@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="ro">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#2A2C27">
+  <meta name="color-scheme" content="dark">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="{{APP_NAME}}">
+  <meta name="application-name" content="{{APP_NAME}}">
+  <title>{{APP_NAME}}</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon.svg">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <!-- Login -->
+  <main id="login" class="screen" hidden>
+    <header class="top">
+      <h1 class="app-name">{{APP_NAME}}</h1>
+    </header>
+    <section class="head login-head" aria-labelledby="login-title">
+      <h2 id="login-title" class="login-title">Introdu PIN-ul</h2>
+      <div class="pin-dots" id="pin-dots" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <p class="login-msg" id="login-msg" role="alert"></p>
+      <div class="keypad" id="keypad">
+        <button class="key" data-k="1">1</button>
+        <button class="key" data-k="2">2</button>
+        <button class="key" data-k="3">3</button>
+        <button class="key" data-k="4">4</button>
+        <button class="key" data-k="5">5</button>
+        <button class="key" data-k="6">6</button>
+        <button class="key" data-k="7">7</button>
+        <button class="key" data-k="8">8</button>
+        <button class="key" data-k="9">9</button>
+        <button class="key key-fn" data-k="del" aria-label="Șterge o cifră">⌫</button>
+        <button class="key" data-k="0">0</button>
+        <button class="key key-fn" data-k="ok" aria-label="Intră">OK</button>
+      </div>
+    </section>
+  </main>
+
+  <!-- Main -->
+  <main id="app" class="screen" hidden>
+    <header class="top">
+      <h1 class="app-name">{{APP_NAME}}</h1>
+      <span class="mode" id="mode" hidden></span>
+      <button class="leds" id="leds" aria-expanded="false" aria-controls="led-names" aria-label="Starea serviciilor"></button>
+    </header>
+    <p class="led-names" id="led-names" hidden></p>
+
+    <section class="head" aria-label="Telecomandă">
+      <div class="key-row" id="mon-keys">
+        <button class="key key-wide" id="mon-off">Stinge monitoarele</button>
+        <button class="key key-wide" id="mon-on">Aprinde monitoarele</button>
+      </div>
+      <div class="key-row" id="cancel-row" hidden>
+        <button class="key key-wide key-cancel" id="power-cancel">Anulează oprirea</button>
+      </div>
+
+      <label class="switch">
+        <input type="checkbox" role="switch" id="auto-off">
+        <span class="slot" aria-hidden="true"><span class="knob"></span></span>
+        <span class="switch-text">Stinge automat la play pe TV</span>
+      </label>
+
+      <div class="power-wrap">
+        <div class="power-ring">
+          <svg class="ring" id="ring" viewBox="0 0 120 120" aria-hidden="true" hidden>
+            <circle class="ring-track" cx="60" cy="60" r="56"></circle>
+            <circle class="ring-fill" id="ring-fill" cx="60" cy="60" r="56"></circle>
+          </svg>
+          <button class="key key-power" id="power-key" aria-label="Oprire sau repornire PC">
+            <svg viewBox="0 0 24 24" width="30" height="30" aria-hidden="true">
+              <path d="M12 3v8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+              <path d="M6.6 6.6a7.6 7.6 0 1 0 10.8 0" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <p class="countdown" id="countdown" hidden aria-live="polite"></p>
+      </div>
+    </section>
+
+    <section class="block" aria-labelledby="h-playing">
+      <h2 id="h-playing">Acum pe TV</h2>
+      <div id="playing"></div>
+    </section>
+
+    <section class="block" aria-labelledby="h-downloads">
+      <h2 id="h-downloads">Descărcări</h2>
+      <div id="downloads"></div>
+    </section>
+
+    <section class="block" aria-labelledby="h-torrents">
+      <h2 id="h-torrents">Seed FileList</h2>
+      <div id="torrents"></div>
+    </section>
+
+    <section class="block" aria-labelledby="h-waiting">
+      <h2 id="h-waiting">În așteptare</h2>
+      <div id="waiting"></div>
+    </section>
+
+    <section class="block" aria-labelledby="h-library">
+      <h2 id="h-library">Biblioteca</h2>
+      <div id="library"></div>
+    </section>
+
+    <section class="block" aria-labelledby="h-disks">
+      <h2 id="h-disks">Spațiu</h2>
+      <div id="disks"></div>
+    </section>
+
+    <footer class="foot">
+      <span id="updated"></span>
+      <button class="text-btn" id="logout">Ieși din cont</button>
+    </footer>
+  </main>
+
+  <!-- Power sheet -->
+  <div class="scrim" id="scrim" hidden></div>
+  <section class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" hidden>
+    <h2 id="sheet-title">Alimentare</h2>
+    <p class="sheet-text">PC-ul se oprește la 60 de secunde după ce apeși. Poți anula până atunci.</p>
+    <div class="sheet-warn" id="sheet-warn" hidden>
+      <p>Atenție: aceste torrente nu au terminat seed-ul pe FileList. Ai voie să închizi, dar în 7 zile trebuie să ajungă la ratio 1 sau 48h.</p>
+      <ul id="sheet-warn-list"></ul>
+    </div>
+    <div class="sheet-keys">
+      <button class="key key-wide key-red" id="pw-shutdown">Oprește PC-ul</button>
+      <button class="key key-wide" id="pw-restart">Repornește</button>
+      <button class="key key-wide key-quiet" id="sheet-close">Închide</button>
+    </div>
+  </section>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

@@ -1,0 +1,36 @@
+{
+  "_comment": "Copy to config.local.json (or pass --config). pin_hash and secret are written by the app (--set-pin / first run). Leave api_key/token empty to read them from the service config files or the registry at runtime.",
+  "app_name": "Plex Couch",
+  "settings": {
+    "auto_monitors_off": true
+  },
+  "filelist_tracker_regex": "thefl\\.org|filelist\\.(io|ro)|flro\\.org",
+  "disks": ["C:", "D:"],
+  "plex_poll_seconds": 10,
+  "services": {
+    "plex": {
+      "url": "http://127.0.0.1:32400",
+      "token": "",
+      "token_registry_key": "Software\\Plex, Inc.\\Plex Media Server",
+      "token_registry_value": "PlexOnlineToken"
+    },
+    "radarr": {
+      "url": "http://127.0.0.1:7878",
+      "api_key": "",
+      "config_xml": "C:\\ProgramData\\Radarr\\config.xml"
+    },
+    "bazarr": {
+      "url": "http://127.0.0.1:6767",
+      "api_key": "",
+      "config_yaml": "C:\\ProgramData\\Bazarr\\config\\config.yaml"
+    },
+    "prowlarr": {
+      "url": "http://127.0.0.1:9696"
+    },
+    "qbittorrent": {
+      "url": "http://127.0.0.1:8080",
+      "username": "",
+      "password": ""
+    }
+  }
+}

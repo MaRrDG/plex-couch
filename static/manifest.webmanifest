@@ -1,0 +1,14 @@
+{
+  "name": "{{APP_NAME}}",
+  "short_name": "{{APP_NAME}}",
+  "lang": "ro",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#2A2C27",
+  "background_color": "#2A2C27",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
