@@ -30,14 +30,18 @@ def _shutdown_exe():
     return exe if os.path.exists(exe) else "shutdown"
 
 
-def power_args(kind, exe, app_name):
-    """Build the shutdown.exe argv. Pure: runs nothing.
+POWER_DELAY = 60
 
-    Shutdown uses /hybrid (Fast Startup, like Start > Shut down); Windows
-    rejects /hybrid together with /r, so restart omits it.
+
+def power_args(kind, exe):
+    """Build the shutdown.exe argv for an immediate shutdown/restart. Pure: runs nothing.
+
+    Behaves like Start > Shut down: /hybrid keeps Fast Startup (Windows rejects it
+    with /r), and /t 0 avoids the implied /f that any /t above 0 adds, so apps
+    with unsaved work can still stop the shutdown. The 60 s delay is our own timer.
     """
     flags = {"shutdown": ["/s", "/hybrid"], "restart": ["/r"]}[kind]
-    return [exe] + flags + ["/t", "60", "/c", "%s: oprire in 60 de secunde" % app_name]
+    return [exe] + flags + ["/t", "0"]
 
 
 class Actions:
@@ -45,6 +49,7 @@ class Actions:
         self.dry_run = dry_run
         self.app_name = app_name
         self._power = None
+        self._timer = None
         self._lock = threading.Lock()
 
     # -- monitors ---------------------------------------------------------
@@ -68,29 +73,42 @@ class Actions:
 
     # -- power ------------------------------------------------------------
     def power(self, kind):
-        """kind: 'shutdown' | 'restart'. Schedules in 60s."""
-        args = power_args(kind, _shutdown_exe(), self.app_name)
+        """kind: 'shutdown' | 'restart'. Runs it after POWER_DELAY seconds unless cancelled."""
+        args = power_args(kind, _shutdown_exe())
         with self._lock:
-            if self.dry_run:
-                log.info("dry-run: power %s (would run shutdown %s)", kind, " ".join(args[1:]))
-            else:
-                log.info("power %s scheduled", kind)
-                r = subprocess.run(args, creationflags=CREATE_NO_WINDOW, capture_output=True, timeout=15)
-                if r.returncode != 0:
-                    log.warning("shutdown %s failed with code %s", kind, r.returncode)
-                    return None
-            self._power = {"kind": kind, "at": time.time() + 60}
+            if logic.pending_power(self._power) is not None:
+                return None  # one at a time
+            self._power = {"kind": kind, "at": time.time() + POWER_DELAY}
+            self._timer = threading.Timer(POWER_DELAY, self._fire, (self._power, args))
+            self._timer.daemon = True
+            self._timer.start()
+            log.info("%spower %s scheduled in %ss", "dry-run: " if self.dry_run else "", kind, POWER_DELAY)
             return logic.pending_power(self._power)
+
+    def _fire(self, scheduled, args):
+        with self._lock:
+            if self._power is not scheduled:
+                return  # cancelled or replaced
+            self._timer = None
+        kind = scheduled["kind"]
+        if self.dry_run:
+            log.info("dry-run: power %s (would run shutdown %s)", kind, " ".join(args[1:]))
+            return
+        log.info("power %s now", kind)
+        r = subprocess.run(args, creationflags=CREATE_NO_WINDOW, capture_output=True, timeout=15)
+        if r.returncode != 0:
+            log.warning("shutdown %s failed with code %s", kind, r.returncode)
+            with self._lock:
+                if self._power is scheduled:
+                    self._power = None
 
     def cancel_power(self):
         with self._lock:
-            if self.dry_run:
-                log.info("dry-run: power cancel (would run shutdown /a)")
-            else:
-                r = subprocess.run([_shutdown_exe(), "/a"], creationflags=CREATE_NO_WINDOW,
-                                   capture_output=True, timeout=15)
-                log.info("power cancel (code %s)", r.returncode)
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
             self._power = None
+        log.info("%spower cancelled", "dry-run: " if self.dry_run else "")
         return True
 
     def pending(self):

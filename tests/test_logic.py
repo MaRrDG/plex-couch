@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import unittest
 from datetime import datetime, timezone
 
@@ -427,18 +428,51 @@ class TestPower(unittest.TestCase):
 
 
 class TestPowerArgs(unittest.TestCase):
-    def test_shutdown_is_hybrid(self):
-        a = power_args("shutdown", "shutdown.exe", "App")
-        self.assertEqual(a[:5], ["shutdown.exe", "/s", "/hybrid", "/t", "60"])
+    def test_shutdown_is_hybrid_and_immediate(self):
+        self.assertEqual(power_args("shutdown", "shutdown.exe"),
+                         ["shutdown.exe", "/s", "/hybrid", "/t", "0"])
 
     def test_restart_has_no_hybrid(self):
-        a = power_args("restart", "shutdown.exe", "App")
-        self.assertEqual(a[:4], ["shutdown.exe", "/r", "/t", "60"])
-        self.assertNotIn("/hybrid", a)
+        self.assertEqual(power_args("restart", "shutdown.exe"), ["shutdown.exe", "/r", "/t", "0"])
+
+    def test_never_forced(self):
+        # /t above 0 implies /f; we keep /t 0 so unsaved work can stop it, like Start > Shut down
+        for kind in ("shutdown", "restart"):
+            self.assertNotIn("/f", power_args(kind, "shutdown.exe"))
 
     def test_unknown_kind_raises(self):
         with self.assertRaises(KeyError):
-            power_args("hibernate", "shutdown.exe", "App")
+            power_args("hibernate", "shutdown.exe")
+
+
+class TestPowerTimer(unittest.TestCase):
+    def setUp(self):
+        from plexcouch import system
+        self.system = system
+        self.old_delay = system.POWER_DELAY
+        system.POWER_DELAY = 0.2
+        self.fired = []
+        self.old_run = system.subprocess.run
+        system.subprocess.run = lambda *a, **k: self.fired.append(a[0])  # never runs shutdown.exe
+
+    def tearDown(self):
+        self.system.POWER_DELAY = self.old_delay
+        self.system.subprocess.run = self.old_run
+
+    def test_cancel_stops_it(self):
+        acts = self.system.Actions(dry_run=True, app_name="App")
+        self.assertIsNotNone(acts.power("shutdown"))
+        self.assertIsNone(acts.power("restart"))  # one at a time
+        acts.cancel_power()
+        time.sleep(0.4)
+        self.assertIsNone(acts.pending())
+        self.assertEqual(self.fired, [])
+
+    def test_dry_run_never_executes(self):
+        acts = self.system.Actions(dry_run=True, app_name="App")
+        acts.power("shutdown")
+        time.sleep(0.4)
+        self.assertEqual(self.fired, [])
 
 
 if __name__ == "__main__":
