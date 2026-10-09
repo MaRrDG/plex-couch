@@ -7,6 +7,12 @@
   "filelist_tracker_regex": "thefl\\.org|filelist\\.(io|ro)|flro\\.org",
   "disks": ["C:", "D:"],
   "plex_poll_seconds": 10,
+  "https": {
+    "port": 8766,
+    "cert": "certs/server.pem",
+    "key": "certs/server.key",
+    "ca_cert": "certs/ca.crt"
+  },
   "services": {
     "plex": {
       "url": "http://127.0.0.1:32400",

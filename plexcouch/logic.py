@@ -533,3 +533,66 @@ def pending_power(state, now=None, grace=10):
     if state.get("at", 0) + grace < now:
         return None
     return {"kind": state["kind"], "at": int(state["at"])}
+
+
+# ---------------------------------------------------------------------------
+# HTTPS helpers
+# ---------------------------------------------------------------------------
+
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9-]{1,63})*\.?$")
+
+
+def split_host_header(host_header):
+    """Return the host part of a Host header ('192.168.1.50:8765' -> '192.168.1.50',
+    '[fe80::1]:8765' -> '[fe80::1]'), or None if it is missing or not a sane host name/IP."""
+    h = (host_header or "").strip()
+    if not h or len(h) > 255:
+        return None
+    if h.startswith("["):
+        end = h.find("]")
+        if end < 0:
+            return None
+        inner, rest = h[1:end], h[end + 1:]
+        if rest and not re.fullmatch(r":\d{1,5}", rest):
+            return None
+        try:
+            ipaddress.IPv6Address(inner.split("%", 1)[0])
+        except ValueError:
+            return None
+        return "[%s]" % inner
+    host, sep, port = h.rpartition(":") if h.count(":") == 1 else (h, "", "")
+    if sep and not re.fullmatch(r"\d{1,5}", port):
+        return None
+    if not host:
+        return None
+    if _HOSTNAME_RE.match(host):
+        return host.lower()
+    return None
+
+
+def https_url(host_header, https_port, path="/", fallback_host="127.0.0.1"):
+    """Build the HTTPS URL for a plain-HTTP request: same host as the browser used, HTTPS port."""
+    host = split_host_header(host_header)
+    if host is None:
+        fb = fallback_host or "127.0.0.1"
+        host = "[%s]" % fb if ":" in fb and not fb.startswith("[") else fb
+    if not path or not path.startswith("/") or any(ord(c) < 33 or ord(c) == 127 for c in path):
+        path = "/"
+    if path.startswith("//"):
+        path = "/" + path.lstrip("/")
+    port = int(https_port)
+    return "https://%s%s%s" % (host, "" if port == 443 else ":%d" % port, path)
+
+
+def session_cookie(name, value, max_age, secure):
+    """Set-Cookie value for the session cookie; Secure only when served over HTTPS."""
+    return "%s=%s; Max-Age=%d; HttpOnly; SameSite=Strict; Path=/%s" % (
+        name, value, int(max_age), "; Secure" if secure else "")
+
+
+def cert_der(data):
+    """Return DER bytes for a certificate given as PEM text or DER bytes."""
+    import ssl
+    if data.lstrip().startswith(b"-----BEGIN"):
+        return ssl.PEM_cert_to_DER_cert(data.decode("ascii"))
+    return data

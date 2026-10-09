@@ -1,14 +1,23 @@
 """Plex Couch - LAN-only phone remote for a Plex PC.
 
 Usage:
-  app.py [--host 0.0.0.0] [--port 8765] [--config config.local.json] [--dry-run]
+  app.py [--host 0.0.0.0] [--port 8765] [--https-port 8766] [--cert F] [--key F] [--ca-cert F]
+         [--config config.local.json] [--dry-run]
   app.py --set-pin 1234 [--config config.local.json]
+
+With a certificate and key (see tools/make_certs.py) the app is served over HTTPS on
+--https-port, and --port only serves an install page, the CA certificate and redirects.
 """
 
 import argparse
+import base64
+import hashlib
 import json
 import logging
 import os
+import re
+import socket
+import ssl
 import sys
 import threading
 import time
@@ -38,15 +47,26 @@ if sys.stderr is None:
 
 log = logging.getLogger("plexcouch")
 
+# Whitelist of static files: URL path -> (file in static/, content type). No directory serving.
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
+    "/sw.js": ("sw.js", "text/javascript; charset=utf-8"),
     "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json; charset=utf-8"),
     "/icon.svg": ("icon.svg", "image/svg+xml"),
+    "/icon-192.png": ("icon-192.png", "image/png"),
+    "/icon-512.png": ("icon-512.png", "image/png"),
+    "/icon-maskable-512.png": ("icon-maskable-512.png", "image/png"),
+    "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
 }
 TEMPLATED = {"index.html", "manifest.webmanifest"}
+STATIC_HEADERS = {
+    "/sw.js": {"Service-Worker-Allowed": "/"},
+}
+INSTALL_PAGE = "install.html"
+CA_CONTENT_TYPE = "application/x-x509-ca-cert"
 
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -68,6 +88,43 @@ def setup_logging():
 def _html_escape(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             .replace('"', "&quot;"))
+
+
+def _read_static(name):
+    with open(os.path.join(STATIC_DIR, name), "rb") as f:
+        return f.read()
+
+
+def install_csp(page):
+    """CSP for the install page: no scripts at all, only its own inline <style> (by hash)."""
+    m = re.search(rb"<style>(.*?)</style>", page, re.S)
+    style = "'none'"
+    if m:
+        style = "'sha256-%s'" % base64.b64encode(hashlib.sha256(m.group(1)).digest()).decode()
+    return ("default-src 'none'; style-src %s; img-src 'self'; frame-ancestors 'none'; "
+            "base-uri 'none'; form-action 'none'" % style)
+
+
+def https_settings(args, config):
+    """Resolve the HTTPS port and file paths: command line first, then config, then defaults."""
+    h = config.data.get("https") or {}
+
+    def cli(v):
+        return os.path.abspath(v) if v else None
+
+    return {
+        "port": int(args.https_port if args.https_port is not None else h.get("port") or 8766),
+        "cert": cli(args.cert) or config.resolve(h.get("cert")),
+        "key": cli(args.key) or config.resolve(h.get("key")),
+        "ca_cert": cli(args.ca_cert) or config.resolve(h.get("ca_cert")),
+    }
+
+
+def make_ssl_context(cert, key):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(cert, key)
+    return ctx
 
 
 class App:
@@ -184,7 +241,9 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "PlexCouch"
     sys_version = ""
     protocol_version = "HTTP/1.1"
+    timeout = 60
     app = None  # set in main()
+    secure = False  # True on the HTTPS listener
 
     # quiet default logging (pythonw has no stderr); errors go to the log file
     def log_message(self, fmt, *args):
@@ -257,13 +316,12 @@ class Handler(BaseHTTPRequestHandler):
         if not entry:
             return self._send(404, b"Not found", "text/plain; charset=utf-8")
         name, ctype = entry
-        with open(os.path.join(STATIC_DIR, name), "rb") as f:
-            body = f.read()
+        body = _read_static(name)
         if name in TEMPLATED:
             app_name = self.app.config.app_name
             safe = _html_escape(app_name) if name.endswith(".html") else json.dumps(app_name)[1:-1]
             body = body.replace(b"{{APP_NAME}}", safe.encode("utf-8"))
-        self._send(200, body, ctype)
+        self._send(200, body, ctype, headers=STATIC_HEADERS.get(path))
 
     # -- POST -----------------------------------------------------------------
     def do_POST(self):
@@ -286,7 +344,7 @@ class Handler(BaseHTTPRequestHandler):
         a = self.app.actions
         if path == "/api/logout":
             return self._json(200, {"ok": True}, headers={
-                "Set-Cookie": "%s=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/" % COOKIE})
+                "Set-Cookie": logic.session_cookie(COOKIE, "", 0, self.secure)})
         if path == "/api/monitors/off":
             log.info("action monitors/off from %s", self.client_ip)
             return self._json(200, {"ok": a.monitors_off(), "dry_run": self.app.dry_run})
@@ -335,8 +393,7 @@ class Handler(BaseHTTPRequestHandler):
             guard.record_success(ip)
             log.info("login ok from %s", ip)
             token = self.app.new_session()
-            cookie = "%s=%s; Max-Age=%d; HttpOnly; SameSite=Strict; Path=/" % (
-                COOKIE, token, logic.SESSION_DAYS * 86400)
+            cookie = logic.session_cookie(COOKIE, token, logic.SESSION_DAYS * 86400, self.secure)
             return self._json(200, {"ok": True}, headers={"Set-Cookie": cookie})
         locked = guard.record_failure(ip)
         log.warning("login failed from %s", ip)
@@ -346,18 +403,106 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(401, {"error": "PIN greșit.", "attempts_left": guard.attempts_left(ip)})
 
 
+class SecureHandler(Handler):
+    secure = True
+
+
+class InstallHandler(Handler):
+    """Plain-HTTP listener while HTTPS is on: install page, CA certificate, redirects. Nothing else."""
+    https_port = 8766
+    ca_cert = ""
+
+    def _https_url(self, path):
+        local = self.connection.getsockname()[0]
+        return logic.https_url(self.headers.get("Host"), self.https_port, path, fallback_host=local)
+
+    def do_GET(self):
+        if not self._allowed_ip():
+            return
+        path = self.path.split("?", 1)[0]
+        if path == "/":
+            return self._install_page()
+        if path == "/ca.crt":
+            try:
+                with open(self.ca_cert, "rb") as f:
+                    der = logic.cert_der(f.read())
+            except (OSError, ValueError):
+                return self._send(404, b"Not found", "text/plain; charset=utf-8")
+            return self._send(200, der, CA_CONTENT_TYPE, headers={
+                "Content-Disposition": 'attachment; filename="plex-couch-ca.crt"'})
+        self._redirect()
+
+    def do_POST(self):
+        if not self._allowed_ip():
+            return
+        self._redirect()
+
+    def _install_page(self):
+        page = _read_static(INSTALL_PAGE)
+        page = (page.replace(b"{{APP_NAME}}", _html_escape(self.app.config.app_name).encode("utf-8"))
+                .replace(b"{{HTTPS_URL}}", _html_escape(self._https_url("/")).encode("utf-8")))
+        self.send_response(200)
+        for k, v in SECURITY_HEADERS.items():
+            if k != "Content-Security-Policy":
+                self.send_header(k, v)
+        self.send_header("Content-Security-Policy", install_csp(page))
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(page)
+
+    def _redirect(self):
+        self._send(301, b"", "text/plain; charset=utf-8", headers={"Location": self._https_url(self.path)})
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
     def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ssl.SSLError, ConnectionError, socket.timeout)):
+            # Clients dropping keep-alive connections or failing TLS: not worth a traceback.
+            log.debug("connection error from %s: %s", client_address[0], type(exc).__name__)
+            return
         log.exception("request error from %s", client_address[0])
+
+
+class TLSServer(Server):
+    """HTTPS server. The TLS handshake runs in the request thread, not in the accept loop,
+    so a slow or broken client cannot stall other connections."""
+
+    def __init__(self, address, handler, context):
+        self.context = context
+        super().__init__(address, handler)
+
+    def finish_request(self, request, client_address):
+        request.settimeout(Handler.timeout)
+        try:
+            tls = self.context.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError) as e:
+            log.debug("tls handshake failed from %s: %s", client_address[0], type(e).__name__)
+            return
+        try:
+            self.RequestHandlerClass(tls, client_address, self)
+        finally:
+            try:
+                tls.close()
+            except OSError:
+                pass
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="Plex Couch")
     p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--port", type=int, default=8765,
+                   help="HTTP port: the whole app without a certificate, else only the install page")
+    p.add_argument("--https-port", type=int, help="HTTPS port (default 8766, or https.port in the config)")
+    p.add_argument("--cert", help="server certificate, PEM (default certs/server.pem)")
+    p.add_argument("--key", help="server private key, PEM (default certs/server.key)")
+    p.add_argument("--ca-cert", help="CA certificate offered at /ca.crt, DER or PEM (default certs/ca.crt)")
     p.add_argument("--config", default=os.path.join(BASE_DIR, "config.local.json"))
     p.add_argument("--dry-run", action="store_true", help="log monitor/power actions, never execute them")
     p.add_argument("--set-pin", metavar="DIGITS", help="store the PIN hash in the config and exit")
@@ -382,21 +527,42 @@ def main(argv=None):
         return 2
     app = App(config, args.dry_run, demo_mode=args.demo)
     Handler.app = app
+    tls = https_settings(args, config)
+    servers = []
+    if os.path.isfile(tls["cert"] or "") and os.path.isfile(tls["key"] or ""):
+        try:
+            context = make_ssl_context(tls["cert"], tls["key"])
+        except (ssl.SSLError, OSError) as e:
+            log.error("cannot load the HTTPS certificate/key: %s", type(e).__name__)
+            print("Cannot load the HTTPS certificate/key: %s" % e)
+            return 2
+        InstallHandler.https_port = tls["port"]
+        InstallHandler.ca_cert = tls["ca_cert"]
+        servers.append(TLSServer((args.host, tls["port"]), SecureHandler, context))
+        servers.append(Server((args.host, args.port), InstallHandler))
+        where = "https %s:%d, http %s:%d (install page)" % (args.host, tls["port"], args.host, args.port)
+    else:
+        servers.append(Server((args.host, args.port), Handler))
+        where = "http %s:%d (no certificate, HTTPS off)" % (args.host, args.port)
+
     stop = threading.Event()
     if not args.demo:
         threading.Thread(target=app.auto_monitor_loop, args=(stop,), name="auto-monitor", daemon=True).start()
-    server = Server((args.host, args.port), Handler)
-    log.info("started on %s:%d%s", args.host, args.port,
-             " (demo)" if args.demo else (" (dry-run)" if args.dry_run else ""))
+    for srv in servers[1:]:
+        threading.Thread(target=srv.serve_forever, name="http", daemon=True).start()
+    log.info("started on %s%s", where, " (demo)" if args.demo else (" (dry-run)" if args.dry_run else ""))
     if not config.data.get("pin_hash"):
         log.warning("no PIN set; run app.py --set-pin <digits>")
     try:
-        server.serve_forever()
+        servers[0].serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         stop.set()
-        server.server_close()
+        for srv in servers[1:]:
+            srv.shutdown()
+        for srv in servers:
+            srv.server_close()
         log.info("stopped")
     return 0
 

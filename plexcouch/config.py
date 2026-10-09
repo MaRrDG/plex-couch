@@ -17,6 +17,14 @@ DEFAULTS = {
     "filelist_tracker_regex": r"thefl\.org|filelist\.(io|ro)|flro\.org",
     "disks": ["C:", "D:"],
     "plex_poll_seconds": 10,
+    # HTTPS for the installable PWA. Relative paths are resolved against the config file's
+    # folder. If cert or key is missing the app serves plain HTTP only, as before.
+    "https": {
+        "port": 8766,
+        "cert": "certs/server.pem",
+        "key": "certs/server.key",
+        "ca_cert": "certs/ca.crt",
+    },
     "services": {
         "plex": {
             "url": "http://127.0.0.1:32400",
@@ -119,6 +127,15 @@ class Config:
     @property
     def app_name(self):
         return str(self.data.get("app_name") or DEFAULTS["app_name"])
+
+    def resolve(self, value):
+        """Resolve a path from the config relative to the config file's folder."""
+        if not value:
+            return ""
+        value = os.path.expandvars(os.path.expanduser(str(value)))
+        if os.path.isabs(value):
+            return value
+        return os.path.normpath(os.path.join(os.path.dirname(self.path), value))
 
     def service(self, name):
         return self.data["services"].get(name, {})

@@ -1,3 +1,4 @@
 ﻿config.local.json
 *.log
 __pycache__/
+certs/
