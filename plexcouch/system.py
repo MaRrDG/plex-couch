@@ -30,6 +30,16 @@ def _shutdown_exe():
     return exe if os.path.exists(exe) else "shutdown"
 
 
+def power_args(kind, exe, app_name):
+    """Build the shutdown.exe argv. Pure: runs nothing.
+
+    Shutdown uses /hybrid (Fast Startup, like Start > Shut down); Windows
+    rejects /hybrid together with /r, so restart omits it.
+    """
+    flags = {"shutdown": ["/s", "/hybrid"], "restart": ["/r"]}[kind]
+    return [exe] + flags + ["/t", "60", "/c", "%s: oprire in 60 de secunde" % app_name]
+
+
 class Actions:
     def __init__(self, dry_run, app_name):
         self.dry_run = dry_run
@@ -59,16 +69,15 @@ class Actions:
     # -- power ------------------------------------------------------------
     def power(self, kind):
         """kind: 'shutdown' | 'restart'. Schedules in 60s."""
-        flag = {"shutdown": "/s", "restart": "/r"}[kind]
-        args = [_shutdown_exe(), flag, "/t", "60", "/c", "%s: oprire in 60 de secunde" % self.app_name]
+        args = power_args(kind, _shutdown_exe(), self.app_name)
         with self._lock:
             if self.dry_run:
-                log.info("dry-run: power %s (would run shutdown %s /t 60)", kind, flag)
+                log.info("dry-run: power %s (would run shutdown %s)", kind, " ".join(args[1:]))
             else:
                 log.info("power %s scheduled", kind)
                 r = subprocess.run(args, creationflags=CREATE_NO_WINDOW, capture_output=True, timeout=15)
                 if r.returncode != 0:
-                    log.warning("shutdown %s failed with code %s", flag, r.returncode)
+                    log.warning("shutdown %s failed with code %s", kind, r.returncode)
                     return None
             self._power = {"kind": kind, "at": time.time() + 60}
             return logic.pending_power(self._power)

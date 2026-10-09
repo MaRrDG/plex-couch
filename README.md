@@ -33,7 +33,7 @@ comes next, as a poster grid) and **PC** (seeding, disk, services, shut down).
   Login required, digits-only ids, the API key and token stay on the PC. A drawn placeholder with
   the title is shown when there is no poster.
 - **Disk space** and uptime.
-- **Power**: shut down or restart in 60 s, confirmed from an action sheet that warns about
+- **Power**: shut down (Fast Startup, `shutdown /s /hybrid`) or restart in 60 s, confirmed from an action sheet that warns about
   torrents still owing seed time, then a countdown banner with a cancel button.
 - **Service status** for Plex, Radarr, Prowlarr, Bazarr and qBittorrent. Every service is
   optional; a service that is down only blanks its own section.

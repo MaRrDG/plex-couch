@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from plexcouch import logic  # noqa: E402
+from plexcouch.system import power_args  # noqa: E402
 from plexcouch.services import parse_bazarr_apikey  # noqa: E402
 
 H = 3600
@@ -423,6 +424,21 @@ class TestPower(unittest.TestCase):
         self.assertEqual(logic.pending_power({"kind": "shutdown", "at": 1060.4}, now=1000),
                          {"kind": "shutdown", "at": 1060})
         self.assertIsNone(logic.pending_power({"kind": "shutdown", "at": 1060}, now=1100))
+
+
+class TestPowerArgs(unittest.TestCase):
+    def test_shutdown_is_hybrid(self):
+        a = power_args("shutdown", "shutdown.exe", "App")
+        self.assertEqual(a[:5], ["shutdown.exe", "/s", "/hybrid", "/t", "60"])
+
+    def test_restart_has_no_hybrid(self):
+        a = power_args("restart", "shutdown.exe", "App")
+        self.assertEqual(a[:4], ["shutdown.exe", "/r", "/t", "60"])
+        self.assertNotIn("/hybrid", a)
+
+    def test_unknown_kind_raises(self):
+        with self.assertRaises(KeyError):
+            power_args("hibernate", "shutdown.exe", "App")
 
 
 if __name__ == "__main__":
