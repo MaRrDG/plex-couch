@@ -1,0 +1,16 @@
+<!-- @dsCard group="Controls" height=200 subtitle="Primary, danger, plain" -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap">
+<style>
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font-sans); }
+  .wrap { max-width: 340px; padding: var(--space-4); display: grid; gap: var(--space-3); }
+  .btn { font: inherit; font-size: 15px; font-weight: 600; min-height: var(--size-tap); padding: 12px; border-radius: var(--radius-md); border: 1px solid transparent; cursor: pointer; }
+  .btn.primary { background: var(--accent); color: var(--on-accent); }
+  .btn.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
+  .btn.plain { background: var(--surface); color: var(--ink); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+<div class="wrap">
+  <button class="btn primary" type="button">Anulează oprirea</button>
+  <button class="btn danger" type="button">Oprește PC-ul</button>
+  <button class="btn plain" type="button">Repornește</button>
+</div>

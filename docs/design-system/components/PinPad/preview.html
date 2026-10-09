@@ -1,0 +1,28 @@
+<!-- @dsCard group="Controls" height=520 subtitle="Two digits typed, wrong-PIN message" -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap">
+<style>
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font-sans); }
+  .login { max-width: 320px; margin: 0 auto; padding: var(--space-6) var(--space-4); display: grid; justify-items: center; gap: var(--space-3); }
+  .sub { color: var(--muted); margin-top: -6px; }
+  .dots { display: flex; gap: 14px; margin-top: var(--space-2); }
+  .dots i { width: 10px; height: 10px; border-radius: 50%; box-shadow: inset 0 0 0 1.5px var(--muted); }
+  .dots i.on { background: var(--ink); box-shadow: none; }
+  .err { color: var(--accent); min-height: 18px; }
+  .pad { display: grid; grid-template-columns: repeat(3, var(--size-key)); gap: 14px 22px; margin-top: var(--space-2); }
+  .pad button { width: var(--size-key); height: var(--size-key); border-radius: var(--radius-pill); border: 0; background: var(--surface); color: var(--ink); font: inherit; font-size: 26px; font-weight: 500; cursor: pointer; }
+  .pad button:active { background: var(--surface-2); }
+  .pad button.ghost { background: transparent; color: var(--muted); font-size: 15px; }
+  .pad button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+<div class="login">
+  <span class="title-screen">Plex Couch</span>
+  <span class="meta sub">Introdu PIN-ul</span>
+  <div class="dots" aria-label="2 din 6 cifre"><i class="on"></i><i class="on"></i><i></i><i></i><i></i><i></i></div>
+  <span class="meta err" role="alert">PIN greșit. Mai ai 3 încercări.</span>
+  <div class="pad">
+    <button type="button">1</button><button type="button">2</button><button type="button">3</button>
+    <button type="button">4</button><button type="button">5</button><button type="button">6</button>
+    <button type="button">7</button><button type="button">8</button><button type="button">9</button>
+    <span></span><button type="button">0</button><button type="button" class="ghost" aria-label="Șterge">Șterge</button>
+  </div>
+</div>

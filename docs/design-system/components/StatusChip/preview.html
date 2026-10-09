@@ -1,0 +1,17 @@
+<!-- @dsCard group="Feedback" height=110 subtitle="Running and down" -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap">
+<style>
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font-sans); }
+  .chips { max-width: 340px; padding: var(--space-4); display: flex; flex-wrap: wrap; gap: var(--space-2); }
+  .chip { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 6px 10px; border-radius: var(--radius-pill); background: var(--surface); font-size: 12px; font-weight: 600; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+  .chip.down .dot { background: var(--danger); }
+  .chip.down .w { color: var(--danger); font-weight: 600; }
+</style>
+<div class="chips">
+  <span class="chip"><i class="dot"></i>Plex</span>
+  <span class="chip"><i class="dot"></i>Radarr</span>
+  <span class="chip"><i class="dot"></i>Prowlarr</span>
+  <span class="chip down"><i class="dot"></i>Bazarr <span class="w">oprit</span></span>
+  <span class="chip"><i class="dot"></i>qBittorrent</span>
+</div>

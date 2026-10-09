@@ -11,24 +11,34 @@ Not affiliated with or endorsed by Plex Inc.
 
 ## Features
 
-- **Now playing on the TV** (Plex sessions): title, player, state, progress, Direct Play /
+Three tabs: **Acasă** (what is on the TV and the four controls), **Filme** (library and what
+comes next, as a poster grid) and **PC** (seeding, disk, services, shut down).
+
+- **Now playing on the TV** (Plex sessions): poster, title, device, progress, Direct Play /
   Direct Stream / Transcode.
 - **Monitors**: turn the PC displays off or on with one tap.
 - **Auto monitors off**: when a new Plex session starts playing on another device (e.g. the
   TV), the PC monitors are turned off once. Moving the mouse turns them back on and they stay
   on for the rest of that session.
 - **Downloads**: Radarr queue with progress and time left.
-- **FileList seeding**: every FileList torrent in qBittorrent with a progress bar towards the
-  hit & run rule (ratio 1.0 or 48 h of seeding) and a check mark once safe.
-- **Waiting list**: monitored Radarr movies without a file, with a human status
-  (e.g. waiting for the digital release on a given date).
-- **Library**: Radarr movies with size and whether a Romanian subtitle exists (Bazarr).
+- **FileList seeding**: every FileList torrent in qBittorrent, shown by movie title (matched
+  through Radarr's grab history and queue, else parsed from the release name), with a progress
+  bar towards the hit & run rule (ratio 1.0 or 48 h of seeding) and "gata" once safe.
+- **Waiting list** ("Urmează"): monitored Radarr movies without a file, with a human status
+  (e.g. waiting for the digital release on a given date) or the download progress.
+- **Library**: Radarr movies as posters with size and whether a Romanian subtitle exists (Bazarr).
+- **Posters and backdrop**: proxied from Radarr's local media covers and Plex's photo transcoder
+  through `/img/movie/<id>`, `/img/plex/<id>` and, for the blurred backdrop behind the
+  now-playing card, `/img/plex-art/<id>` (falling back to Radarr's fanart, `/img/movie-art/<id>`).
+  Login required, digits-only ids, the API key and token stay on the PC. A drawn placeholder with
+  the title is shown when there is no poster.
 - **Disk space** and uptime.
 - **Power**: shut down or restart in 60 s, confirmed from an action sheet that warns about
   torrents still owing seed time, then a countdown banner with a cancel button.
 - **Service status** for Plex, Radarr, Prowlarr, Bazarr and qBittorrent. Every service is
   optional; a service that is down only blanks its own section.
-- Clean dark UI in the style of iOS grouped lists, no external CDNs or fonts.
+- "Cinema" dark UI built from a small design system (`docs/design-system/`): one accent (Plex
+  amber), real posters, self-hosted Figtree font, no external CDNs.
 - **Installable PWA over HTTPS** (Android Chrome): a local, name-constrained certificate
   authority, a service worker that caches the app shell, and a clear "PC-ul nu răspunde"
   state when the PC is off. Without certificates the app still works over plain HTTP.
@@ -154,10 +164,29 @@ so check that file if something does not work.
   invalidates all existing sessions.
 - Every state-changing call is a POST that must carry the `X-Requested-With: plex-couch`
   header (CSRF guard). Strict Content-Security-Policy, no third-party resources.
-- The service worker caches only the static app shell; `/api/*` responses are never cached.
+- The service worker caches the static app shell and, in a separate small cache (150 entries),
+  poster images; `/api/*` responses are never cached. The page keeps a copy of the last status in
+  the browser's local storage so the cached screen can be shown while the PC is off; it is
+  removed on logout.
 - Tracker URLs (which contain your passkey), API keys and tokens are never logged or returned
   by the API.
 - `config.local.json` contains the PIN hash and the cookie secret; it is git-ignored.
+
+## Design system
+
+`docs/design-system/` holds the rules (`README.md`), the tokens (`tokens.json`) and one folder per
+component with its rules and a reference preview. `static/tokens.css` is generated from the
+tokens; after changing `tokens.json` run:
+
+```
+python tools/build_tokens.py           # writes static/tokens.css
+python tools/build_tokens.py --check   # exits 1 if static/tokens.css is out of date
+```
+
+`static/style.css` uses only those variables for colours, spacing, radii and sizes. The UI font
+is [Figtree](https://github.com/erikdkennedy/figtree) (SIL Open Font License 1.1, see
+`static/fonts/OFL.txt`), self-hosted as two variable woff2 files (latin and latin-ext, weights
+400-700) so the app works offline and Romanian diacritics render in the same face.
 
 ## Tests
 
@@ -167,7 +196,8 @@ python -m unittest discover -s tests -v
 
 The tests cover the pure logic (hit & run rule, tracker matching, IP checks, session tokens,
 PIN hashing, lockouts, Romanian status text, auto-monitor decisions, HTTPS redirects, cookie
-flags, the static whitelist and the CA name constraints) and need no network or Windows APIs.
+flags, the static whitelist, the CA name constraints, release-name parsing, torrent-to-movie
+matching, the poster routes and the generated tokens.css) and need no network or Windows APIs.
 
 ## License
 

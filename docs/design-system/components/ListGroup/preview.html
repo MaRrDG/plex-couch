@@ -1,0 +1,25 @@
+<!-- @dsCard group="Data" height=220 subtitle="Seed FileList" -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap">
+<style>
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font-sans); }
+  .wrap { max-width: 340px; padding: var(--space-4); display: grid; gap: 10px; }
+  .head { display: flex; justify-content: space-between; align-items: baseline; }
+  .head .meta { color: var(--muted); }
+  .group { background: var(--surface); border-radius: var(--radius-lg); padding: 4px var(--space-4); }
+  .li { display: grid; gap: 7px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+  .li:last-child { border-bottom: 0; }
+  .li-h { display: flex; justify-content: space-between; gap: 10px; }
+  .li-h .data { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .bar { height: 4px; border-radius: var(--radius-pill); background: var(--surface-2); overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .bar.ok i { background: var(--ok); }
+  .foot { color: var(--muted); }
+</style>
+<div class="wrap">
+  <div class="head"><span class="body-strong">Seed FileList</span><span class="meta">ratio 1 sau 48 h</span></div>
+  <div class="group">
+    <div class="li"><div class="li-h"><span class="tile-label">The Godfather</span><span class="data">ratio 0,12, 3 din 48 h</span></div><div class="bar"><i style="width:12%"></i></div></div>
+    <div class="li"><div class="li-h"><span class="tile-label">Dune: Part Two</span><span class="data">gata</span></div><div class="bar ok"><i style="width:100%"></i></div></div>
+  </div>
+  <span class="foot meta">Torrentele se șterg singure după ce ajung la regulă.</span>
+</div>

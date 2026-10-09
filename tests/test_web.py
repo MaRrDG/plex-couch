@@ -77,8 +77,33 @@ class TestStatic(unittest.TestCase):
     def test_whitelisted_files_exist_and_nothing_else_is_served(self):
         for path, (name, _ctype) in app.STATIC_FILES.items():
             self.assertTrue(os.path.isfile(os.path.join(app.STATIC_DIR, name)), path)
-            self.assertNotIn("/", name)
+            # Flat files, plus woff2 fonts in static/fonts/ only; never anything with '..'.
+            self.assertNotIn("..", name)
+            self.assertNotIn("\\", name)
+            if "/" in name:
+                self.assertRegex(name, r"^fonts/[a-z0-9-]+\.woff2$")
+                self.assertEqual(path, "/" + name)
         self.assertNotIn("/install.html", app.STATIC_FILES)
+        self.assertNotIn("/fonts/OFL.txt", app.STATIC_FILES)
+
+    def test_whitelist_has_design_files(self):
+        self.assertEqual(app.STATIC_FILES["/tokens.css"], ("tokens.css", "text/css; charset=utf-8"))
+        for sub in ("latin", "latin-ext"):
+            path = "/fonts/figtree-%s.woff2" % sub
+            self.assertEqual(app.STATIC_FILES[path], (path[1:], "font/woff2"))
+            with open(os.path.join(app.STATIC_DIR, path[1:]), "rb") as f:
+                self.assertEqual(f.read(4), b"wOF2")
+        self.assertTrue(os.path.isfile(os.path.join(app.STATIC_DIR, "fonts", "OFL.txt")))
+        css = _read("style.css")
+        self.assertIn("/fonts/figtree-latin.woff2", css)
+        self.assertIn("/fonts/figtree-latin-ext.woff2", css)
+        html = _read("index.html")
+        self.assertLess(html.index("/tokens.css"), html.index("/style.css"))
+
+    def test_style_uses_only_token_colors(self):
+        import re
+        css = _read("style.css")
+        self.assertIsNone(re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(", css))
 
     def test_manifest_icons(self):
         raw = _read("manifest.webmanifest")
@@ -92,8 +117,10 @@ class TestStatic(unittest.TestCase):
     def test_sw_precaches_whitelisted_files_only(self):
         sw = _read("sw.js")
         self.assertIn("'/api/'", sw)
-        for path in ("/", "/app.js", "/style.css", "/manifest.webmanifest", "/icon-192.png"):
+        for path in ("/", "/app.js", "/style.css", "/tokens.css", "/manifest.webmanifest", "/icon-192.png",
+                     "/fonts/figtree-latin.woff2", "/fonts/figtree-latin-ext.woff2"):
             self.assertIn("'%s'" % path, sw)
+        self.assertIn("'/img/'", sw)
 
     def test_install_csp_hashes_inline_style(self):
         page = b"<html><style>body{color:red}</style></html>"
@@ -163,6 +190,102 @@ class TestMakeCerts(unittest.TestCase):
         self.assertTrue(make_certs.validate_names(["fe80::1"], []))
         self.assertTrue(make_certs.validate_names([], ["example.com"]))
         self.assertTrue(make_certs.validate_names([], []))
+
+
+def _load_tool(name):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(ROOT, "tools", name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestTokens(unittest.TestCase):
+    def test_tokens_css_matches_tokens_json(self):
+        build = _load_tool("build_tokens")
+        tokens = build.load()
+        with open(os.path.join(app.STATIC_DIR, "tokens.css"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), build.render(tokens), "run tools/build_tokens.py")
+
+    def test_every_token_is_a_variable(self):
+        build = _load_tool("build_tokens")
+        tokens = build.load()
+        css = build.render(tokens)
+        for c in tokens["color"]["tokens"]:
+            self.assertIn("  --%s: %s;" % (c["name"], c["value"]["dark"]), css)
+        for group in ("spacing", "radius", "shadow", "size"):
+            for t in tokens[group]["tokens"]:
+                self.assertIn("  --%s: %s;" % (t["name"], t["value"]), css)
+        for s in tokens["type"]["groups"][0]["styles"]:
+            self.assertIn("\n.%s {\n" % s["name"], css)
+        self.assertIn("--font-sans: \"Figtree\"", css)
+
+
+class TestImageRoutes(unittest.TestCase):
+    """/img/* over a real local server: login required, digits only, no secrets."""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        import threading
+        from plexcouch.config import Config
+        cls.tmp = tempfile.TemporaryDirectory()
+        cfg = Config(os.path.join(cls.tmp.name, "cfg.json"))
+        cfg.set_pin_hash(logic.hash_pin("1234", iterations=1000))
+        cls.app = app.App(cfg, dry_run=True)
+        cls.calls = []
+
+        def poster(kind, ident):
+            cls.calls.append((kind, ident))
+            return (b"\xff\xd8\xff\xe0jpeg", "image/jpeg") if ident == "2" else None
+        cls.app.poster = poster
+        cls.old_app = app.Handler.app
+        app.Handler.app = cls.app
+        cls.srv = app.Server(("127.0.0.1", 0), app.Handler)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.port = cls.srv.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        app.Handler.app = cls.old_app
+        cls.app.pool.shutdown(wait=False)
+        cls.tmp.cleanup()
+
+    def get(self, path, cookie=None):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", path, headers={"Cookie": "pc_session=%s" % cookie} if cookie else {})
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        return r.status, dict(r.getheaders()), body
+
+    def test_requires_login(self):
+        self.calls.clear()
+        for path in ("/img/movie/2", "/img/plex/1", "/img/plex-art/2", "/img/movie-art/2", "/img/movie/abc"):
+            status, _h, _b = self.get(path)
+            self.assertEqual(status, 401, path)
+            self.assertEqual(self.get(path, cookie="123.bad")[0], 401, path)
+        self.assertEqual(self.calls, [])
+
+    def test_digits_only_and_cache_headers(self):
+        tok = self.app.new_session()
+        status, h, body = self.get("/img/movie/2", cookie=tok)
+        self.assertEqual((status, h["Content-Type"], body), (200, "image/jpeg", b"\xff\xd8\xff\xe0jpeg"))
+        self.assertEqual(h["Cache-Control"], "private, max-age=86400")
+        self.assertEqual(h["X-Content-Type-Options"], "nosniff")
+        for path in ("/img/plex-art/2", "/img/movie-art/2", "/img/plex/2"):
+            status, h, _b = self.get(path, cookie=tok)
+            self.assertEqual((status, h["Cache-Control"]), (200, "private, max-age=86400"), path)
+        self.assertEqual(self.calls[-3:], [("plex-art", "2"), ("movie-art", "2"), ("plex", "2")])
+        self.calls.clear()
+        for path in ("/img/movie/abc", "/img/movie/2a", "/img/movie/..%2f1", "/img/plex/%31",
+                     "/img/x/1", "/img/movie/", "/img/movie/12345678901", "/img/plex-art/a", "/img/movie-art/"):
+            self.assertEqual(self.get(path, cookie=tok)[0], 404, path)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.get("/img/movie/7", cookie=tok)[0], 404)
+        self.assertEqual(self.calls, [("movie", "7")])
 
 
 if __name__ == "__main__":

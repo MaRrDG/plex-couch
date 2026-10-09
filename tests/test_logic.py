@@ -34,9 +34,9 @@ class TestHitAndRun(unittest.TestCase):
         self.assertEqual(logic.rule_progress(None, None), 0.0)
 
     def test_remaining_text(self):
-        self.assertEqual(logic.hr_remaining_text(0.1, 13 * H), "mai are nevoie de 35h seed sau ratio 1")
-        self.assertEqual(logic.hr_remaining_text(0.1, 13 * H + 1), "mai are nevoie de 35h seed sau ratio 1")
-        self.assertEqual(logic.hr_remaining_text(0, 48 * H - 10), "mai are nevoie de 1h seed sau ratio 1")
+        self.assertEqual(logic.hr_remaining_text(0.1, 13 * H), "mai are nevoie de 35 h sau ratio 1")
+        self.assertEqual(logic.hr_remaining_text(0.1, 13 * H + 1), "mai are nevoie de 35 h sau ratio 1")
+        self.assertEqual(logic.hr_remaining_text(0, 48 * H - 10), "mai are nevoie de 1 h sau ratio 1")
 
     def test_summarize_and_warnings(self):
         ts = [
@@ -47,10 +47,96 @@ class TestHitAndRun(unittest.TestCase):
         s = [logic.summarize_torrent(t) for t in ts]
         self.assertEqual([x["hr"] for x in s], ["pending", "safe", "downloading"])
         self.assertTrue(s[1]["safe"])
-        self.assertEqual(s[0]["remaining"], "mai are nevoie de 48h seed sau ratio 1")
+        self.assertEqual(s[0]["remaining"], "mai are nevoie de 48 h sau ratio 1")
         w = logic.hr_warnings(s)
-        self.assertEqual(w, [{"name": "A", "remaining": "mai are nevoie de 48h seed sau ratio 1"}])
+        self.assertEqual(w, [{"title": "A", "name": "A", "remaining": "mai are nevoie de 48 h sau ratio 1"}])
         self.assertNotIn("tracker", s[0])
+        self.assertNotIn("hash", s[0])
+
+    def test_title_given_or_parsed(self):
+        raw = {"name": "The.Godfather.1972.2160p.WEB.H265-PETRiFiED.mkv", "progress": 1, "ratio": 0.1}
+        self.assertEqual(logic.summarize_torrent(raw)["title"], "The Godfather (1972)")
+        t = logic.summarize_torrent(raw, "The Godfather")
+        self.assertEqual(t["title"], "The Godfather")
+        self.assertEqual(logic.hr_warnings([t])[0]["title"], "The Godfather")
+
+
+class TestReleaseTitle(unittest.TestCase):
+    CASES = [
+        ("The.Godfather.1972.2160p.WEB.H265-PETRiFiED.mkv", "The Godfather (1972)"),
+        ("The.Godfather.1972.2160p.WEB-DL.AAC5.1.H.265-PETRiFiED", "The Godfather (1972)"),
+        ("Anatomy.of.a.Fall.2023.REPACK.2160p.WEB-DL.DDP5.1.HDR.H.265-GROUP", "Anatomy of a Fall (2023)"),
+        ("Dune Part Two 2024 2160p UHD BluRay x265-GROUP", "Dune Part Two (2024)"),
+        ("[YTS.MX] Past Lives (2023) [2160p] [WEB-DL]", "Past Lives (2023)"),
+        ("Perfect Days (2023) [1080p] [BluRay] [5.1] [YTS.MX]", "Perfect Days (2023)"),
+        ("Blade.Runner.2049.2017.2160p.UHD.BluRay.REMUX.HDR.HEVC.Atmos-GROUP", "Blade Runner 2049 (2017)"),
+        ("2001.A.Space.Odyssey.1968.2160p.UHD.BluRay.x265.mkv", "2001 A Space Odyssey (1968)"),
+        ("A.Complete.Unknown.2024.1080p.WEBRip.x264.mp4", "A Complete Unknown (2024)"),
+        ("Mad_Max_Fury_Road_2015_1080p_BluRay_x264", "Mad Max Fury Road (2015)"),
+        ("Some.Movie.2160p.WEB-DL.DDP5.1-GROUP", "Some Movie"),
+        ("The Odyssey", "The Odyssey"),
+    ]
+
+    def test_shapes(self):
+        for name, want in self.CASES:
+            self.assertEqual(logic.release_title(name), want, name)
+
+    def test_empty(self):
+        self.assertEqual(logic.release_title(""), "")
+        self.assertEqual(logic.release_title(None), "")
+
+
+class TestTorrentTitles(unittest.TestCase):
+    MOVIES = [{"id": 2, "title": "The Godfather"}, {"id": 3, "title": "Anatomy of a Fall"}]
+    H1 = "85b755cd2d0a8a7a0e15348b9fdcbff2f1580a55"
+    H2 = "c3" * 20
+
+    def test_history_then_queue_case_insensitive(self):
+        history = [{"downloadId": self.H1.upper(), "movieId": 2, "eventType": "grabbed"}]
+        queue = [{"downloadId": self.H2.upper(), "movieId": 3}]
+        m = logic.torrent_title_map(history, queue, self.MOVIES)
+        self.assertEqual(m, {self.H1.upper(): "The Godfather", self.H2.upper(): "Anatomy of a Fall"})
+        t = {"hash": self.H1, "name": "The.Godfather.1972.2160p.WEB.H265-PETRiFiED.mkv"}
+        self.assertEqual(logic.torrent_title(t, m), "The Godfather")
+        mixed = logic.torrent_title_map([{"downloadId": self.H1.lower(), "movieId": 2}], [], self.MOVIES)
+        self.assertEqual(logic.torrent_title(t, mixed), "The Godfather")
+
+    def test_history_wins_and_unknown_movie_skipped(self):
+        history = [{"downloadId": self.H1, "movieId": 3}, {"downloadId": "FFFF", "movieId": 99}]
+        queue = [{"downloadId": self.H1, "movieId": 2}]
+        m = logic.torrent_title_map(history, queue, self.MOVIES)
+        self.assertEqual(m, {self.H1.upper(): "Anatomy of a Fall"})
+
+    def test_queue_movie_object_and_fallback(self):
+        queue = [{"downloadId": self.H2, "movieId": 7, "movie": {"title": "Past Lives"}}]
+        m = logic.torrent_title_map(None, queue, None)
+        self.assertEqual(logic.torrent_title({"hash": self.H2}, m), "Past Lives")
+        t = {"hash": "ab" * 20, "name": "Past.Lives.2023.2160p.WEB-DL-GROUP"}
+        self.assertEqual(logic.torrent_title(t, m), "Past Lives (2023)")
+        self.assertEqual(logic.torrent_title(t, None), "Past Lives (2023)")
+
+
+class TestImgRoutes(unittest.TestCase):
+    def test_parse_img_path(self):
+        self.assertEqual(logic.parse_img_path("/img/movie/12"), ("movie", "12"))
+        self.assertEqual(logic.parse_img_path("/img/plex/1"), ("plex", "1"))
+        self.assertEqual(logic.parse_img_path("/img/plex-art/1"), ("plex-art", "1"))
+        self.assertEqual(logic.parse_img_path("/img/movie-art/22"), ("movie-art", "22"))
+        for path in ("/img/plex-art/x", "/img/movie-art/", "/img/art/1", "/img/plex-art/1/2"):
+            self.assertIsNone(logic.parse_img_path(path), path)
+        bad = ["/img/movie/abc", "/img/movie/", "/img/movie/1a", "/img/movie/-1", "/img/movie/1/",
+               "/img/movie/../x", "/img/movie/%31", "/img/movie/1 ", "/img/other/1",
+               "/img/movie/１２", "/img/movie/١", "/img/movie/12345678901",
+               "/img/plex/1?x", "/img/movie/1.jpg", "/img/movie/1\n", "", None]
+        for path in bad:
+            self.assertIsNone(logic.parse_img_path(path), path)
+
+    def test_poster_url(self):
+        self.assertEqual(logic.poster_url("movie", 2), "/img/movie/2")
+        self.assertEqual(logic.poster_url("plex", "101"), "/img/plex/101")
+        for ident in (None, "", "x1", "١٢", "1/2"):
+            self.assertIsNone(logic.poster_url("movie", ident), ident)
+        self.assertIsNone(logic.poster_url("tv", 1))
 
 
 class TestTrackerMatch(unittest.TestCase):
@@ -207,9 +293,12 @@ class TestWaitingStatus(unittest.TestCase):
         ]
         w = logic.summarize_waiting(movies, now=self.now)
         self.assertEqual([x["title"] for x in w], ["The Odyssey"])
+        self.assertEqual((w[0]["radarr_id"], w[0]["poster"], w[0]["downloading"]), (1, "/img/movie/1", False))
+        self.assertTrue(logic.summarize_waiting(movies, {1}, now=self.now)[0]["downloading"])
         lib = logic.summarize_library(movies, logic.bazarr_ro_map([
             {"radarrId": 2, "subtitles": [{"code2": "ro", "path": "x"}], "missing_subtitles": []}]))
-        self.assertEqual(lib, [{"title": "The Godfather", "year": 1972, "size_gb": 19.0, "ro_subs": True}])
+        self.assertEqual(lib, [{"title": "The Godfather", "year": 1972, "size_gb": 19.0, "ro_subs": True,
+                                "radarr_id": 2, "poster": "/img/movie/2"}])
         self.assertIsNone(logic.summarize_library(movies, None)[0]["ro_subs"])
         missing = logic.bazarr_ro_map([{"radarrId": 2, "subtitles": [{"code2": "ro"}],
                                         "missing_subtitles": [{"code2": "ro"}]}])
@@ -221,6 +310,13 @@ class TestWaitingStatus(unittest.TestCase):
         self.assertIsNone(logic.parse_timeleft(None))
         self.assertEqual(logic.format_duration_ro(3723), "1h 2m")
         self.assertEqual(logic.format_duration_ro(86410 + 7200), "1z 2h")
+
+    def test_queue_record_poster(self):
+        q = logic.summarize_queue_record({"movieId": 3, "size": 100, "sizeleft": 38, "status": "downloading",
+                                          "trackedDownloadState": "downloading", "timeleft": "00:08:00",
+                                          "movie": {"title": "Anatomy of a Fall", "year": 2023}})
+        self.assertEqual((q["percent"], q["time_left"], q["radarr_id"], q["poster"]),
+                         (62.0, "8 min", 3, "/img/movie/3"))
 
 
 class TestAutoMonitor(unittest.TestCase):
@@ -280,8 +376,34 @@ class TestPlexParse(unittest.TestCase):
         self.assertEqual(s["decision_ro"], "redare directă")
         pub = logic.public_session(s)
         self.assertNotIn("address", pub)
+        self.assertEqual((pub["rating_key"], pub["poster"], pub["backdrop"]), (None, None, None))
+        data["MediaContainer"]["Metadata"][0]["ratingKey"] = "1"
+        s = logic.parse_plex_sessions(data)[0]
+        self.assertEqual((s["rating_key"], s["poster"], s["backdrop"]), ("1", "/img/plex/1", None))
+        data["MediaContainer"]["Metadata"][0]["art"] = "/library/metadata/1/art/123"
+        self.assertEqual(logic.parse_plex_sessions(data)[0]["backdrop"], "/img/plex-art/1")
         data["MediaContainer"]["Metadata"][0]["TranscodeSession"] = {"videoDecision": "transcode"}
         self.assertTrue(logic.parse_plex_sessions(data)[0]["transcode"])
+
+    def test_backdrop_fallback_to_radarr(self):
+        movies = [{"id": 2, "title": "The Godfather", "year": 1972}, {"id": 3, "title": "Other", "year": 1972}]
+        s = {"title": "The Godfather", "year": 1972, "backdrop": None}
+        self.assertEqual(logic.with_backdrop_fallback(dict(s), movies)["backdrop"], "/img/movie-art/2")
+        self.assertIsNone(logic.with_backdrop_fallback(dict(s, year=1990), movies)["backdrop"])
+        self.assertIsNone(logic.with_backdrop_fallback(dict(s), None)["backdrop"])
+        kept = dict(s, backdrop="/img/plex-art/1")
+        self.assertEqual(logic.with_backdrop_fallback(kept, movies)["backdrop"], "/img/plex-art/1")
+
+    def test_episode_uses_show_poster(self):
+        data = {"MediaContainer": {"Metadata": [{
+            "title": "Pilot", "type": "episode", "grandparentTitle": "Show", "parentIndex": 1, "index": 2,
+            "ratingKey": "50", "grandparentRatingKey": "40", "Player": {"state": "playing"}}]}}
+        s = logic.parse_plex_sessions(data)[0]
+        self.assertEqual(s["title"], "Show S01E02 – Pilot")
+        self.assertEqual(s["poster"], "/img/plex/40")
+        self.assertIsNone(s["backdrop"])
+        data["MediaContainer"]["Metadata"][0]["grandparentArt"] = "/library/metadata/40/art/9"
+        self.assertEqual(logic.parse_plex_sessions(data)[0]["backdrop"], "/img/plex-art/40")
 
     def test_empty(self):
         self.assertEqual(logic.parse_plex_sessions({"MediaContainer": {"size": 0}}), [])

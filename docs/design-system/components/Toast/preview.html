@@ -1,0 +1,12 @@
+<!-- @dsCard group="Feedback" height=130 subtitle="Confirmation and error" -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap">
+<style>
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font-sans); }
+  .wrap { max-width: 340px; padding: var(--space-4); display: grid; gap: var(--space-3); justify-items: center; }
+  .toast { display: inline-flex; align-items: center; gap: 8px; background: var(--surface-2); border-radius: var(--radius-md); padding: 10px 14px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--danger); flex: none; }
+</style>
+<div class="wrap">
+  <div class="toast body" role="status">Monitoarele s-au stins.</div>
+  <div class="toast body" role="status"><i class="dot"></i>PC-ul nu răspunde. Verifică dacă e pornit.</div>
+</div>

@@ -53,6 +53,9 @@ STATIC_FILES = {
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
+    "/tokens.css": ("tokens.css", "text/css; charset=utf-8"),
+    "/fonts/figtree-latin.woff2": ("fonts/figtree-latin.woff2", "font/woff2"),
+    "/fonts/figtree-latin-ext.woff2": ("fonts/figtree-latin-ext.woff2", "font/woff2"),
     "/sw.js": ("sw.js", "text/javascript; charset=utf-8"),
     "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json; charset=utf-8"),
     "/icon.svg": ("icon.svg", "image/svg+xml"),
@@ -65,6 +68,7 @@ TEMPLATED = {"index.html", "manifest.webmanifest"}
 STATIC_HEADERS = {
     "/sw.js": {"Service-Worker-Allowed": "/"},
 }
+IMG_CACHE_CONTROL = "private, max-age=86400"
 INSTALL_PAGE = "install.html"
 CA_CONTENT_TYPE = "application/x-x509-ca-cert"
 
@@ -172,6 +176,7 @@ class App:
             "bazarr": self.pool.submit(s.bazarr_movies),
             "prowlarr": self.pool.submit(s.prowlarr_ping),
             "qbittorrent": self.pool.submit(s.filelist_torrents),
+            "radarr_history": self.pool.submit(s.radarr_history),
         }
         results, errors = {}, {}
         deadline = time.monotonic() + 6
@@ -192,8 +197,10 @@ class App:
         }
         queue = results.get("radarr_queue")
         movies = results.get("radarr_movies")
-        torrents = [logic.summarize_torrent(t) for t in results.get("qbittorrent") or []]
-        torrents.sort(key=lambda t: ({"pending": 0, "downloading": 1, "safe": 2}[t["hr"]], t["name"].lower()))
+        titles = logic.torrent_title_map(results.get("radarr_history"), queue, movies)
+        torrents = [logic.summarize_torrent(t, logic.torrent_title(t, titles))
+                    for t in results.get("qbittorrent") or []]
+        torrents.sort(key=lambda t: ({"pending": 0, "downloading": 1, "safe": 2}[t["hr"]], t["title"].lower()))
         ro_map = logic.bazarr_ro_map(results["bazarr"]) if "bazarr" in results else None
         queue_ids = {r.get("movieId") for r in queue or []}
 
@@ -203,7 +210,8 @@ class App:
             "dry_run": self.dry_run,
             "pc": pc_info(self.config.data.get("disks") or []),
             "services": services,
-            "now_playing": [logic.public_session(x) for x in results.get("plex") or []],
+            "now_playing": [logic.with_backdrop_fallback(logic.public_session(x), movies)
+                            for x in results.get("plex") or []],
             "downloads": None if queue is None else [logic.summarize_queue_record(r) for r in queue],
             "waiting": None if movies is None else logic.summarize_waiting(movies, queue_ids),
             "library": None if movies is None else logic.summarize_library(movies, ro_map),
@@ -212,6 +220,19 @@ class App:
             "power": self.actions.pending(),
             "settings": self.config.settings,
         }
+
+    # -- posters ------------------------------------------------------------
+    def poster(self, kind, ident):
+        """(bytes, content_type) for /img/<kind>/<ident>, or None. ident is digits only."""
+        if self.demo:
+            return demo.poster(kind, ident)
+        fetch = {
+            "movie": self.services.radarr_poster,
+            "plex": self.services.plex_poster,
+            "movie-art": self.services.radarr_fanart,
+            "plex-art": self.services.plex_art,
+        }.get(kind)
+        return fetch(ident) if fetch else None
 
     # -- background: auto monitors off -------------------------------------
     def auto_monitor_loop(self, stop):
@@ -259,8 +280,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store" if ctype.startswith("application/json") else "no-cache")
-        for k, v in (headers or {}).items():
+        headers = headers or {}
+        if "Cache-Control" not in headers:
+            self.send_header("Cache-Control", "no-store" if ctype.startswith("application/json") else "no-cache")
+        for k, v in headers.items():
             self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
@@ -312,6 +335,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/status":
                 return self._json(200, self.app.status())
             return self._json(404, {"error": "Necunoscut."})
+        if path.startswith("/img/"):
+            return self._image(path)
         entry = STATIC_FILES.get(path)
         if not entry:
             return self._send(404, b"Not found", "text/plain; charset=utf-8")
@@ -322,6 +347,17 @@ class Handler(BaseHTTPRequestHandler):
             safe = _html_escape(app_name) if name.endswith(".html") else json.dumps(app_name)[1:-1]
             body = body.replace(b"{{APP_NAME}}", safe.encode("utf-8"))
         self._send(200, body, ctype, headers=STATIC_HEADERS.get(path))
+
+    def _image(self, path):
+        """Poster proxy: same login and LAN checks as /api; the service keys stay server-side."""
+        if not self.app.session_ok(self._token()):
+            return self._json(401, {"error": "Autentificare necesară."})
+        parsed = logic.parse_img_path(path)
+        img = self.app.poster(*parsed) if parsed else None
+        if not img:
+            return self._send(404, b"Not found", "text/plain; charset=utf-8")
+        body, ctype = img
+        self._send(200, body, ctype, headers={"Cache-Control": IMG_CACHE_CONTROL})
 
     # -- POST -----------------------------------------------------------------
     def do_POST(self):

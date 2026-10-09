@@ -1,0 +1,15 @@
+<!-- @dsCard group="Navigation" height=96 subtitle="Acasă selected" -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap">
+<style>
+  body { margin: 0; background: var(--bg); font-family: var(--font-sans); }
+  .tabs { display: grid; grid-template-columns: repeat(3, 1fr); max-width: var(--size-content); margin: 0 auto; border-top: 1px solid var(--line); padding: 8px 10px 14px; color: var(--muted); }
+  .tabs a { display: grid; justify-items: center; gap: 3px; color: inherit; text-decoration: none; min-height: var(--size-tap); }
+  .tabs a[aria-current="page"] { color: var(--accent); }
+  .tabs svg { width: 24px; height: 24px; }
+  .tabs a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
+</style>
+<nav class="tabs" aria-label="Navigare">
+  <a href="#" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10.5 12 4l8 6.5V20h-5.5v-5.5h-5V20H4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg><span class="tab">Acasă</span></a>
+  <a href="#"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8 5v14M16 5v14M4 9.5h4M4 14.5h4M16 9.5h4M16 14.5h4" stroke="currentColor" stroke-width="1.8"/></svg><span class="tab">Filme</span></a>
+  <a href="#"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="11.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 20h6M12 16v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><span class="tab">PC</span></a>
+</nav>

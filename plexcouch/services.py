@@ -19,6 +19,8 @@ log = logging.getLogger("plexcouch")
 
 TIMEOUT = 2.5
 KEY_TTL = 300
+IMG_TIMEOUT = 6
+IMG_MAX_BYTES = 4 * 1024 * 1024
 
 
 class _TTLCache:
@@ -49,6 +51,23 @@ def _get_json(url, headers=None, timeout=TIMEOUT, opener=None):
     with o(req, timeout=timeout) as r:
         body = r.read()
     return json.loads(body.decode("utf-8")) if body else None
+
+
+def _get_image(url, headers, timeout=IMG_TIMEOUT):
+    """GET an image. Returns (bytes, content_type) or None if the upstream has none.
+    Errors are logged by type only (never the URL or headers)."""
+    req = urllib.request.Request(url, headers=headers or {})
+    req.add_header("Accept", "image/*")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            ctype = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            body = r.read(IMG_MAX_BYTES + 1)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        log.debug("image fetch failed: %s", type(e).__name__)
+        return None
+    if not body or len(body) > IMG_MAX_BYTES:
+        return None
+    return body, (ctype if ctype.startswith("image/") else "image/jpeg")
 
 
 def read_radarr_key(path):
@@ -125,6 +144,24 @@ class Services:
     def plex_sessions(self):
         return logic.parse_plex_sessions(self.plex_sessions_raw())
 
+    def _plex_photo(self, rating_key, image, width, height):
+        rating_key = str(rating_key)
+        if not (rating_key.isascii() and rating_key.isdigit()):
+            return None
+        token = self._key("plex")
+        src = "/library/metadata/%s/%s" % (rating_key, image)
+        query = urllib.parse.urlencode({"width": width, "height": height, "minSize": 1, "upscale": 1, "url": src})
+        headers = {"X-Plex-Token": token} if token else {}
+        return _get_image(self._url("plex", "/photo/:/transcode?" + query), headers)
+
+    def plex_poster(self, rating_key):
+        """Poster for a Plex item, resized by Plex's photo transcoder (about 240x360)."""
+        return self._plex_photo(rating_key, "thumb", 240, 360)
+
+    def plex_art(self, rating_key):
+        """Backdrop (art) for a Plex item, about 720x405."""
+        return self._plex_photo(rating_key, "art", 720, 405)
+
     # -- Radarr -----------------------------------------------------------
     def _radarr(self, path):
         return _get_json(self._url("radarr", "/api/v3" + path), {"X-Api-Key": self._key("radarr")})
@@ -135,6 +172,32 @@ class Services:
 
     def radarr_movies(self):
         return self.cache.get("radarr_movies", 30, lambda: self._radarr("/movie") or [])
+
+    def radarr_history(self):
+        """Recent 'grabbed' events: downloadId (torrent hash, upper case) -> movieId."""
+        def load():
+            data = self._radarr("/history?eventType=1&pageSize=200")
+            return (data or {}).get("records") or []
+        return self.cache.get("radarr_history", 60, load)
+
+    def radarr_poster(self, movie_id):
+        """Radarr's local poster for a movie: the 500px copy, else the original."""
+        return self._radarr_cover(movie_id, ("poster-500.jpg", "poster.jpg"))
+
+    def radarr_fanart(self, movie_id):
+        """Radarr's local backdrop for a movie: the 360px copy, else the original."""
+        return self._radarr_cover(movie_id, ("fanart-360.jpg", "fanart.jpg"))
+
+    def _radarr_cover(self, movie_id, names):
+        movie_id = str(movie_id)
+        if not (movie_id.isascii() and movie_id.isdigit()):
+            return None
+        headers = {"X-Api-Key": self._key("radarr")}
+        for name in names:
+            img = _get_image(self._url("radarr", "/api/v3/mediacover/%s/%s" % (movie_id, name)), headers)
+            if img:
+                return img
+        return None
 
     # -- Bazarr -----------------------------------------------------------
     def bazarr_movies(self):

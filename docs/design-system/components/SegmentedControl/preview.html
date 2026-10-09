@@ -1,0 +1,20 @@
+<!-- @dsCard group="Navigation" height=88 subtitle="Bibliotecă selected" -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap">
+<style>
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font-sans); }
+  .seg { max-width: 300px; margin: var(--space-4); display: grid; grid-template-columns: 1fr 1fr; background: var(--surface); border-radius: var(--radius-md); padding: 3px; }
+  .seg button { font: inherit; font-size: 13px; font-weight: 600; border: 0; background: transparent; color: var(--muted); border-radius: 9px; min-height: 36px; cursor: pointer; }
+  .seg button[aria-selected="true"] { background: var(--surface-2); color: var(--ink); }
+  .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+<div class="seg" role="tablist" aria-label="Filme">
+  <button role="tab" aria-selected="true" type="button">Bibliotecă</button>
+  <button role="tab" aria-selected="false" type="button">Urmează</button>
+</div>
+<script>
+  Array.prototype.forEach.call(document.querySelectorAll('.seg button'), function (b) {
+    b.addEventListener('click', function () {
+      Array.prototype.forEach.call(document.querySelectorAll('.seg button'), function (x) { x.setAttribute('aria-selected', String(x === b)); });
+    });
+  });
+</script>

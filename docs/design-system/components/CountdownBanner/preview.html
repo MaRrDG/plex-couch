@@ -1,0 +1,17 @@
+<!-- @dsCard group="Feedback" height=190 subtitle="42 seconds left" -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap">
+<style>
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font-sans); }
+  .banner { max-width: 340px; margin: var(--space-4); background: var(--surface); border-radius: var(--radius-lg); padding: var(--space-4); display: grid; gap: var(--space-3); }
+  .line { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .countdown { font-variant-numeric: tabular-nums; }
+  .bar { height: 4px; border-radius: var(--radius-pill); background: var(--surface-2); overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--danger); }
+  .btn { font: inherit; font-size: 15px; font-weight: 600; min-height: var(--size-tap); border-radius: var(--radius-md); border: 0; background: var(--accent); color: var(--on-accent); cursor: pointer; }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+<div class="banner" role="status">
+  <div class="line"><span class="body-strong">PC-ul se oprește în</span><span class="countdown">42&nbsp;s</span></div>
+  <div class="bar" aria-hidden="true"><i style="width:70%"></i></div>
+  <button class="btn" type="button">Anulează oprirea</button>
+</div>

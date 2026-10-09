@@ -1,0 +1,17 @@
+<!-- @dsCard group="Feedback" height=170 subtitle="Download, seed done, disk" -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap">
+<style>
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font-sans); }
+  .wrap { max-width: 340px; padding: var(--space-4); display: grid; gap: var(--space-5); }
+  .item { display: grid; gap: var(--space-1); }
+  .row { display: flex; justify-content: space-between; align-items: baseline; }
+  .row .data { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bar { height: 4px; border-radius: var(--radius-pill); background: var(--surface-2); overflow: hidden; margin-top: 6px; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .bar.ok i { background: var(--ok); }
+</style>
+<div class="wrap">
+  <div class="item"><div class="row"><span class="tile-label">Anatomy of a Fall</span><span class="data">62%, 8 min</span></div><div class="bar" role="progressbar" aria-valuenow="62" aria-valuemin="0" aria-valuemax="100"><i style="width:62%"></i></div></div>
+  <div class="item"><div class="row"><span class="tile-label">Dune: Part Two</span><span class="data">gata</span></div><div class="bar ok" role="progressbar" aria-valuenow="100" aria-valuemin="0" aria-valuemax="100"><i style="width:100%"></i></div></div>
+  <div class="item"><div class="row"><span class="tile-label">Spațiu pe D:</span><span class="data">807 GB liberi din 932 GB</span></div><div class="bar" role="progressbar" aria-valuenow="13" aria-valuemin="0" aria-valuemax="100"><i style="width:13%"></i></div></div>
+</div>

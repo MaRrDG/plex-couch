@@ -55,12 +55,12 @@ def hr_status(progress, ratio, seeding_time_s):
 
 
 def hr_remaining_text(ratio, seeding_time_s):
-    """Romanian description of what is left, e.g. 'mai are nevoie de 35h seed sau ratio 1'."""
+    """Romanian description of what is left, e.g. 'mai are nevoie de 35 h sau ratio 1'."""
     if is_hr_safe(ratio, seeding_time_s):
         return "regula îndeplinită"
     hours_left = HR_SEED_HOURS - (seeding_time_s or 0) / 3600.0
     hours_left = max(1, int(math.ceil(hours_left)))
-    return "mai are nevoie de %dh seed sau ratio 1" % hours_left
+    return "mai are nevoie de %d h sau ratio 1" % hours_left
 
 
 QBIT_STATE_RO = {
@@ -91,13 +91,16 @@ def qbit_state_ro(state):
     return QBIT_STATE_RO.get(state or "", state or "necunoscut")
 
 
-def summarize_torrent(t):
-    """Turn a qBittorrent /torrents/info entry into the API shape (no tracker URL)."""
+def summarize_torrent(t, title=None):
+    """Turn a qBittorrent /torrents/info entry into the API shape (no tracker URL, no hash).
+
+    title: the movie title for the UI (see torrent_title); defaults to one parsed from the name."""
     progress = float(t.get("progress") or 0)
     ratio = float(t.get("ratio") or 0)
     seeding = int(t.get("seeding_time") or 0)
     status = hr_status(progress, ratio, seeding)
     return {
+        "title": title or release_title(t.get("name")),
         "name": t.get("name") or "",
         "state": t.get("state") or "",
         "state_ro": qbit_state_ro(t.get("state")),
@@ -117,10 +120,113 @@ def summarize_torrent(t):
 
 def hr_warnings(torrent_summaries):
     return [
-        {"name": t["name"], "remaining": t["remaining"]}
+        {"title": t.get("title") or release_title(t["name"]), "name": t["name"], "remaining": t["remaining"]}
         for t in torrent_summaries
         if t["hr"] == "pending"
     ]
+
+
+# ---------------------------------------------------------------------------
+# Movie titles for torrents (the UI never shows release file names)
+# ---------------------------------------------------------------------------
+
+_VIDEO_EXT_RE = re.compile(r"\.(mkv|mp4|avi|m4v|mov|wmv|ts|m2ts|iso)$", re.IGNORECASE)
+_YEAR_RE = re.compile(r"^[(\[]?((?:19|20)\d\d)[)\]]?$")
+# Tokens that start the technical part of a release name (compared lower case, without dots).
+_RELEASE_TAGS = {
+    "2160p", "1080p", "1080i", "720p", "576p", "480p", "4k", "uhd", "fhd",
+    "web", "webdl", "web-dl", "webrip", "web-rip", "hdtv", "bluray", "blu-ray", "bdrip", "brrip",
+    "bdremux", "remux", "dvdrip", "hdrip", "hdr", "hdr10", "hdr10+", "hdr10plus", "dovi",
+    "x264", "x265", "h264", "h265", "hevc", "avc", "av1", "10bit", "8bit",
+    "repack", "proper", "rerip", "extended", "remastered", "unrated", "uncut", "imax",
+    "multi", "subbed", "dubbed", "aac", "ac3", "dts", "dts-hd", "truehd",
+    "atmos", "ddp", "eac3", "flac", "amzn", "dsnp", "hmax", "atvp",
+}
+_TAG_PREFIX_RE = re.compile(r"^(ddp\d|dd\d|aac\d|ac3\d|dts-|x26[45]|h26[45]|\d{3,4}[pi]$)", re.IGNORECASE)
+
+
+def _is_release_tag(tok):
+    t = tok.lower().strip("[]()")
+    return t in _RELEASE_TAGS or bool(_TAG_PREFIX_RE.match(t))
+
+
+def release_title(name):
+    """A clean 'Title (Year)' from a release or file name, e.g.
+    'The.Godfather.1972.2160p.WEB.H265-PETRiFiED.mkv' -> 'The Godfather (1972)'.
+    Without a year it returns the title part only; never the raw name for a parseable one."""
+    s = (name or "").strip()
+    if not s:
+        return ""
+    s = _VIDEO_EXT_RE.sub("", s)
+    # Leading site/group tags: "[YTS.MX] ", "[ www.site.org ] - "
+    s = re.sub(r"^(\s*\[[^\]]*\]\s*[-_.]?\s*)+", "", s)
+    if " " not in s.strip() or s.count(".") >= 3 or "_" in s:
+        s = re.sub(r"[._]+", " ", s)
+    s = re.sub(r"[\[\]]", " ", s)
+    tokens = s.split()
+    if not tokens:
+        return (name or "").strip()
+
+    # The release year: a year-like token after at least one title word, preferably the one
+    # followed by a release tag or nothing ('Blade Runner 2049 2017 2160p' -> 2017,
+    # '2001 A Space Odyssey 1968' -> 1968).
+    years = [i for i, tok in enumerate(tokens) if i > 0 and _YEAR_RE.match(tok)]
+    strong = [i for i in years if i + 1 == len(tokens) or _is_release_tag(tokens[i + 1])]
+    year_idx = (strong or years or [None])[-1]
+    end = year_idx
+    if end is None:
+        end = next((i for i, tok in enumerate(tokens) if i > 0 and _is_release_tag(tok)), len(tokens))
+    title = " ".join(tokens[:end]).strip(" -–_.(")
+    if not title:
+        return (name or "").strip()
+    if year_idx is not None:
+        return "%s (%s)" % (title, _YEAR_RE.match(tokens[year_idx]).group(1))
+    return title
+
+
+def torrent_title_map(history_records, queue_records, movies):
+    """Map torrent hash (upper case) -> movie title using Radarr.
+
+    Radarr's 'grabbed' history and its queue carry the download client id, which for
+    qBittorrent is the torrent hash in upper case, plus the movieId. History wins over the
+    queue; ids without a known movie are skipped (the caller falls back to release_title)."""
+    by_id = {m.get("id"): m for m in movies or [] if m.get("id") is not None}
+    out = {}
+    for records in (history_records or [], queue_records or []):
+        for rec in records:
+            dl = str(rec.get("downloadId") or "").strip().upper()
+            movie = by_id.get(rec.get("movieId")) or rec.get("movie") or {}
+            title = movie.get("title")
+            if dl and title and dl not in out:
+                out[dl] = title
+    return out
+
+
+def torrent_title(t, title_map):
+    """The movie title for a raw qBittorrent torrent: Radarr first, then the parsed name."""
+    h = str(t.get("hash") or "").upper()
+    return (title_map or {}).get(h) or release_title(t.get("name"))
+
+
+# ---------------------------------------------------------------------------
+# Poster image routes
+# ---------------------------------------------------------------------------
+
+# movie: Radarr poster, plex: Plex poster, plex-art / movie-art: backdrops (Plex art, Radarr fanart).
+IMG_KINDS = ("movie", "plex", "plex-art", "movie-art")
+
+
+def parse_img_path(path):
+    """'/img/movie/12' -> ('movie', '12'); None for anything else (ids are 1-10 ASCII digits)."""
+    m = re.fullmatch(r"/img/(movie|plex|plex-art|movie-art)/([0-9]{1,10})", path or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+def poster_url(kind, ident):
+    ident = str(ident if ident is not None else "")
+    if kind in IMG_KINDS and ident.isascii() and ident.isdigit() and len(ident) <= 10:
+        return "/img/%s/%s" % (kind, ident)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +489,8 @@ def summarize_queue_record(rec):
         "time_left": format_duration_ro(secs),
         "status": QUEUE_STATUS_RO.get(state, state),
         "movie_id": rec.get("movieId"),
+        "radarr_id": rec.get("movieId"),
+        "poster": poster_url("movie", rec.get("movieId")),
     }
 
 
@@ -412,6 +520,8 @@ def summarize_library(movies, ro_map):
             "year": m.get("year"),
             "size_gb": round(size / 1024 ** 3, 1),
             "ro_subs": ro,
+            "radarr_id": m.get("id"),
+            "poster": poster_url("movie", m.get("id")),
         })
     out.sort(key=lambda x: x["title"].lower())
     return out
@@ -426,6 +536,9 @@ def summarize_waiting(movies, queue_movie_ids=(), now=None):
             "title": m.get("title") or "",
             "year": m.get("year"),
             "status": waiting_status(m, now=now, downloading=m.get("id") in queue_movie_ids),
+            "downloading": m.get("id") in queue_movie_ids,
+            "radarr_id": m.get("id"),
+            "poster": poster_url("movie", m.get("id")),
         }
         for m in items
     ]
@@ -473,6 +586,10 @@ def parse_plex_sessions(data):
         offset = meta.get("viewOffset") or 0
         decision = playback_decision(meta)
         state = player.get("state") or ""
+        # Episodes show the show's poster (2:3), movies their own.
+        rating_key = str(meta.get("grandparentRatingKey") if meta.get("type") == "episode"
+                         and meta.get("grandparentRatingKey") else meta.get("ratingKey") or "")
+        has_art = bool(meta.get("grandparentArt") if meta.get("type") == "episode" else meta.get("art"))
         out.append({
             "key": str(meta.get("sessionKey") or (meta.get("Session") or {}).get("id") or ""),
             "title": title,
@@ -488,6 +605,9 @@ def parse_plex_sessions(data):
             "decision_ro": DECISION_RO[decision],
             "transcode": decision == "transcode",
             "address": player.get("address") or "",
+            "rating_key": rating_key if poster_url("plex", rating_key) else None,
+            "poster": poster_url("plex", rating_key),
+            "backdrop": poster_url("plex-art", rating_key) if has_art else None,
         })
     return out
 
@@ -495,6 +615,19 @@ def parse_plex_sessions(data):
 def public_session(s):
     """Strip internal fields before returning to the client."""
     return {k: v for k, v in s.items() if k not in ("address", "key")}
+
+
+def with_backdrop_fallback(session, movies):
+    """When Plex has no art for a playing movie, use Radarr's fanart of the same movie
+    (matched by title and year). Returns the session dict (updated in place)."""
+    if session.get("backdrop") or not movies:
+        return session
+    title = (session.get("title") or "").casefold()
+    for m in movies:
+        if (m.get("title") or "").casefold() == title and m.get("year") == session.get("year"):
+            session["backdrop"] = poster_url("movie-art", m.get("id"))
+            break
+    return session
 
 
 def auto_monitor_decision(handled, sessions, own_ips, enabled):

@@ -1,0 +1,29 @@
+<!-- @dsCard group="Overlays" height=420 subtitle="Shutdown with a seed warning" -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap">
+<style>
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font-sans); }
+  .stage { position: relative; max-width: 380px; height: 420px; overflow: hidden; }
+  .scrim { position: absolute; inset: 0; background: var(--scrim); }
+  .sheet { position: absolute; left: 0; right: 0; bottom: 0; background: var(--surface); border-radius: var(--radius-xl) var(--radius-xl) 0 0; box-shadow: var(--shadow-sheet); padding: var(--space-4) var(--space-4) var(--space-6); display: grid; gap: var(--space-3); }
+  .grab { width: 36px; height: 4px; border-radius: var(--radius-pill); background: var(--line); justify-self: center; }
+  .warn { color: var(--accent); margin: 0; }
+  .list { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+  .list .meta { color: var(--muted); }
+  .btn { font: inherit; font-size: 15px; font-weight: 600; min-height: var(--size-tap); border-radius: var(--radius-md); border: 0; cursor: pointer; }
+  .btn.confirm { background: var(--danger); color: var(--on-danger); }
+  .btn.plain { background: var(--surface-2); color: var(--ink); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  p { margin: 0; }
+</style>
+<div class="stage">
+  <div class="scrim"></div>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="t">
+    <span class="grab" aria-hidden="true"></span>
+    <span class="title-card" id="t">Oprești PC-ul?</span>
+    <p class="body">Se oprește în 60 de secunde. Poți anula până atunci.</p>
+    <p class="body warn">Un torrent n-a terminat seed-ul pe FileList. Ai voie să închizi, dar în 7 zile trebuie să ajungă la ratio 1 sau 48 h.</p>
+    <ul class="list"><li><span class="tile-label">The Godfather</span> <span class="meta">mai are nevoie de 45 h sau ratio 1</span></li></ul>
+    <button class="btn confirm" type="button">Oprește PC-ul</button>
+    <button class="btn plain" type="button">Anulează</button>
+  </div>
+</div>

@@ -1,0 +1,21 @@
+<!-- @dsCard group="Controls" height=260 subtitle="Action, toggle on, danger" -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap">
+<style>
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font-sans); }
+  .grid { max-width: 340px; padding: var(--space-4); display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); }
+  .tile { font: inherit; color: var(--ink); text-align: left; background: var(--surface); border: 0; border-radius: var(--radius-lg); padding: var(--space-4); min-height: var(--size-tile); display: grid; align-content: space-between; gap: 18px; cursor: pointer; }
+  .tile svg { width: 22px; height: 22px; color: var(--accent); }
+  .tile .state { display: block; color: var(--muted); margin-top: 2px; }
+  .tile:active { background: var(--surface-2); }
+  .tile[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+  .tile[aria-pressed="true"] svg { color: var(--on-accent); }
+  .tile[aria-pressed="true"] .state { color: var(--on-accent-muted); }
+  .tile.danger svg { color: var(--danger); }
+  .tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+<div class="grid">
+  <button class="tile" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="11.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 20h6M12 16v4M4 4l16 13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><span class="tile-label">Stinge monitoarele</span></button>
+  <button class="tile" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="11.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 20h6M12 16v4M12 7.5v1.2M12 12.6v1.2M8.6 10.3h1.2M14.2 10.3h1.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><span class="tile-label">Aprinde monitoarele</span></button>
+  <button class="tile" type="button" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6.5v11l9-5.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M3.5 12a8.5 8.5 0 0 1 2.2-5.7M20.5 12a8.5 8.5 0 0 1-2.2 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></svg><span class="tile-label">Stinge la play<span class="state meta">Pornit</span></span></button>
+  <button class="tile danger" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5v8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M7.2 6.6a7.5 7.5 0 1 0 9.6 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><span class="tile-label">Oprește PC-ul<span class="state meta">în 60 de secunde</span></span></button>
+</div>
