@@ -2,8 +2,8 @@
 
 (function () {
   const POLL_MS = 5000;
+  const TIMEOUT_MS = 8000;
   const PIN_LEN = 6;
-  const RING = 351.86; // 2 * PI * 56
   const CSRF = { 'X-Requested-With': 'plex-couch' };
   const SERVICES = [
     ['plex', 'Plex'], ['radarr', 'Radarr'], ['prowlarr', 'Prowlarr'],
@@ -23,6 +23,7 @@
   const nf = (d) => new Intl.NumberFormat('ro-RO', { minimumFractionDigits: d, maximumFractionDigits: d });
   const n0 = nf(0), n1 = nf(1), n2 = nf(2);
   const lower = (s) => (s || '').toLocaleLowerCase('ro-RO');
+  const hhmm = (d) => d.toLocaleTimeString('ro-RO', { hour: '2-digit', minute: '2-digit' });
   function clock(sec) {
     const s = Math.max(0, Math.floor(sec || 0));
     const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
@@ -48,6 +49,10 @@
     if (text !== undefined && text !== null) e.textContent = text;
     return e;
   }
+  function kids(parent, ...nodes) {
+    for (const n of nodes) if (n) parent.appendChild(n);
+    return parent;
+  }
   function bar(fraction, cls) {
     const b = el('div', 'bar' + (cls ? ' ' + cls : ''));
     const s = el('span');
@@ -55,14 +60,45 @@
     b.appendChild(s);
     return b;
   }
-  function line(left, right, leftCls) {
-    const r = el('div', 'row-line');
-    r.appendChild(el('span', leftCls || 'title', left));
-    if (right !== undefined && right !== null) r.appendChild(typeof right === 'string' ? el('span', 'aside num', right) : right);
+  const cell = (...nodes) => kids(el('div', 'cell'), ...nodes);
+  // Release names have no spaces: allow line breaks only after dots, dashes and underscores.
+  function breakable(text, cls) {
+    const span = el('span', cls);
+    for (const part of String(text || '').split(/(?<=[._-])/)) {
+      span.appendChild(document.createTextNode(part));
+      span.appendChild(document.createElement('wbr'));
+    }
+    return span;
+  }
+  // A title line with an optional right-hand value.
+  function row(left, right, leftCls) {
+    const r = el('div', 'row');
+    r.appendChild(typeof left === 'string' ? el('span', 'grow ' + (leftCls || 'title'), left) : left);
+    if (right != null) r.appendChild(typeof right === 'string' ? el('span', 'aside num', right) : right);
     return r;
   }
-  const note = (text, cls) => el('p', 'note' + (cls ? ' ' + cls : ''), text);
+  const sub = (text, cls) => el('p', 'sub' + (cls ? ' ' + cls : ''), text);
+  const foot = (text, cls) => el('p', 'foot-note num' + (cls ? ' ' + cls : ''), text);
+  const empty = (text, cls) => cell(el('p', cls || 'empty', text));
   const fill = (id, nodes) => $(id).replaceChildren(...nodes);
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  function checkmark() {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 20 20');
+    svg.setAttribute('class', 'check');
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', 'gata');
+    const p = document.createElementNS(SVG_NS, 'path');
+    p.setAttribute('d', 'M4 10.5l4 4 8-9');
+    p.setAttribute('fill', 'none');
+    p.setAttribute('stroke', 'currentColor');
+    p.setAttribute('stroke-width', '2.2');
+    p.setAttribute('stroke-linecap', 'round');
+    p.setAttribute('stroke-linejoin', 'round');
+    svg.appendChild(p);
+    return svg;
+  }
 
   let toastTimer = null;
   function toast(text, isErr) {
@@ -75,14 +111,27 @@
   }
 
   // ---------- network ----------
+  // err.offline = the PC did not answer (network error or timeout).
   async function api(path, body) {
-    const opts = { credentials: 'same-origin', cache: 'no-store', headers: {} };
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+    const opts = { credentials: 'same-origin', cache: 'no-store', headers: {}, signal: ctrl.signal };
     if (body !== undefined) {
       opts.method = 'POST';
       opts.headers = Object.assign({ 'Content-Type': 'application/json' }, CSRF);
       opts.body = JSON.stringify(body);
     }
-    const r = await fetch(path, opts);
+    let r;
+    try {
+      r = await fetch(path, opts);
+    } catch (e) {
+      const err = new Error('Nu mă pot conecta la PC. Verifică Wi-Fi-ul.');
+      err.offline = true;
+      throw err;
+    } finally {
+      clearTimeout(to);
+    }
+    setOffline(false);
     let data = null;
     try { data = await r.json(); } catch (e) { data = null; }
     if (r.status === 401 && path !== '/api/login') {
@@ -96,6 +145,12 @@
     }
     return data;
   }
+  function setOffline(on) {
+    $('offline').hidden = !on;
+    document.body.classList.toggle('is-offline', on);
+    for (const id of ['mon-off', 'mon-on', 'auto-off']) $(id).disabled = on;
+    for (const id of ['pw-shutdown-row', 'pw-restart-row']) $(id).disabled = on || !!pendingPower;
+  }
 
   // ---------- login ----------
   let pin = '';
@@ -106,6 +161,8 @@
   function drawDots() {
     const dots = $('pin-dots').children;
     for (let i = 0; i < dots.length; i++) dots[i].classList.toggle('on', i < pin.length);
+    $('kp-del').classList.toggle('invisible', !pin.length);
+    $('kp-ok').classList.toggle('invisible', pin.length < 4 || pin.length >= PIN_LEN);
   }
   function setKeypad(enabled) {
     for (const b of $('keypad').querySelectorAll('button')) b.disabled = !enabled;
@@ -181,15 +238,16 @@
     else if (e.key === 'Enter') k = 'ok';
     if (!k) return;
     e.preventDefault();
-    const b = $('keypad').querySelector(`[data-k="${k}"]`);
-    if (b) { b.classList.add('pressed'); setTimeout(() => b.classList.remove('pressed'), 90); }
+    const b = $('keypad').querySelector(`.kp[data-k="${k}"]`);
+    if (b) { b.classList.add('pressed'); setTimeout(() => b.classList.remove('pressed'), 120); }
     pressKey(k);
   });
 
   function showLogin(msg) {
     loggedIn = false;
     stopPolling();
-    closeSheet();
+    closeSheet(true);
+    setOffline(false);
     $('app').hidden = true;
     $('login').hidden = false;
     pin = '';
@@ -205,165 +263,162 @@
 
   // ---------- polling ----------
   function stopPolling() { clearTimeout(timer); timer = null; }
+  function schedule() {
+    stopPolling();
+    if (document.visibilityState === 'visible') timer = setTimeout(refresh, POLL_MS);
+  }
   async function refresh() {
     stopPolling();
     try {
-      render(await api('/api/status'));
+      const s = await api('/api/status');
+      loggedIn = true;
+      $('login').hidden = true;
+      $('app').hidden = false;
+      render(s);
     } catch (e) {
       if (e.message === 'auth') return;
-      $('updated').textContent = 'Nu mă pot conecta la PC.';
+      if (e.offline) {
+        setOffline(true);
+        $('login').hidden = true;
+        $('app').hidden = false;
+        if (!last) renderOfflineSkeleton();
+        if (last) $('updated').textContent = 'Ultima actualizare la ' + hhmm(new Date(last._at));
+      } else {
+        $('updated').textContent = e.message;
+      }
     }
-    if (loggedIn && document.visibilityState === 'visible') timer = setTimeout(refresh, POLL_MS);
+    schedule();
   }
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') { if (loggedIn) refresh(); }
+    if (document.visibilityState === 'visible') { if (!$('app').hidden || loggedIn) refresh(); }
     else stopPolling();
   });
+  window.addEventListener('online', () => { if (!$('app').hidden) refresh(); });
 
   // ---------- render ----------
   function render(s) {
+    s._at = Date.now();
     last = s;
     clockOffset = (s.server_time || Date.now() / 1000) - Date.now() / 1000;
     const mode = s.demo ? 'demo' : (s.dry_run ? 'dry-run' : '');
     $('mode').textContent = mode;
     $('mode').hidden = !mode;
-    renderLeds(s.services || {});
+    const svc = s.services || {};
     $('auto-off').checked = !!(s.settings && s.settings.auto_monitors_off);
-    renderPlaying(s.now_playing, s.services || {});
+    renderPlaying(s.now_playing, svc);
     renderDownloads(s.downloads);
     renderTorrents(s.torrents);
     renderWaiting(s.waiting);
-    renderLibrary(s.library, s.services || {});
+    renderLibrary(s.library, svc);
     renderDisks(s.pc || {});
+    renderServices(svc);
     setPower(s.power);
-    $('updated').textContent = 'Actualizat la ' + new Date().toLocaleTimeString('ro-RO', { hour: '2-digit', minute: '2-digit' });
+    $('updated').textContent = 'Actualizat la ' + hhmm(new Date());
   }
 
-  function renderLeds(svc) {
-    const names = [];
-    fill('leds', SERVICES.map(([k, label]) => {
-      const up = !!svc[k];
-      names.push(`${label} ${up ? 'pornit' : 'oprit'}`);
-      return el('span', 'led' + (up ? ' up' : ''));
-    }));
-    const text = names.join(', ') + '.';
-    $('leds').setAttribute('aria-label', 'Servicii: ' + text);
-    $('led-names').textContent = text;
+  function renderOfflineSkeleton() {
+    const dash = () => [empty('Fără date de la PC.')];
+    for (const id of ['playing', 'downloads', 'torrents', 'waiting', 'library', 'disks']) fill(id, dash());
+    fill('services', SERVICES.map(([, label]) => cell(row(label, el('span', 'status', '—')))));
+    $('pc-line').hidden = true;
+    $('updated').textContent = '';
   }
-  $('leds').addEventListener('click', () => {
-    const open = $('led-names').hidden;
-    $('led-names').hidden = !open;
-    $('leds').setAttribute('aria-expanded', String(open));
-  });
 
   const down = (name) => `${name} nu răspunde. Pornește-l din Services sau repornește PC-ul.`;
 
   function renderPlaying(list, svc) {
-    if (list == null || (!list.length && !svc.plex)) return fill('playing', [note(down('Plex'), 'is-warn')]);
-    if (!list.length) return fill('playing', [note('Nimic pe TV acum.')]);
+    if (list == null || (!list.length && !svc.plex)) return fill('playing', [empty(down('Plex'), 'warn-text')]);
+    if (!list.length) return fill('playing', [empty('Nimic pe TV acum.')]);
     fill('playing', list.map((p) => {
-      const box = el('div', 'row');
-      box.appendChild(el('p', 'np-title', withYear(p.title, p.year)));
-      box.appendChild(el('div', 'dim', `${p.player}, ${p.state_ro || p.state}`));
-      box.appendChild(bar((p.progress || 0) / 100, 'thin'));
       const where = p.duration ? `${clock(p.position)} din ${clock(p.duration)}` : `${n0.format(p.progress || 0)}%`;
-      box.appendChild(el('div', 'small dim num', `${where}, ${p.decision_ro}`));
-      return box;
+      return cell(
+        el('p', 'title', withYear(p.title, p.year)),
+        sub(`${p.player}, ${p.state_ro || p.state}`),
+        bar((p.progress || 0) / 100, 'thin'),
+        foot(`${where}, ${p.decision_ro}`, p.transcode ? 'warn-text' : ''),
+      );
     }));
   }
 
   function renderDownloads(list) {
-    if (list == null) return fill('downloads', [note(down('Radarr'), 'is-warn')]);
-    if (!list.length) return fill('downloads', [note('Nicio descărcare. Adaugă un film în Watchlist-ul Plex.')]);
+    if (list == null) return fill('downloads', [empty(down('Radarr'), 'warn-text')]);
+    if (!list.length) return fill('downloads', [empty('Nicio descărcare. Adaugă un film în Watchlist-ul Plex.')]);
     fill('downloads', list.map((d) => {
-      const box = el('div', 'row');
-      box.appendChild(el('div', 'title', withYear(d.title, d.year)));
-      box.appendChild(bar(d.percent / 100, 'warn'));
       const parts = [`${n0.format(d.percent)}%`];
       if (d.time_left) parts.push(d.time_left);
       const st = lower(d.status);
       if (st && st !== 'se descarcă') parts.push(st);
-      box.appendChild(el('div', 'small dim num', parts.join(', ')));
-      return box;
+      return cell(el('p', 'title', withYear(d.title, d.year)), bar(d.percent / 100, 'thin'), foot(parts.join(', ')));
     }));
   }
 
   function renderTorrents(list) {
-    if (list == null) return fill('torrents', [note(down('qBittorrent'), 'is-warn')]);
-    if (!list.length) return fill('torrents', [note('Niciun torrent FileList la seed.')]);
+    if (list == null) return fill('torrents', [empty(down('qBittorrent'), 'warn-text')]);
+    if (!list.length) return fill('torrents', [empty('Niciun torrent FileList la seed.')]);
     fill('torrents', list.map((t) => {
-      const box = el('div', 'row');
       if (t.hr === 'downloading') {
-        box.appendChild(line(t.name, `${n0.format(t.progress)}%`));
-        box.appendChild(bar(t.progress / 100));
-        box.appendChild(el('div', 'small dim', `se descarcă, regula de seed începe la final`));
-        return box;
+        return cell(row(breakable(t.name, 'grow name'), `${n0.format(t.progress)}%`), bar(t.progress / 100, 'thin'),
+          foot('se descarcă, regula de seed începe la final'));
       }
       const safe = t.hr === 'safe';
-      box.appendChild(line(t.name, safe ? el('span', 'aside is-ok', 'gata') : null));
-      box.appendChild(bar(t.rule_progress, safe ? 'ok' : 'warn'));
       const hours = n0.format(Math.min(48, Math.floor(t.seed_hours)));
-      box.appendChild(el('div', 'small dim num', `ratio ${n2.format(t.ratio)}, ${hours} din 48 h`));
-      return box;
+      return cell(
+        row(breakable(t.name, 'grow name'), safe ? checkmark() : null),
+        bar(t.rule_progress, safe ? 'thin ok' : 'thin'),
+        foot(`ratio ${n2.format(t.ratio)}, ${hours} din 48 h`),
+      );
     }));
   }
 
   function renderWaiting(list) {
-    if (list == null) return fill('waiting', [note(down('Radarr'), 'is-warn')]);
-    if (!list.length) return fill('waiting', [note('Nimic în așteptare. Adaugă un film în Watchlist-ul Plex.')]);
-    fill('waiting', list.map((m) => {
-      const box = el('div', 'row');
-      box.appendChild(el('div', 'title', withYear(m.title, m.year)));
-      box.appendChild(el('div', 'small dim', m.status));
-      return box;
-    }));
+    if (list == null) return fill('waiting', [empty(down('Radarr'), 'warn-text')]);
+    if (!list.length) return fill('waiting', [empty('Nimic în așteptare. Adaugă un film în Watchlist-ul Plex.')]);
+    fill('waiting', list.map((m) => cell(el('p', 'title', withYear(m.title, m.year)), foot(m.status))));
   }
 
   function renderLibrary(list, svc) {
-    if (list == null) return fill('library', [note(down('Radarr'), 'is-warn')]);
-    if (!list.length) return fill('library', [note('Biblioteca e goală. Filmele descărcate apar aici.')]);
+    if (list == null) return fill('library', [empty(down('Radarr'), 'warn-text')]);
+    if (!list.length) return fill('library', [empty('Biblioteca e goală. Filmele descărcate apar aici.')]);
     const rows = list.map((m) => {
-      const box = el('div', 'row');
-      box.appendChild(line(withYear(m.title, m.year), `${n1.format(m.size_gb)} GB`));
-      if (m.ro_subs === true) box.appendChild(el('div', 'small dim', 'subtitrare RO'));
-      else if (m.ro_subs === false) box.appendChild(el('div', 'small is-warn', 'fără subtitrare RO'));
-      return box;
+      let subs = null;
+      if (m.ro_subs === true) subs = foot('subtitrare RO');
+      else if (m.ro_subs === false) subs = foot('fără subtitrare RO', 'warn-text');
+      return cell(row(withYear(m.title, m.year), `${n1.format(m.size_gb)} GB`), subs);
     });
-    if (!svc.bazarr) rows.push(note('Bazarr nu răspunde, așa că nu știu ce subtitrări există.', 'is-warn'));
+    if (!svc.bazarr) rows.push(empty('Bazarr nu răspunde, așa că nu știu ce subtitrări există.', 'warn-text'));
     fill('library', rows);
   }
 
   function renderDisks(pc) {
     const disks = pc.disks || [];
     const main = disks.find((d) => d.drive === 'D:') || disks[0];
-    const nodes = [];
-    if (!main) nodes.push(note('Nu pot citi discurile.'));
+    const free = (d) => `${n0.format(d.free_gb)} GB liberi din ${n0.format(d.total_gb)} GB`;
+    if (!main) fill('disks', [empty('Nu pot citi discurile.')]);
     else {
-      const box = el('div', 'row');
-      box.appendChild(line(`Disc ${main.drive}`, null));
-      box.appendChild(bar(main.used_pct / 100, main.used_pct > 90 ? 'warn' : ''));
-      box.appendChild(el('div', 'small dim num', `${n0.format(main.free_gb)} GB liberi din ${n0.format(main.total_gb)} GB`));
-      nodes.push(box);
-      for (const d of disks) {
-        if (d === main) continue;
-        nodes.push(el('p', 'note small num', `Disc ${d.drive} ${n0.format(d.free_gb)} GB liberi din ${n0.format(d.total_gb)} GB`));
-      }
+      const cells = [cell(row(`Disc ${main.drive}`, free(main)), bar(main.used_pct / 100, 'thin'))];
+      for (const d of disks) if (d !== main) cells.push(cell(row(`Disc ${d.drive}`, free(d))));
+      fill('disks', cells);
     }
-    if (pc.hostname) nodes.push(el('p', 'note small', `${pc.hostname}, pornit de ${uptime(pc.uptime)}`));
-    fill('disks', nodes);
+    $('pc-line').hidden = !pc.hostname;
+    $('pc-line').textContent = pc.hostname ? `${pc.hostname}, pornit de ${uptime(pc.uptime)}` : '';
+  }
+
+  function renderServices(svc) {
+    fill('services', SERVICES.map(([k, label]) => {
+      const up = !!svc[k];
+      const st = kids(el('span', 'status'), el('span', 'dot' + (up ? '' : ' dot-off')), el('span', '', up ? 'pornit' : 'oprit'));
+      return cell(row(label, st));
+    }));
   }
 
   // ---------- power ----------
   function nowSec() { return Date.now() / 1000 + clockOffset; }
   function setPower(p) {
-    const was = pendingPower;
     pendingPower = p || null;
     const on = !!pendingPower;
-    $('mon-keys').hidden = on;
-    $('cancel-row').hidden = !on;
-    $('ring').toggleAttribute('hidden', !on);
-    $('countdown').hidden = !on;
-    $('power-key').setAttribute('aria-disabled', String(on));
+    $('power-banner').hidden = !on;
+    $('pw-shutdown-row').disabled = on;
+    $('pw-restart-row').disabled = on;
     if (!on) {
       clearInterval(countdownTimer);
       countdownTimer = null;
@@ -371,55 +426,81 @@
     }
     const restart = pendingPower.kind === 'restart';
     $('power-cancel').textContent = restart ? 'Anulează repornirea' : 'Anulează oprirea';
-    if (!was) $('ring-fill').style.strokeDashoffset = '0';
     const tick = () => {
       if (!pendingPower) return;
       const left = Math.max(0, pendingPower.at - nowSec());
-      const cd = $('countdown');
-      cd.replaceChildren(document.createTextNode(String(Math.ceil(left))),
-        el('small', '', restart ? 'secunde până la repornire' : 'secunde până la oprire'));
-      if (!reducedMotion.matches) {
-        $('ring-fill').style.strokeDashoffset = String(RING * (1 - Math.min(1, left / 60)));
-      }
+      const n = Math.ceil(left);
+      $('power-text').textContent = restart ? `PC-ul repornește în ${n} s` : `PC-ul se oprește în ${n} s`;
+      $('power-bar').style.width = (Math.min(1, left / 60) * 100).toFixed(1) + '%';
     };
     tick();
     if (!countdownTimer) countdownTimer = setInterval(tick, 1000);
   }
 
+  // ---------- action sheet ----------
   let lastFocus = null;
-  function openSheet() {
+  let sheetKind = null;
+  function openSheet(kind) {
     if (pendingPower) return;
+    sheetKind = kind;
+    const restart = kind === 'restart';
+    $('sheet-title').textContent = restart
+      ? 'PC-ul repornește la 60 de secunde după ce confirmi. Poți anula până atunci.'
+      : 'PC-ul se oprește la 60 de secunde după ce confirmi. Poți anula până atunci.';
+    const btn = $('sheet-confirm');
+    btn.textContent = restart ? 'Repornește' : 'Oprește PC-ul';
+    btn.className = 'sheet-btn' + (restart ? '' : ' danger');
     const warns = (last && last.hr_warnings) || [];
     $('sheet-warn').hidden = !warns.length;
-    $('sheet-warn-list').replaceChildren(...warns.map((w) => el('li', '', `${w.name}: ${w.remaining}`)));
+    $('sheet-warn-list').replaceChildren(...warns.map((w) => kids(el('li'), breakable(w.name, 'warn-name'), document.createTextNode(w.remaining))));
     lastFocus = document.activeElement;
+    $('app').inert = true;
     $('scrim').hidden = false;
     $('sheet').hidden = false;
-    $('sheet-close').focus();
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      $('scrim').classList.add('open');
+      $('sheet').classList.add('open');
+    }));
+    $('sheet-cancel').focus({ preventScroll: true });
   }
-  function closeSheet() {
-    $('scrim').hidden = true;
-    $('sheet').hidden = true;
-    if (lastFocus && lastFocus.focus) lastFocus.focus();
+  function closeSheet(instant) {
+    if ($('sheet').hidden) return;
+    $('app').inert = false;
+    $('scrim').classList.remove('open');
+    $('sheet').classList.remove('open');
+    const done = () => { $('scrim').hidden = true; $('sheet').hidden = true; };
+    if (instant || reducedMotion.matches) done();
+    else setTimeout(done, 350);
+    if (lastFocus && lastFocus.focus) lastFocus.focus({ preventScroll: true });
     lastFocus = null;
   }
-  $('power-key').addEventListener('click', openSheet);
-  $('sheet-close').addEventListener('click', closeSheet);
-  $('scrim').addEventListener('click', closeSheet);
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('sheet').hidden) closeSheet(); });
+  $('pw-shutdown-row').addEventListener('click', () => openSheet('shutdown'));
+  $('pw-restart-row').addEventListener('click', () => openSheet('restart'));
+  $('sheet-cancel').addEventListener('click', () => closeSheet());
+  $('scrim').addEventListener('click', () => closeSheet());
+  $('sheet-confirm').addEventListener('click', () => power(sheetKind));
+  document.addEventListener('keydown', (e) => {
+    if ($('sheet').hidden) return;
+    if (e.key === 'Escape') return closeSheet();
+    if (e.key === 'Tab') { // keep focus inside the sheet
+      const items = [$('sheet-confirm'), $('sheet-cancel')];
+      const i = items.indexOf(document.activeElement);
+      e.preventDefault();
+      items[(i + (e.shiftKey ? items.length - 1 : 1)) % items.length].focus();
+    }
+  });
 
   async function power(kind) {
     closeSheet();
     try {
       const r = await api('/api/power/' + kind, {});
       setPower(r.power);
+      window.scrollTo({ top: 0, behavior: reducedMotion.matches ? 'auto' : 'smooth' });
       toast(kind === 'restart' ? 'PC-ul repornește în 60 de secunde.' : 'PC-ul se oprește în 60 de secunde.');
     } catch (e) {
       if (e.message !== 'auth') toast(e.message, true);
     }
   }
-  $('pw-shutdown').addEventListener('click', () => power('shutdown'));
-  $('pw-restart').addEventListener('click', () => power('restart'));
   $('power-cancel').addEventListener('click', async () => {
     try {
       await api('/api/power/cancel', {});
@@ -460,18 +541,14 @@
     showLogin();
   });
 
+  // ---------- service worker (HTTPS / localhost only) ----------
+  if ('serviceWorker' in navigator && window.isSecureContext) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => { /* app works without it */ });
+    });
+  }
+
   // ---------- boot ----------
-  (async function boot() {
-    if (location.hash === '#login') return showLogin(); // for screenshots of the login screen
-    try {
-      const s = await api('/api/status');
-      loggedIn = true;
-      $('login').hidden = true;
-      $('app').hidden = false;
-      render(s);
-      timer = setTimeout(refresh, POLL_MS);
-    } catch (e) {
-      if (e.message !== 'auth') showLogin('Nu mă pot conecta la PC. Verifică Wi-Fi-ul.');
-    }
-  })();
+  if (location.hash === '#login') showLogin(); // for screenshots of the login screen
+  else refresh();
 })();

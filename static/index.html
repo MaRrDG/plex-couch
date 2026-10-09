@@ -3,141 +3,155 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#2A2C27">
+  <meta name="theme-color" content="#000000">
   <meta name="color-scheme" content="dark">
-  <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
   <meta name="apple-mobile-web-app-title" content="{{APP_NAME}}">
   <meta name="application-name" content="{{APP_NAME}}">
   <title>{{APP_NAME}}</title>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="/icon.svg">
+  <link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="stylesheet" href="/style.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
   <!-- Login -->
-  <main id="login" class="screen" hidden>
-    <header class="top">
-      <h1 class="app-name">{{APP_NAME}}</h1>
-    </header>
-    <section class="head login-head" aria-labelledby="login-title">
-      <h2 id="login-title" class="login-title">Introdu PIN-ul</h2>
+  <main id="login" class="login" hidden>
+    <div class="login-top">
+      <img class="login-icon" src="/icon-192.png" alt="" width="64" height="64">
+      <h1 class="login-title">{{APP_NAME}}</h1>
+      <p class="login-sub">Introdu PIN-ul</p>
       <div class="pin-dots" id="pin-dots" aria-hidden="true">
         <span></span><span></span><span></span><span></span><span></span><span></span>
       </div>
       <p class="login-msg" id="login-msg" role="alert"></p>
-      <div class="keypad" id="keypad">
-        <button class="key" data-k="1">1</button>
-        <button class="key" data-k="2">2</button>
-        <button class="key" data-k="3">3</button>
-        <button class="key" data-k="4">4</button>
-        <button class="key" data-k="5">5</button>
-        <button class="key" data-k="6">6</button>
-        <button class="key" data-k="7">7</button>
-        <button class="key" data-k="8">8</button>
-        <button class="key" data-k="9">9</button>
-        <button class="key key-fn" data-k="del" aria-label="Șterge o cifră">⌫</button>
-        <button class="key" data-k="0">0</button>
-        <button class="key key-fn" data-k="ok" aria-label="Intră">OK</button>
-      </div>
-    </section>
+    </div>
+    <div class="keypad" id="keypad" role="group" aria-label="Tastatură PIN">
+      <button class="kp" data-k="1">1</button>
+      <button class="kp" data-k="2">2</button>
+      <button class="kp" data-k="3">3</button>
+      <button class="kp" data-k="4">4</button>
+      <button class="kp" data-k="5">5</button>
+      <button class="kp" data-k="6">6</button>
+      <button class="kp" data-k="7">7</button>
+      <button class="kp" data-k="8">8</button>
+      <button class="kp" data-k="9">9</button>
+      <button class="kp-text invisible" data-k="ok" id="kp-ok">Intră</button>
+      <button class="kp" data-k="0">0</button>
+      <button class="kp-text invisible" data-k="del" id="kp-del" aria-label="Șterge o cifră">Șterge</button>
+    </div>
   </main>
 
   <!-- Main -->
-  <main id="app" class="screen" hidden>
-    <header class="top">
-      <h1 class="app-name">{{APP_NAME}}</h1>
-      <span class="mode" id="mode" hidden></span>
-      <button class="leds" id="leds" aria-expanded="false" aria-controls="led-names" aria-label="Starea serviciilor"></button>
-    </header>
-    <p class="led-names" id="led-names" hidden></p>
-
-    <section class="head" aria-label="Telecomandă">
-      <div class="key-row" id="mon-keys">
-        <button class="key key-wide" id="mon-off">Stinge monitoarele</button>
-        <button class="key key-wide" id="mon-on">Aprinde monitoarele</button>
-      </div>
-      <div class="key-row" id="cancel-row" hidden>
-        <button class="key key-wide key-cancel" id="power-cancel">Anulează oprirea</button>
-      </div>
-
-      <label class="switch">
-        <input type="checkbox" role="switch" id="auto-off">
-        <span class="slot" aria-hidden="true"><span class="knob"></span></span>
-        <span class="switch-text">Stinge automat la play pe TV</span>
-      </label>
-
-      <div class="power-wrap">
-        <div class="power-ring">
-          <svg class="ring" id="ring" viewBox="0 0 120 120" aria-hidden="true" hidden>
-            <circle class="ring-track" cx="60" cy="60" r="56"></circle>
-            <circle class="ring-fill" id="ring-fill" cx="60" cy="60" r="56"></circle>
-          </svg>
-          <button class="key key-power" id="power-key" aria-label="Oprire sau repornire PC">
-            <svg viewBox="0 0 24 24" width="30" height="30" aria-hidden="true">
-              <path d="M12 3v8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
-              <path d="M6.6 6.6a7.6 7.6 0 1 0 10.8 0" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
-            </svg>
-          </button>
+  <div id="app" class="app" hidden>
+    <div class="top-stack">
+      <div class="banner" id="power-banner" hidden>
+        <div class="banner-text">
+          <p class="banner-title num" id="power-text" aria-live="off"></p>
+          <div class="banner-bar" aria-hidden="true"><span id="power-bar"></span></div>
         </div>
-        <p class="countdown" id="countdown" hidden aria-live="polite"></p>
+        <button class="pill-btn" id="power-cancel">Anulează oprirea</button>
       </div>
-    </section>
+      <div class="banner banner-offline" id="offline" role="status" hidden>
+        <span class="dot dot-off" aria-hidden="true"></span>
+        <div class="banner-text">
+          <p class="banner-title">PC-ul nu răspunde</p>
+          <p class="banner-sub">Verifică dacă PC-ul e pornit și telefonul e pe același Wi‑Fi. Reîncerc automat.</p>
+        </div>
+      </div>
+    </div>
 
-    <section class="block" aria-labelledby="h-playing">
-      <h2 id="h-playing">Acum pe TV</h2>
-      <div id="playing"></div>
-    </section>
+    <main class="content">
+      <header class="large-title">
+        <h1>{{APP_NAME}}</h1>
+        <span class="mode" id="mode" hidden></span>
+      </header>
 
-    <section class="block" aria-labelledby="h-downloads">
-      <h2 id="h-downloads">Descărcări</h2>
-      <div id="downloads"></div>
-    </section>
+      <section class="group" aria-labelledby="h-playing">
+        <h2 class="group-header" id="h-playing">Acum pe TV</h2>
+        <div class="cells" id="playing"></div>
+      </section>
 
-    <section class="block" aria-labelledby="h-torrents">
-      <h2 id="h-torrents">Seed FileList</h2>
-      <div id="torrents"></div>
-    </section>
+      <section class="group" aria-labelledby="h-monitors">
+        <h2 class="group-header" id="h-monitors">Monitoare</h2>
+        <div class="cells">
+          <button class="cell cell-btn tint" id="mon-off">Stinge monitoarele</button>
+          <button class="cell cell-btn tint" id="mon-on">Aprinde monitoarele</button>
+          <label class="cell cell-switch" for="auto-off">
+            <span class="cell-label">Stinge automat la play pe TV</span>
+            <input type="checkbox" role="switch" class="switch" id="auto-off">
+          </label>
+        </div>
+        <p class="group-footer">Monitoarele se aprind la loc când miști mouse-ul.</p>
+      </section>
 
-    <section class="block" aria-labelledby="h-waiting">
-      <h2 id="h-waiting">În așteptare</h2>
-      <div id="waiting"></div>
-    </section>
+      <section class="group" aria-labelledby="h-downloads">
+        <h2 class="group-header" id="h-downloads">Descărcări</h2>
+        <div class="cells" id="downloads"></div>
+      </section>
 
-    <section class="block" aria-labelledby="h-library">
-      <h2 id="h-library">Biblioteca</h2>
-      <div id="library"></div>
-    </section>
+      <section class="group" aria-labelledby="h-torrents">
+        <h2 class="group-header" id="h-torrents">Seed FileList</h2>
+        <div class="cells" id="torrents"></div>
+        <p class="group-footer">Regula: ratio 1 sau 48 h de seed.</p>
+      </section>
 
-    <section class="block" aria-labelledby="h-disks">
-      <h2 id="h-disks">Spațiu</h2>
-      <div id="disks"></div>
-    </section>
+      <section class="group" aria-labelledby="h-waiting">
+        <h2 class="group-header" id="h-waiting">În așteptare</h2>
+        <div class="cells" id="waiting"></div>
+      </section>
 
-    <footer class="foot">
-      <span id="updated"></span>
-      <button class="text-btn" id="logout">Ieși din cont</button>
-    </footer>
-  </main>
+      <section class="group" aria-labelledby="h-library">
+        <h2 class="group-header" id="h-library">Biblioteca</h2>
+        <div class="cells" id="library"></div>
+      </section>
 
-  <!-- Power sheet -->
+      <section class="group" aria-labelledby="h-disks">
+        <h2 class="group-header" id="h-disks">Spațiu</h2>
+        <div class="cells" id="disks"></div>
+        <p class="group-footer" id="pc-line" hidden></p>
+      </section>
+
+      <section class="group" aria-labelledby="h-services">
+        <h2 class="group-header" id="h-services">Servicii</h2>
+        <div class="cells" id="services"></div>
+      </section>
+
+      <section class="group" aria-labelledby="h-power">
+        <h2 class="group-header" id="h-power">Alimentare</h2>
+        <div class="cells">
+          <button class="cell cell-btn danger" id="pw-shutdown-row">Oprește PC-ul</button>
+          <button class="cell cell-btn tint" id="pw-restart-row">Repornește</button>
+        </div>
+        <p class="group-footer">PC-ul se oprește la 60 de secunde după confirmare. Poți anula până atunci.</p>
+      </section>
+
+      <footer class="foot">
+        <p class="foot-text num" id="updated"></p>
+        <button class="text-btn" id="logout">Ieși din cont</button>
+      </footer>
+    </main>
+  </div>
+
+  <!-- Power action sheet -->
   <div class="scrim" id="scrim" hidden></div>
-  <section class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" hidden>
-    <h2 id="sheet-title">Alimentare</h2>
-    <p class="sheet-text">PC-ul se oprește la 60 de secunde după ce apeși. Poți anula până atunci.</p>
-    <div class="sheet-warn" id="sheet-warn" hidden>
-      <p>Atenție: aceste torrente nu au terminat seed-ul pe FileList. Ai voie să închizi, dar în 7 zile trebuie să ajungă la ratio 1 sau 48h.</p>
-      <ul id="sheet-warn-list"></ul>
+  <div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" hidden>
+    <div class="sheet-group">
+      <div class="sheet-head">
+        <p class="sheet-title" id="sheet-title"></p>
+        <div class="sheet-warn" id="sheet-warn" hidden>
+          <p>Atenție: aceste torrente nu au terminat seed-ul pe FileList. Ai voie să închizi, dar în 7 zile trebuie să ajungă la ratio 1 sau 48h.</p>
+          <ul id="sheet-warn-list"></ul>
+        </div>
+      </div>
+      <button class="sheet-btn" id="sheet-confirm"></button>
     </div>
-    <div class="sheet-keys">
-      <button class="key key-wide key-red" id="pw-shutdown">Oprește PC-ul</button>
-      <button class="key key-wide" id="pw-restart">Repornește</button>
-      <button class="key key-wide key-quiet" id="sheet-close">Închide</button>
-    </div>
-  </section>
+    <button class="sheet-btn sheet-cancel" id="sheet-cancel">Anulează</button>
+  </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 </body>
