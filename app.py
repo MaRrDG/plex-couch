@@ -2,12 +2,14 @@
 
 Usage:
   app.py [--host 0.0.0.0] [--port 8765] [--https-port 8766] [--cert F] [--key F] [--ca-cert F]
-         [--config config.local.json] [--dry-run]
+         [--config config.local.json] [--dry-run] [--allow-http]
   app.py --set-pin 1234 [--config config.local.json]
   app.py --setup-ntfy [--new-topic] [--config config.local.json]
 
 With a certificate and key (see tools/make_certs.py) the app is served over HTTPS on
 --https-port, and --port only serves an install page, the CA certificate and redirects.
+Without a usable certificate --port serves only a 503 page, unless --allow-http is given
+(then the whole app runs over plain HTTP).
 """
 
 import argparse
@@ -30,7 +32,7 @@ from logging.handlers import RotatingFileHandler
 from plexcouch import demo, logic, notify
 from plexcouch.config import Config
 from plexcouch.services import Services
-from plexcouch.system import Actions, free_gb, own_ipv4s, pc_info
+from plexcouch.system import TOO_LATE, Actions, free_gb, own_ipv4s, pc_info
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -42,6 +44,10 @@ MAX_BODY = 4096
 STATE_FILE = "state.local.json"  # next to the config: what was already notified
 NOTIFY_POLL_SECONDS = 60
 NOTIFY_TEST_TIMEOUT = 6  # below the page's 8 s request timeout
+CONNECTION_TIMEOUT = 15  # per socket operation, the TLS handshake included
+MAX_CONNECTIONS = 64     # per listener; more are closed right away
+LOGIN_CONCURRENCY = 4    # login requests checked at the same time; more get a 429
+HSTS = "max-age=31536000"
 
 # pythonw.exe has no console: make sure nothing writes to a None stream.
 if sys.stdout is None:
@@ -98,6 +104,10 @@ def _html_escape(s):
             .replace('"', "&quot;"))
 
 
+def _lockout_body(seconds):
+    return {"error": "Prea multe încercări. Așteaptă %d secunde." % seconds, "lockout_seconds": seconds}
+
+
 def _read_static(name):
     with open(os.path.join(STATIC_DIR, name), "rb") as f:
         return f.read()
@@ -135,6 +145,16 @@ def make_ssl_context(cert, key):
     return ctx
 
 
+def load_tls(tls):
+    """(ssl_context, None) when the certificate and key load, else (None, what is wrong)."""
+    if not (os.path.isfile(tls["cert"] or "") and os.path.isfile(tls["key"] or "")):
+        return None, "missing"
+    try:
+        return make_ssl_context(tls["cert"], tls["key"]), None
+    except (ssl.SSLError, OSError) as e:
+        return None, "unreadable (%s)" % type(e).__name__
+
+
 class App:
     def __init__(self, config, dry_run, demo_mode=False):
         self.config = config
@@ -143,12 +163,15 @@ class App:
         config.ensure_secret()
         self.services = Services(config)
         self.actions = Actions(self.dry_run, config.app_name)
-        self.guard = logic.LoginGuard()
         self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="svc")
         self._own_ips = set()
         self._own_ips_at = 0.0
         self.notifier = notify.Notifier(config, self.dry_run)
         self.state_file = notify.StateFile(os.path.join(os.path.dirname(config.path), STATE_FILE))
+        self.guard = logic.LoginGuard()
+        self.guard.load_known(self.state_file.load().get("known_ips"))
+        self._pin_lock = threading.Lock()  # one PBKDF2 check at a time
+        self._login_slots = threading.BoundedSemaphore(LOGIN_CONCURRENCY)
         self._disk_drive = "D:"
         # "Shut down after the movie": in memory only, a restart disarms it.
         self._after_movie = None
@@ -158,15 +181,71 @@ class App:
     def _session_key(self):
         return logic.session_key(self.config.data["secret"], self.config.data.get("pin_hash"))
 
-    def new_session(self):
-        return logic.sign_session(self._session_key())
+    def new_session(self, now=None):
+        return logic.sign_session(self._session_key(), now=now, epoch=self.config.session_epoch)
+
+    def check_session(self, token, now=None):
+        """(ok, renewed_token). renewed_token is a fresh token when the valid one expires in
+        less than logic.SESSION_RENEW_DAYS (sliding renewal), else None."""
+        if self.demo:
+            return True, None
+        if not self.config.data.get("pin_hash"):
+            return False, None
+        now = time.time() if now is None else now
+        exp = logic.session_expiry(self._session_key(), token, now=now, epoch=self.config.session_epoch)
+        if exp is None:
+            return False, None
+        return True, (self.new_session(now) if logic.session_needs_renewal(exp, now) else None)
 
     def session_ok(self, token):
+        return self.check_session(token)[0]
+
+    def logout_all(self):
+        """Invalidate every session token (all devices) by bumping the session epoch."""
         if self.demo:
-            return True
-        if not self.config.data.get("pin_hash"):
-            return False
-        return logic.verify_session(self._session_key(), token)
+            return
+        epoch = self.config.bump_session_epoch()
+        log.info("all sessions revoked (session epoch %d)", epoch)
+
+    def login(self, ip, pin):
+        """Check a PIN for ip. Returns (http_status, body, session_token or None).
+
+        The attempt is reserved in the login guard before the PIN is checked (parallel
+        requests cannot exceed the per-IP limit), at most LOGIN_CONCURRENCY requests are
+        checked at once and the PBKDF2 checks run one at a time."""
+        if self.demo:
+            return 200, {"ok": True}, None
+        pin_hash = self.config.data.get("pin_hash")
+        if not pin_hash:
+            return 503, {"error": "PIN-ul nu este setat. Rulează app.py --set-pin."}, None
+        guard = self.guard
+        ticket, wait = guard.reserve(ip)
+        if wait:
+            return 429, _lockout_body(wait), None
+        if not self._login_slots.acquire(blocking=False):
+            guard.refund(ticket)
+            log.debug("login refused from %s: too many at once", ip)
+            return 429, _lockout_body(guard.busy_retry), None
+        ok = False
+        try:
+            if isinstance(pin, str) and len(pin) <= 64:
+                with self._pin_lock:
+                    ok = logic.verify_pin(pin, pin_hash)
+        except BaseException:
+            guard.refund(ticket)
+            raise
+        finally:
+            self._login_slots.release()
+        if ok:
+            guard.succeed(ticket)
+            self.state_file.update({"known_ips": guard.known_snapshot()})
+            log.info("login ok from %s", ip)
+            return 200, {"ok": True}, self.new_session()
+        locked = guard.fail(ticket)
+        log.warning("login failed from %s", ip)
+        if locked:
+            return 429, _lockout_body(locked), None
+        return 401, {"error": "PIN greșit.", "attempts_left": guard.attempts_left(ip)}, None
 
     def own_ips(self):
         if time.time() - self._own_ips_at > 300:
@@ -235,7 +314,7 @@ class App:
 
     def _public_playing(self, session, movies):
         out = logic.with_backdrop_fallback(logic.public_session(session), movies)
-        out["on_tv"] = not logic.is_local_player(session.get("address"), self.own_ips())
+        out["on_tv"] = logic.is_tv_player(session.get("address"), self.own_ips())
         return out
 
     def power_status(self):
@@ -358,7 +437,9 @@ class App:
         if warn:
             sent.append(("Spațiu puțin", logic.disk_low_text(drive, free), ["warning"], "high"))
 
-        self.state_file.save(state)  # before sending: never twice, even after a crash
+        # Before sending: never twice, even after a crash. Only these keys: the file also holds
+        # the login guard's known IPs.
+        self.state_file.update({"movie_ready": state["movie_ready"], "disk_low": state["disk_low"]})
         for title, text, tags, prio in sent:
             self.notifier.send(title, text, tags=tags, priority=prio)
         return sent
@@ -419,9 +500,10 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "PlexCouch"
     sys_version = ""
     protocol_version = "HTTP/1.1"
-    timeout = 60
+    timeout = CONNECTION_TIMEOUT
     app = None  # set in main()
     secure = False  # True on the HTTPS listener
+    _renew = None  # Set-Cookie value of a renewed session for the current response
 
     # quiet default logging (pythonw has no stderr); errors go to the log file
     def log_message(self, fmt, *args):
@@ -435,6 +517,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         for k, v in SECURITY_HEADERS.items():
             self.send_header(k, v)
+        if self.secure:
+            self.send_header("Strict-Transport-Security", HSTS)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         headers = headers or {}
@@ -442,6 +526,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store" if ctype.startswith("application/json") else "no-cache")
         for k, v in headers.items():
             self.send_header(k, v)
+        if self._renew and "Set-Cookie" not in headers:
+            self.send_header("Set-Cookie", self._renew)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -475,19 +561,42 @@ class Handler(BaseHTTPRequestHandler):
         if logic.is_private_client(self.client_ip):
             return True
         log.warning("rejected non-private client %s", self.client_ip)
-        self._json(403, {"error": "Acces permis doar din rețeaua locală."})
+        # Connection: close, as a request body (if any) is never read.
+        self._json(403, {"error": "Acces permis doar din rețeaua locală."}, headers={"Connection": "close"})
         return False
+
+    def _allowed_host(self):
+        """Host header allowlist (DNS rebinding): IPs, localhost, *.local, config allowed_hosts."""
+        if logic.host_allowed(self.headers.get("Host"), self.app.config.allowed_hosts):
+            return True
+        log.warning("rejected Host header from %s", self.client_ip)  # the value is not logged
+        self._send(421, "Gazdă nepermisă.".encode("utf-8"), "text/plain; charset=utf-8",
+                   headers={"Connection": "close"})
+        return False
+
+    def _preflight(self):
+        """Checks that run before every request on every listener. False = already answered."""
+        self._renew = None
+        return self._allowed_ip() and self._allowed_host()
+
+    def _auth(self, renew=True):
+        """True for a valid session. With renew, a session that expires soon gets a fresh
+        cookie on this response (sliding renewal)."""
+        ok, fresh = self.app.check_session(self._token())
+        if ok and fresh and renew:
+            self._renew = logic.session_cookie(COOKIE, fresh, logic.SESSION_DAYS * 86400, self.secure)
+        return ok
 
     # -- GET ------------------------------------------------------------------
     def do_HEAD(self):
         self.do_GET()
 
     def do_GET(self):
-        if not self._allowed_ip():
+        if not self._preflight():
             return
         path = self.path.split("?", 1)[0]
         if path.startswith("/api/"):
-            if not self.app.session_ok(self._token()):
+            if not self._auth():
                 return self._json(401, {"error": "Autentificare necesară."})
             if path == "/api/status":
                 return self._json(200, self.app.status())
@@ -506,8 +615,9 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, ctype, headers=STATIC_HEADERS.get(path))
 
     def _image(self, path):
-        """Poster proxy: same login and LAN checks as /api; the service keys stay server-side."""
-        if not self.app.session_ok(self._token()):
+        """Poster proxy: same login and LAN checks as /api; the service keys stay server-side.
+        No cookie renewal here: these responses are cached, /api/* renews the session."""
+        if not self._auth(renew=False):
             return self._json(401, {"error": "Autentificare necesară."})
         parsed = logic.parse_img_path(path)
         img = self.app.poster(*parsed) if parsed else None
@@ -518,7 +628,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- POST -----------------------------------------------------------------
     def do_POST(self):
-        if not self._allowed_ip():
+        if not self._preflight():
             return
         path = self.path.split("?", 1)[0]
         if self.headers.get(CSRF_HEADER) != CSRF_VALUE:
@@ -531,11 +641,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/login":
             return self._login(body)
-        if not self.app.session_ok(self._token()):
+        if not self._auth():
             return self._json(401, {"error": "Autentificare necesară."})
 
         a = self.app.actions
         if path == "/api/logout":
+            return self._json(200, {"ok": True}, headers={
+                "Set-Cookie": logic.session_cookie(COOKIE, "", 0, self.secure)})
+        if path == "/api/logout-all":
+            log.info("action logout-all from %s", self.client_ip)
+            self.app.logout_all()
             return self._json(200, {"ok": True}, headers={
                 "Set-Cookie": logic.session_cookie(COOKIE, "", 0, self.secure)})
         if path == "/api/monitors/off":
@@ -553,8 +668,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "power": pending, "dry_run": self.app.dry_run})
         if path == "/api/power/cancel":
             log.info("action power/cancel from %s", self.client_ip)
-            a.cancel_power()
-            return self._json(200, {"ok": True, "power": None})
+            outcome = a.cancel_power()
+            if outcome == TOO_LATE:
+                return self._json(409, {"error": "Prea târziu: comanda pornise deja și nu a mai putut fi anulată.",
+                                        "outcome": outcome})
+            return self._json(200, {"ok": True, "power": None, "outcome": outcome})
         if path == "/api/power/after-movie":
             log.info("action power/after-movie from %s", self.client_ip)
             code, out = self.app.arm_after_movie()
@@ -581,30 +699,11 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "Necunoscut."})
 
     def _login(self, body):
-        ip = self.client_ip
-        guard = self.app.guard
-        left = guard.remaining(ip)
-        if left:
-            return self._json(429, {"error": "Prea multe încercări. Așteaptă %d secunde." % left,
-                                    "lockout_seconds": left})
-        if self.app.demo:
-            return self._json(200, {"ok": True})
-        pin_hash = self.app.config.data.get("pin_hash")
-        if not pin_hash:
-            return self._json(503, {"error": "PIN-ul nu este setat. Rulează app.py --set-pin."})
-        pin = body.get("pin")
-        if isinstance(pin, str) and len(pin) <= 64 and logic.verify_pin(pin, pin_hash):
-            guard.record_success(ip)
-            log.info("login ok from %s", ip)
-            token = self.app.new_session()
-            cookie = logic.session_cookie(COOKIE, token, logic.SESSION_DAYS * 86400, self.secure)
-            return self._json(200, {"ok": True}, headers={"Set-Cookie": cookie})
-        locked = guard.record_failure(ip)
-        log.warning("login failed from %s", ip)
-        if locked:
-            return self._json(429, {"error": "Prea multe încercări. Așteaptă %d secunde." % locked,
-                                    "lockout_seconds": locked})
-        return self._json(401, {"error": "PIN greșit.", "attempts_left": guard.attempts_left(ip)})
+        code, out, token = self.app.login(self.client_ip, body.get("pin"))
+        headers = None
+        if token:
+            headers = {"Set-Cookie": logic.session_cookie(COOKIE, token, logic.SESSION_DAYS * 86400, self.secure)}
+        return self._json(code, out, headers=headers)
 
 
 class SecureHandler(Handler):
@@ -621,7 +720,7 @@ class InstallHandler(Handler):
         return logic.https_url(self.headers.get("Host"), self.https_port, path, fallback_host=local)
 
     def do_GET(self):
-        if not self._allowed_ip():
+        if not self._preflight():
             return
         path = self.path.split("?", 1)[0]
         if path == "/":
@@ -637,7 +736,7 @@ class InstallHandler(Handler):
         self._redirect()
 
     def do_POST(self):
-        if not self._allowed_ip():
+        if not self._preflight():
             return
         self._redirect()
 
@@ -661,9 +760,61 @@ class InstallHandler(Handler):
         self._send(301, b"", "text/plain; charset=utf-8", headers={"Location": self._https_url(self.path)})
 
 
+NO_CERT_PAGE = """<!doctype html>
+<html lang="ro">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{name}</title></head>
+<body>
+<h1>Certificatele HTTPS lipsesc</h1>
+<p>{name} nu pornește fără HTTPS: certificatul sau cheia lipsesc ori nu pot fi citite.</p>
+<p>Pe PC, rulează <code>python tools/make_certs.py --ip &lt;IP-ul PC-ului&gt;</code> și repornește {name}.</p>
+</body>
+</html>
+"""
+
+
+class NoCertHandler(Handler):
+    """Plain-HTTP listener when no usable certificate is found (and no --allow-http):
+    a 503 page saying the certificates are missing. No API, no app, no login."""
+
+    def do_GET(self):
+        if not self._preflight():
+            return
+        page = NO_CERT_PAGE.format(name=_html_escape(self.app.config.app_name)).encode("utf-8")
+        self._send(503, page, "text/html; charset=utf-8",
+                   headers={"Retry-After": "300", "Connection": "close"})
+
+    def do_POST(self):
+        self.do_GET()  # the request body is never read: the connection is closed after it
+
+
 class Server(ThreadingHTTPServer):
+    """Threaded HTTP server with at most MAX_CONNECTIONS connections at once: a connection
+    beyond that is closed right away instead of getting a new thread."""
     daemon_threads = True
     allow_reuse_address = False
+    max_connections = MAX_CONNECTIONS
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(self.max_connections)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            log.debug("connection limit reached, closing one from %s", client_address[0])
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
@@ -728,6 +879,9 @@ def main(argv=None):
     p.add_argument("--ca-cert", help="CA certificate offered at /ca.crt, DER or PEM (default certs/ca.crt)")
     p.add_argument("--config", default=os.path.join(BASE_DIR, "config.local.json"))
     p.add_argument("--dry-run", action="store_true", help="log monitor/power actions, never execute them")
+    p.add_argument("--allow-http", action="store_true",
+                   help="without a usable certificate, serve the whole app over plain HTTP "
+                        "(default: only a 503 page saying the certificates are missing)")
     p.add_argument("--set-pin", metavar="DIGITS", help="store the PIN hash in the config and exit")
     p.add_argument("--setup-ntfy", action="store_true",
                    help="create an ntfy topic for phone notifications (keeps an existing one), print it, exit")
@@ -757,22 +911,28 @@ def main(argv=None):
     app = App(config, args.dry_run, demo_mode=args.demo)
     Handler.app = app
     tls = https_settings(args, config)
+    context, problem = load_tls(tls)
+    allow_http = args.allow_http or args.demo  # --demo is 127.0.0.1 only and has no real data
     servers = []
-    if os.path.isfile(tls["cert"] or "") and os.path.isfile(tls["key"] or ""):
-        try:
-            context = make_ssl_context(tls["cert"], tls["key"])
-        except (ssl.SSLError, OSError) as e:
-            log.error("cannot load the HTTPS certificate/key: %s", type(e).__name__)
-            print("Cannot load the HTTPS certificate/key: %s" % e)
-            return 2
+    if context is not None:
         InstallHandler.https_port = tls["port"]
         InstallHandler.ca_cert = tls["ca_cert"]
         servers.append(TLSServer((args.host, tls["port"]), SecureHandler, context))
         servers.append(Server((args.host, args.port), InstallHandler))
         where = "https %s:%d, http %s:%d (install page)" % (args.host, tls["port"], args.host, args.port)
-    else:
+    elif allow_http:
+        if not args.demo:
+            log.warning("HTTPS certificate/key %s; serving the app over plain HTTP (--allow-http)", problem)
         servers.append(Server((args.host, args.port), Handler))
-        where = "http %s:%d (no certificate, HTTPS off)" % (args.host, args.port)
+        where = "http %s:%d (no certificate, HTTPS off, --allow-http)" % (args.host, args.port)
+    else:
+        log.error("HTTPS certificate/key %s: serving only an error page on http port %d. "
+                  "Run tools/make_certs.py (or start with --allow-http for plain HTTP).", problem, args.port)
+        print("HTTPS certificate/key %s. Only an error page is served on port %d; run "
+              "tools/make_certs.py, or start with --allow-http to serve the app over plain HTTP."
+              % (problem, args.port))
+        servers.append(Server((args.host, args.port), NoCertHandler))
+        where = "http %s:%d (certificates missing: error page only)" % (args.host, args.port)
 
     stop = threading.Event()
     if not args.demo:

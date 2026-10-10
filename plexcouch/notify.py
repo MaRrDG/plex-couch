@@ -119,8 +119,9 @@ class Notifier:
 
 
 class StateFile:
-    """A small JSON file (state.local.json next to the config) for what was already notified,
-    so a restart does not repeat messages. A missing or broken file reads as empty."""
+    """A small JSON file (state.local.json next to the config, git-ignored) for what was
+    already notified, so a restart does not repeat messages, and the IPs that logged in
+    successfully (login guard). A missing or broken file reads as empty."""
 
     def __init__(self, path):
         self.path = os.path.abspath(path)
@@ -128,20 +129,34 @@ class StateFile:
 
     def load(self):
         with self._lock:
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (OSError, ValueError):
-                return {}
-            return data if isinstance(data, dict) else {}
+            return self._load_locked()
+
+    def _load_locked(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def save(self, data):
         with self._lock:
-            tmp = self.path + ".tmp"
-            try:
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False, sort_keys=True)
-                    f.write("\n")
-                os.replace(tmp, self.path)
-            except OSError as e:
-                log.warning("cannot save the state file: %s", type(e).__name__)
+            self._save_locked(data)
+
+    def update(self, changes):
+        """Merge the given top-level keys into the file (load + save under one lock), so the
+        notification checks and the login code never overwrite each other's keys."""
+        with self._lock:
+            data = self._load_locked()
+            data.update(changes)
+            self._save_locked(data)
+
+    def _save_locked(self, data):
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp, self.path)
+        except OSError as e:
+            log.warning("cannot save the state file: %s", type(e).__name__)

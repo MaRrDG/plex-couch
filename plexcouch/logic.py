@@ -262,6 +262,39 @@ def is_local_player(address, own_ips):
         return False
 
 
+def is_tv_player(address, own_ips):
+    """True if a Plex player is the TV at home: a private/LAN address that is not this PC.
+    Remote viewers (public addresses), this PC and unknown addresses are never the TV."""
+    if not address or is_local_player(address, own_ips):
+        return False
+    a = address.strip()
+    return is_private_client(a) and not is_local_player(a.split("%", 1)[0], own_ips)
+
+
+ALLOWED_HOST_SUFFIX = ".local"
+
+
+def host_allowed(host_header, extra_hosts=()):
+    """Host header allowlist against DNS rebinding: an IPv4/IPv6 literal, 'localhost', a
+    '*.local' name or a name listed in the config's allowed_hosts. Anything else (also an
+    empty or malformed Host) is refused."""
+    host = split_host_header(host_header)
+    if host is None:
+        return False
+    if host.startswith("["):
+        return True  # split_host_header only accepts valid IPv6 literals in brackets
+    host = host.rstrip(".")
+    try:
+        ipaddress.IPv4Address(host)
+        return True
+    except ValueError:
+        pass
+    if host == "localhost" or (host.endswith(ALLOWED_HOST_SUFFIX) and len(host) > len(ALLOWED_HOST_SUFFIX)):
+        return True
+    extra = {h.strip().lower().rstrip(".") for h in (extra_hosts or ()) if isinstance(h, str) and h.strip()}
+    return host in extra
+
+
 # ---------------------------------------------------------------------------
 # PIN hashing and session tokens
 # ---------------------------------------------------------------------------
@@ -294,30 +327,49 @@ def valid_pin_format(pin):
     return isinstance(pin, str) and pin.isdigit() and pin.isascii() and 4 <= len(pin) <= 6
 
 
-SESSION_DAYS = 180
+SESSION_DAYS = 30
+SESSION_RENEW_DAYS = 15  # re-issue the cookie on any authenticated request when less is left
 
 
 def _sig(key, payload):
     return hmac.new(key, payload.encode("ascii"), hashlib.sha256).hexdigest()
 
 
-def sign_session(key, now=None, days=SESSION_DAYS):
-    """Session token 'expiry.signature' (expiry = epoch seconds)."""
+def sign_session(key, now=None, days=SESSION_DAYS, epoch=1):
+    """Session token 'epoch.expiry.signature' (expiry = epoch seconds). Bumping the server's
+    session epoch ('log out of all devices') invalidates every token signed before."""
     now = time.time() if now is None else now
     expiry = int(now + days * 86400)
-    return "%d.%s" % (expiry, _sig(key, str(expiry)))
+    payload = "%d.%d" % (int(epoch), expiry)
+    return "%s.%s" % (payload, _sig(key, payload))
 
 
-def verify_session(key, token, now=None):
+def session_expiry(key, token, now=None, epoch=1):
+    """The expiry (epoch seconds) of a valid, unexpired token of the current epoch, else None."""
     now = time.time() if now is None else now
-    if not token or not isinstance(token, str) or token.count(".") != 1:
-        return False
-    exp_s, sig = token.split(".")
-    if not exp_s.isdigit() or len(exp_s) > 12:
-        return False
-    if not hmac.compare_digest(sig.encode("ascii", "replace"), _sig(key, exp_s).encode("ascii")):
-        return False
-    return int(exp_s) > now
+    if not token or not isinstance(token, str) or token.count(".") != 2:
+        return None
+    ep_s, exp_s, sig = token.split(".")
+    if not (ep_s.isascii() and ep_s.isdigit() and len(ep_s) <= 9):
+        return None
+    if not (exp_s.isascii() and exp_s.isdigit() and len(exp_s) <= 12):
+        return None
+    if not hmac.compare_digest(sig.encode("ascii", "replace"),
+                               _sig(key, "%s.%s" % (ep_s, exp_s)).encode("ascii")):
+        return None
+    if int(ep_s) != int(epoch):
+        return None
+    exp = int(exp_s)
+    return exp if exp > now else None
+
+
+def verify_session(key, token, now=None, epoch=1):
+    return session_expiry(key, token, now=now, epoch=epoch) is not None
+
+
+def session_needs_renewal(expiry, now=None, renew_days=SESSION_RENEW_DAYS):
+    now = time.time() if now is None else now
+    return expiry is not None and expiry - now < renew_days * 86400
 
 
 def session_key(secret, pin_hash):
@@ -329,56 +381,176 @@ def session_key(secret, pin_hash):
 # Brute-force guard
 # ---------------------------------------------------------------------------
 
-class LoginGuard:
-    """5 wrong attempts per IP -> 10 min lockout for that IP.
-    20 failures per hour globally -> everyone locked for 10 min."""
+KNOWN_IP_DAYS = 30
 
-    def __init__(self, per_ip_max=5, global_max=20, lock_seconds=600, window_seconds=3600):
+
+class LoginGuard:
+    """Brute-force guard for the PIN login.
+
+    Per IP: 5 wrong PINs -> that IP is locked for 10 minutes. Every attempt is reserved
+    (counted against the IP) under the lock *before* the PIN is checked, so parallel requests
+    cannot run more than per_ip_max checks per lockout window; a correct PIN refunds it.
+    Globally: once global_max attempts failed within window_seconds, IPs that did not log in
+    successfully in the last 30 days may try only once every global_delay seconds in total.
+    IPs that logged in before are not slowed down by that (their own per-IP lockout still
+    applies), so another device on the LAN cannot lock the owner out.
+
+    Use: ticket, wait = reserve(ip); wait > 0 -> refuse. Then exactly one of
+    succeed(ticket), fail(ticket) or refund(ticket)."""
+
+    def __init__(self, per_ip_max=5, global_max=20, lock_seconds=600, window_seconds=3600,
+                 global_delay=60, known_days=KNOWN_IP_DAYS, busy_retry=5):
         self.per_ip_max = per_ip_max
         self.global_max = global_max
         self.lock_seconds = lock_seconds
         self.window_seconds = window_seconds
-        self._ip_fail = {}
-        self._ip_locked_until = {}
-        self._global_fails = []
-        self._global_locked_until = 0.0
+        self.global_delay = global_delay
+        self.known_seconds = known_days * 86400
+        self.busy_retry = busy_retry
+        self._ip = {}      # ip -> {"fails": n, "inflight": n, "locked_until": t}
+        self._global = []  # times of failed and in-flight attempts within window_seconds
+        self._known = {}   # ip -> time of its last successful login
         self._lock = threading.Lock()
 
-    def remaining(self, ip, now=None):
-        """Seconds of lockout left for this IP (0 = may try)."""
+    # -- known (successfully logged in) IPs --------------------------------
+    def load_known(self, data, now=None):
         now = time.time() if now is None else now
         with self._lock:
-            return self._remaining_locked(ip, now)
+            self._known = {}
+            for ip, t in (data.items() if isinstance(data, dict) else ()):
+                if isinstance(ip, str) and isinstance(t, (int, float)) and now - t < self.known_seconds:
+                    self._known[ip] = float(t)
 
-    def _remaining_locked(self, ip, now):
-        left = max(self._global_locked_until, self._ip_locked_until.get(ip, 0.0)) - now
+    def known_snapshot(self, now=None):
+        now = time.time() if now is None else now
+        with self._lock:
+            self._prune_known(now)
+            return {ip: int(t) for ip, t in self._known.items()}
+
+    def is_known(self, ip, now=None):
+        now = time.time() if now is None else now
+        with self._lock:
+            return self._is_known(ip, now)
+
+    def _is_known(self, ip, now):
+        t = self._known.get(ip)
+        return t is not None and now - t < self.known_seconds
+
+    def _prune_known(self, now):
+        self._known = {ip: t for ip, t in self._known.items() if now - t < self.known_seconds}
+
+    # -- state -------------------------------------------------------------
+    def _entry(self, ip):
+        e = self._ip.get(ip)
+        if e is None:
+            e = self._ip[ip] = {"fails": 0, "inflight": 0, "locked_until": 0.0}
+        return e
+
+    def _cleanup(self, ip, now):
+        e = self._ip.get(ip)
+        if e and not e["fails"] and not e["inflight"] and e["locked_until"] <= now:
+            del self._ip[ip]
+
+    def _ip_lock_left(self, ip, now):
+        e = self._ip.get(ip)
+        left = (e["locked_until"] if e else 0.0) - now
         return int(math.ceil(left)) if left > 0 else 0
+
+    def _global_left(self, ip, now):
+        """Seconds an unknown IP has to wait because of the global slow-down (0 = may try)."""
+        cutoff = now - self.window_seconds
+        self._global = [t for t in self._global if t > cutoff]
+        if self._is_known(ip, now) or len(self._global) < self.global_max:
+            return 0
+        left = max(self._global) + self.global_delay - now
+        return int(math.ceil(left)) if left > 0 else 0
+
+    def remaining(self, ip, now=None):
+        """Seconds this IP has to wait before the next attempt (0 = may try)."""
+        now = time.time() if now is None else now
+        with self._lock:
+            return max(self._ip_lock_left(ip, now), self._global_left(ip, now))
 
     def attempts_left(self, ip):
         with self._lock:
-            return self.per_ip_max - self._ip_fail.get(ip, 0)
+            e = self._ip.get(ip) or {"fails": 0, "inflight": 0}
+            return max(0, self.per_ip_max - e["fails"] - e["inflight"])
 
+    # -- attempts ----------------------------------------------------------
+    def reserve(self, ip, now=None):
+        """Reserve one PIN check for ip. Returns (ticket, 0) or (None, seconds to wait)."""
+        now = time.time() if now is None else now
+        with self._lock:
+            left = max(self._ip_lock_left(ip, now), self._global_left(ip, now))
+            if left:
+                return None, left
+            e = self._entry(ip)
+            if e["fails"] + e["inflight"] >= self.per_ip_max:
+                return None, self.busy_retry  # the checks still running decide the lockout
+            e["inflight"] += 1
+            self._global.append(now)
+            return (ip, now), 0
+
+    def _close(self, ticket):
+        ip, t = ticket
+        e = self._entry(ip)
+        e["inflight"] = max(0, e["inflight"] - 1)
+        return ip, t, e
+
+    def _drop_global(self, t):
+        try:
+            self._global.remove(t)
+        except ValueError:
+            pass
+
+    def succeed(self, ticket, now=None):
+        """The PIN was right: refund the attempt, clear this IP's failures, remember the IP."""
+        now = time.time() if now is None else now
+        with self._lock:
+            ip, t, e = self._close(ticket)
+            self._drop_global(t)
+            e["fails"] = 0
+            e["locked_until"] = 0.0
+            self._known[ip] = now
+            self._prune_known(now)
+            self._cleanup(ip, now)
+
+    def fail(self, ticket, now=None):
+        """The PIN was wrong. Returns the lockout seconds now in force for this IP (0 if none)."""
+        now = time.time() if now is None else now
+        with self._lock:
+            ip, _t, e = self._close(ticket)
+            e["fails"] += 1
+            if e["fails"] >= self.per_ip_max:
+                e["locked_until"] = now + self.lock_seconds
+                e["fails"] = 0
+            left = self._ip_lock_left(ip, now)
+            self._cleanup(ip, now)
+            return left
+
+    def refund(self, ticket, now=None):
+        """The check never ran (server busy): give the attempt back."""
+        now = time.time() if now is None else now
+        with self._lock:
+            ip, t, _e = self._close(ticket)
+            self._drop_global(t)
+            self._cleanup(ip, now)
+
+    # -- one-shot helpers (an attempt that is reserved and decided at once) --
     def record_failure(self, ip, now=None):
         """Register a failed attempt; returns lockout seconds now in force (0 if none)."""
         now = time.time() if now is None else now
         with self._lock:
-            count = self._ip_fail.get(ip, 0) + 1
-            if count >= self.per_ip_max:
-                self._ip_locked_until[ip] = now + self.lock_seconds
-                count = 0
-            self._ip_fail[ip] = count
-            cutoff = now - self.window_seconds
-            self._global_fails = [t for t in self._global_fails if t > cutoff]
-            self._global_fails.append(now)
-            if len(self._global_fails) >= self.global_max:
-                self._global_locked_until = now + self.lock_seconds
-                self._global_fails = []
-            return self._remaining_locked(ip, now)
+            self._entry(ip)["inflight"] += 1
+            self._global.append(now)
+        return self.fail((ip, now), now=now)
 
-    def record_success(self, ip):
+    def record_success(self, ip, now=None):
+        now = time.time() if now is None else now
         with self._lock:
-            self._ip_fail.pop(ip, None)
-            self._ip_locked_until.pop(ip, None)
+            self._entry(ip)["inflight"] += 1
+            self._global.append(now)
+        self.succeed((ip, now), now=now)
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +808,8 @@ def auto_monitor_decision(handled, sessions, own_ips, enabled):
 
     handled: set of sessionKeys already decided on (triggered or ignored).
     A session is decided the first time it is seen in state 'playing'. It triggers
-    only if enabled and the player is not this PC. Ended sessions are forgotten.
+    only if enabled and the player is the TV (is_tv_player: on the LAN, not this PC).
+    Ended sessions are forgotten.
     Returns (new_handled, trigger)."""
     handled = set(handled or ())
     current = set()
@@ -650,14 +823,14 @@ def auto_monitor_decision(handled, sessions, own_ips, enabled):
             continue
         if s.get("state") == "playing":
             handled.add(key)
-            if enabled and not is_local_player(s.get("address"), own_ips):
+            if enabled and is_tv_player(s.get("address"), own_ips):
                 trigger = True
     return handled & current, trigger
 
 
 def tv_sessions(sessions, own_ips):
-    """Plex sessions on another device (the TV), not on this PC."""
-    return [s for s in sessions or [] if s.get("key") and not is_local_player(s.get("address"), own_ips)]
+    """Plex sessions on the TV: a LAN device that is not this PC (never a remote viewer)."""
+    return [s for s in sessions or [] if s.get("key") and is_tv_player(s.get("address"), own_ips)]
 
 
 # ---------------------------------------------------------------------------

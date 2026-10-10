@@ -176,17 +176,23 @@ class TestSessionToken(unittest.TestCase):
         self.assertTrue(logic.verify_session(self.key, t, now=1001))
 
     def test_expiry(self):
+        self.assertEqual(logic.SESSION_DAYS, 30)
         t = logic.sign_session(self.key, now=1000)
-        self.assertTrue(logic.verify_session(self.key, t, now=1000 + 179 * 86400))
-        self.assertFalse(logic.verify_session(self.key, t, now=1000 + 180 * 86400 + 1))
+        self.assertTrue(logic.verify_session(self.key, t, now=1000 + 29 * 86400))
+        self.assertEqual(logic.session_expiry(self.key, t, now=1001), 1000 + 30 * 86400)
+        self.assertFalse(logic.verify_session(self.key, t, now=1000 + 30 * 86400))
+        self.assertFalse(logic.verify_session(self.key, t, now=1000 + 180 * 86400))
 
     def test_tamper(self):
         t = logic.sign_session(self.key, now=1000)
-        exp, sig = t.split(".")
-        self.assertFalse(logic.verify_session(self.key, "%d.%s" % (int(exp) + 999999, sig), now=1001))
-        self.assertFalse(logic.verify_session(self.key, exp + "." + ("0" * len(sig)), now=1001))
+        ep, exp, sig = t.split(".")
+        self.assertEqual(ep, "1")
+        self.assertFalse(logic.verify_session(self.key, "%s.%d.%s" % (ep, int(exp) + 999999, sig), now=1001))
+        self.assertFalse(logic.verify_session(self.key, "2.%s.%s" % (exp, sig), now=1001, epoch=2))
+        self.assertFalse(logic.verify_session(self.key, "%s.%s.%s" % (ep, exp, "0" * len(sig)), now=1001))
         self.assertFalse(logic.verify_session(b"other", t, now=1001))
-        for bad in ("", None, "abc", "1.2.3", ".x", "x.", "12a.ff", "1.é"):
+        for bad in ("", None, "abc", "1.2.3", ".x", "x.", "12a.ff", "1.é", "1.2", exp + "." + sig,
+                    "1.1.2.3", "a.%s.%s" % (exp, sig), "1.%s.é" % exp):
             self.assertFalse(logic.verify_session(self.key, bad, now=1001), bad)
 
     def test_key_bound_to_pin(self):
@@ -243,20 +249,27 @@ class TestLoginGuard(unittest.TestCase):
         self.assertEqual(g.record_failure("10.0.0.2", now=110), 0)
         self.assertEqual(g.attempts_left("10.0.0.2"), 4)
 
-    def test_global_cap(self):
+    def test_global_slow_down_for_unknown_ips(self):
         g = logic.LoginGuard()
-        locked = 0
-        for i in range(20):  # 20 different IPs, 1 failure each
-            locked = g.record_failure("10.0.1.%d" % i, now=1000 + i)
-        self.assertEqual(locked, 600)
-        self.assertGreater(g.remaining("10.9.9.9", now=1100), 0)  # everyone locked
-        self.assertEqual(g.remaining("10.9.9.9", now=1019 + 601), 0)
+        for i in range(19):  # 19 different IPs, 1 failure each: no slow-down yet
+            self.assertEqual(g.record_failure("10.0.1.%d" % i, now=1000 + i), 0)
+        self.assertEqual(g.remaining("10.9.9.9", now=1019), 0)
+        g.record_failure("10.0.1.99", now=1019)  # the 20th failure within the hour
+        # unknown IPs may now try once per global_delay (60 s) in total, not 10 min each
+        self.assertEqual(g.remaining("10.9.9.9", now=1020), 59)
+        self.assertEqual(g.remaining("10.9.9.9", now=1019 + 60), 0)
+        ticket, wait = g.reserve("10.9.9.9", now=1080)
+        self.assertEqual(wait, 0)
+        g.fail(ticket, now=1080)
+        self.assertEqual(g.remaining("10.9.9.8", now=1081), 59)
 
     def test_global_window_expires(self):
         g = logic.LoginGuard()
-        for i in range(19):
+        for i in range(20):
             g.record_failure("10.0.1.%d" % i, now=1000 + i)
+        self.assertGreater(g.remaining("10.0.2.1", now=1030), 0)
         # an hour later the old failures no longer count
+        self.assertEqual(g.remaining("10.0.2.1", now=1000 + 3700), 0)
         self.assertEqual(g.record_failure("10.0.2.1", now=1000 + 3700), 0)
 
 

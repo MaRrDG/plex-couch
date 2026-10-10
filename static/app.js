@@ -232,7 +232,7 @@
   const busy = new Set();
   function applyDisabled() {
     const off = offline;
-    for (const id of ['mon-off', 'mon-on', 'auto-off', 'logout', 'countdown-cancel', 'after-movie-cancel',
+    for (const id of ['mon-off', 'mon-on', 'auto-off', 'logout', 'logout-all', 'countdown-cancel', 'after-movie-cancel',
       'notify-test']) $(id).disabled = off || busy.has(id);
     for (const id of ['tile-shutdown', 'btn-shutdown', 'btn-restart']) $(id).disabled = off || !!pendingPower;
     $('sheet-confirm').disabled = off;
@@ -861,6 +861,22 @@
     forgetLast();
     last = null;
     showLogin();
+  });
+  $('logout-all').addEventListener('click', async () => {
+    busy.add('logout-all');
+    applyDisabled();
+    try {
+      await api('/api/logout-all', {});
+      forgetLast();
+      last = null;
+      showLogin();
+      toast('Ai ieșit de pe toate dispozitivele.');
+    } catch (e) {
+      if (e.message !== 'auth') toast(e.message, true);
+    } finally {
+      busy.delete('logout-all');
+      applyDisabled();
+    }
   });
 
   // ---------- service worker (HTTPS / localhost only) ----------

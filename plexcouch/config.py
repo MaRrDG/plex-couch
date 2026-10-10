@@ -17,6 +17,12 @@ DEFAULTS = {
     "filelist_tracker_regex": r"thefl\.org|filelist\.(io|ro)|flro\.org",
     "disks": ["C:", "D:"],
     "plex_poll_seconds": 10,
+    # Extra Host names the app answers to, besides IP addresses, localhost and *.local
+    # (protection against DNS rebinding). Example: ["plexpc.lan"].
+    "allowed_hosts": [],
+    # Part of every session token; "Ieși de pe toate dispozitivele" increments it, which
+    # invalidates every session at once. Written by the app.
+    "session_epoch": 1,
     # Phone notifications through ntfy. No topic = off; app.py --setup-ntfy creates one.
     "notifications": {
         "server": "https://ntfy.sh",
@@ -25,7 +31,8 @@ DEFAULTS = {
         "ready_wait_minutes": 20,
     },
     # HTTPS for the installable PWA. Relative paths are resolved against the config file's
-    # folder. If cert or key is missing the app serves plain HTTP only, as before.
+    # folder. If the certificate or key is missing or unreadable, only a 503 page is served
+    # (the whole app over plain HTTP needs app.py --allow-http).
     "https": {
         "port": 8766,
         "cert": "certs/server.pem",
@@ -126,6 +133,30 @@ class Config:
             n["topic"] = topic
             self._save_locked()
             self.data = _merge(DEFAULTS, self._raw)
+
+    @property
+    def session_epoch(self):
+        try:
+            return max(1, int(self.data.get("session_epoch") or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    def bump_session_epoch(self):
+        """Invalidate every session token. Returns the new epoch."""
+        with self._lock:
+            try:
+                cur = max(1, int(self._raw.get("session_epoch") or 1))
+            except (TypeError, ValueError):
+                cur = 1
+            self._raw["session_epoch"] = cur + 1
+            self._save_locked()
+            self.data = _merge(DEFAULTS, self._raw)
+            return cur + 1
+
+    @property
+    def allowed_hosts(self):
+        h = self.data.get("allowed_hosts")
+        return [x for x in h if isinstance(x, str)] if isinstance(h, list) else []
 
     def update_settings(self, changes):
         with self._lock:
