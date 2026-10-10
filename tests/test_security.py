@@ -45,6 +45,79 @@ class _Result:
         self.returncode = code
 
 
+class TestCancelAfterFire(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+        self.codes = {"/a": 0}
+        self.shutdown_delay = 0.0
+        self.old = (system.POWER_DELAY, system.subprocess.run, system._shutdown_exe)
+        system.POWER_DELAY = 0.05
+        system._shutdown_exe = lambda: "shutdown-mock.exe"
+
+        def fake_run(args, **kw):  # never runs shutdown.exe
+            self.calls.append(list(args))
+            if "/a" not in args and self.shutdown_delay:
+                time.sleep(self.shutdown_delay)
+            return _Result(self.codes.get(args[1], 0))
+        system.subprocess.run = fake_run
+
+    def tearDown(self):
+        system.POWER_DELAY, system.subprocess.run, system._shutdown_exe = self.old
+
+    def wait_fired(self, acts):
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with acts._lock:
+                if acts._fired is not None:
+                    return
+            time.sleep(0.01)
+        self.fail("timer did not fire")
+
+    def test_cancel_before_fire(self):
+        acts = system.Actions(dry_run=False, app_name="App")
+        system.POWER_DELAY = 5
+        acts.power("shutdown")
+        self.assertEqual(acts.cancel_power(), system.CANCELLED)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(acts.cancel_power(), system.NOTHING)
+
+    def test_cancel_after_fire_runs_abort(self):
+        acts = system.Actions(dry_run=False, app_name="App")
+        acts.power("shutdown")
+        self.wait_fired(acts)
+        time.sleep(0.05)
+        self.assertEqual(acts.cancel_power(), system.ABORTED)
+        self.assertEqual(self.calls, [["shutdown-mock.exe", "/s", "/hybrid", "/t", "0"],
+                                      ["shutdown-mock.exe", "/a"]])
+        self.assertIsNone(acts.pending())
+
+    def test_cancel_too_late(self):
+        self.codes["/a"] = 1116
+        acts = system.Actions(dry_run=False, app_name="App")
+        acts.power("restart")
+        self.wait_fired(acts)
+        self.assertEqual(acts.cancel_power(), system.TOO_LATE)
+        self.assertEqual(self.calls[-1], ["shutdown-mock.exe", "/a"])
+
+    def test_cancel_while_firing_waits_then_aborts(self):
+        self.shutdown_delay = 0.3
+        acts = system.Actions(dry_run=False, app_name="App")
+        acts.power("shutdown")
+        self.wait_fired(acts)  # shutdown.exe is "running" now
+        self.assertEqual(acts.cancel_power(), system.ABORTED)
+        self.assertEqual([c[1] for c in self.calls], ["/s", "/a"])  # /a only after the command
+
+    def test_dry_run_after_fire_only_logs(self):
+        acts = system.Actions(dry_run=True, app_name="App")
+        acts.power("shutdown")
+        self.wait_fired(acts)
+        self.assertEqual(acts.cancel_power(), system.ABORTED)
+        self.assertEqual(self.calls, [])
+
+    def test_abort_args(self):
+        self.assertEqual(system.abort_args("shutdown.exe"), ["shutdown.exe", "/a"])
+
+
 class TestNoRedirectWithKeys(unittest.TestCase):
     def setUp(self):
         hits = self.hits = []
