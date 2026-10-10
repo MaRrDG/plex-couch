@@ -44,10 +44,41 @@ class _TTLCache:
             self._d.pop(key, None)
 
 
+# Request headers that carry a service key or token (compared case-insensitively).
+SECRET_HEADERS = {"x-api-key", "x-plex-token"}
+
+
+def carries_secret(req):
+    return any(k.lower() in SECRET_HEADERS for k, _v in req.header_items())
+
+
+class RedirectRefused(urllib.error.URLError):
+    """An upstream answered a request that carries an API key/token with a redirect."""
+
+
+class NoSecretRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect with a request that carries an API key or token: urllib would
+    send the same headers to wherever the Location points."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if carries_secret(req):
+            log.warning("upstream redirect refused (request carries a key)")
+            fp.close()
+            raise RedirectRefused("redirect refused (HTTP %d)" % code)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def build_opener(*handlers):
+    return urllib.request.build_opener(NoSecretRedirectHandler(), *handlers)
+
+
+_OPENER = build_opener()
+
+
 def _get_json(url, headers=None, timeout=TIMEOUT, opener=None):
     req = urllib.request.Request(url, headers=headers or {})
     req.add_header("Accept", "application/json")
-    o = opener.open if opener else urllib.request.urlopen
+    o = (opener or _OPENER).open
     with o(req, timeout=timeout) as r:
         body = r.read()
     return json.loads(body.decode("utf-8")) if body else None
@@ -59,7 +90,7 @@ def _get_image(url, headers, timeout=IMG_TIMEOUT):
     req = urllib.request.Request(url, headers=headers or {})
     req.add_header("Accept", "image/*")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _OPENER.open(req, timeout=timeout) as r:
             ctype = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
             body = r.read(IMG_MAX_BYTES + 1)
     except (urllib.error.URLError, OSError, ValueError) as e:
@@ -110,7 +141,7 @@ class Services:
         self.cache = _TTLCache()
         self._fl_hash = {}  # torrent hash -> bool (is FileList); never stores URLs
         self._qb_jar = http.cookiejar.CookieJar()
-        self._qb = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._qb_jar))
+        self._qb = build_opener(urllib.request.HTTPCookieProcessor(self._qb_jar))
         self._qb_lock = threading.Lock()
         self.tracker_re = logic.compile_tracker_regex(config.data.get("filelist_tracker_regex"))
 
