@@ -12,7 +12,7 @@ Not affiliated with or endorsed by Plex Inc.
 ## Features
 
 Three tabs: **Acasă** (what is on the TV and the four controls), **Filme** (library and what
-comes next, as a poster grid) and **PC** (seeding, disk, services, shut down).
+comes next, as a poster grid) and **PC** (seeding, disk, services, notifications, shut down).
 
 - **Now playing on the TV** (Plex sessions): poster, title, device, progress, Direct Play /
   Direct Stream / Transcode.
@@ -35,6 +35,14 @@ comes next, as a poster grid) and **PC** (seeding, disk, services, shut down).
 - **Disk space** and uptime.
 - **Power**: shut down or restart after a 60 s countdown (then `shutdown /s /hybrid /t 0` or `/r /t 0`: the same as Start > Shut down, with Fast Startup and no forced close of unsaved apps), confirmed from an action sheet that warns about
   torrents still owing seed time, then a countdown banner with a cancel button.
+- **Shut down after the movie**: from the same sheet, while something plays on the TV. When that
+  Plex session ends at 90% or later (the credits), the normal 60 s countdown starts and a phone
+  notification says so; stop the movie earlier and the PC stays on (it stays armed for the next
+  session, for up to 3 h with nothing playing). A banner on every tab cancels it. This is kept in
+  memory only: restarting Plex Couch disarms it.
+- **Phone notifications** through [ntfy](https://ntfy.sh) (optional): "Film gata" when a new
+  movie is downloaded (as soon as Bazarr has the Romanian subtitle, or after 20 minutes without
+  it), "Spațiu puțin" when the Radarr drive drops below 60 GB free, and the after-movie shutdown.
 - **Service status** for Plex, Radarr, Prowlarr, Bazarr and qBittorrent. Every service is
   optional; a service that is down only blanks its own section.
 - "Cinema" dark UI built from a small design system (`docs/design-system/`): one accent (Plex
@@ -90,6 +98,35 @@ returned. Paths, URLs and the tracker regex can be overridden in the config
      -Profile Private -RemoteAddress LocalSubnet -Action Allow
    ```
 
+### Phone notifications (ntfy)
+
+Plex Couch can push notifications to your phone through [ntfy](https://ntfy.sh), a free
+publish/subscribe service with an Android and iOS app. Nothing to sign up for: notifications go
+to a *topic*, and anyone who subscribes to that topic name gets them.
+
+1. Create a topic (a long random name; re-running keeps it, `--new-topic` replaces it):
+
+   ```
+   python app.py --setup-ntfy
+   ```
+
+   It prints the topic and its subscribe link. Restart Plex Couch afterwards.
+2. Install the ntfy app on the phone and subscribe to that topic (the PC tab has the name and a
+   "Copiază numele" button), then tap "Trimite un test" on the PC tab.
+
+What you get: "Film gata" when Radarr finishes a new movie (right away once Bazarr has the
+Romanian subtitle, otherwise after `ready_wait_minutes`), "Spațiu puțin" once when the drive of
+Radarr's root folder drops below `disk_min_gb` free (again only after it has gone back above
+`disk_min_gb + 10`), and "Oprire după film". Movies already in the library when notifications
+are first turned on never notify. What was already sent is remembered in `state.local.json` next
+to the config (git-ignored), so a restart does not repeat anything. The `notifications` block in
+the config sets `server` (for a self-hosted ntfy), `disk_min_gb` and `ready_wait_minutes`.
+
+The topic name works like a password for reading the notifications (movie titles and free disk
+space): keep it private. It is stored only in the config file, shown only to logged-in clients
+and never logged. With `--dry-run` notifications are only logged, unless `server` points to this
+PC (127.0.0.1/localhost, for testing with a local server).
+
 ### HTTPS and installing the app on Android
 
 Chrome only installs web apps and runs service workers on HTTPS. Plex Couch ships a small
@@ -130,6 +167,7 @@ Paths and the port can be changed with `--https-port`, `--cert`, `--key`, `--ca-
 app.py [--host 0.0.0.0] [--port 8765] [--https-port 8766] [--cert certs/server.pem]
        [--key certs/server.key] [--ca-cert certs/ca.crt] [--config config.local.json] [--dry-run]
 app.py --set-pin <digits> [--config config.local.json]
+app.py --setup-ntfy [--new-topic] [--config config.local.json]
 app.py --demo --host 127.0.0.1 [--port 8765]
 tools/make_certs.py --ip <lan-ip> [--ip ...] [--dns localhost] [--out certs] [--force-ca]
 ```
@@ -170,7 +208,10 @@ so check that file if something does not work.
   removed on logout.
 - Tracker URLs (which contain your passkey), API keys and tokens are never logged or returned
   by the API.
-- `config.local.json` contains the PIN hash and the cookie secret; it is git-ignored.
+- `config.local.json` contains the PIN hash, the cookie secret and the ntfy topic; it is
+  git-ignored, like `state.local.json`.
+- Notifications are sent from the PC to the ntfy server as JSON over HTTPS; they carry only
+  movie titles, free disk space and the shutdown notice.
 
 ## Design system
 
@@ -197,7 +238,9 @@ python -m unittest discover -s tests -v
 The tests cover the pure logic (hit & run rule, tracker matching, IP checks, session tokens,
 PIN hashing, lockouts, Romanian status text, auto-monitor decisions, HTTPS redirects, cookie
 flags, the static whitelist, the CA name constraints, release-name parsing, torrent-to-movie
-matching, the poster routes and the generated tokens.css) and need no network or Windows APIs.
+matching, the poster routes, the generated tokens.css, the ntfy payload, the movie-ready and
+low-disk notifications and the after-movie shutdown decisions) and need no network or Windows
+APIs.
 
 ## License
 

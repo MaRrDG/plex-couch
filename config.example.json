@@ -7,6 +7,12 @@
   "filelist_tracker_regex": "thefl\\.org|filelist\\.(io|ro)|flro\\.org",
   "disks": ["C:", "D:"],
   "plex_poll_seconds": 10,
+  "notifications": {
+    "server": "https://ntfy.sh",
+    "topic": null,
+    "disk_min_gb": 60,
+    "ready_wait_minutes": 20
+  },
   "https": {
     "port": 8766,
     "cert": "certs/server.pem",

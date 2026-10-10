@@ -180,6 +180,10 @@ class Services:
             return (data or {}).get("records") or []
         return self.cache.get("radarr_history", 60, load)
 
+    def radarr_root_folders(self):
+        """Radarr's root folders ([{"path": "D:\\Movies", ...}])."""
+        return self.cache.get("radarr_rootfolder", 300, lambda: self._radarr("/rootfolder") or [])
+
     def radarr_poster(self, movie_id):
         """Radarr's local poster for a movie: the 500px copy, else the original."""
         return self._radarr_cover(movie_id, ("poster-500.jpg", "poster.jpg"))

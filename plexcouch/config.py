@@ -17,6 +17,13 @@ DEFAULTS = {
     "filelist_tracker_regex": r"thefl\.org|filelist\.(io|ro)|flro\.org",
     "disks": ["C:", "D:"],
     "plex_poll_seconds": 10,
+    # Phone notifications through ntfy. No topic = off; app.py --setup-ntfy creates one.
+    "notifications": {
+        "server": "https://ntfy.sh",
+        "topic": None,
+        "disk_min_gb": 60,
+        "ready_wait_minutes": 20,
+    },
     # HTTPS for the installable PWA. Relative paths are resolved against the config file's
     # folder. If cert or key is missing the app serves plain HTTP only, as before.
     "https": {
@@ -108,6 +115,15 @@ class Config:
             if not self._raw.get("secret"):
                 self._raw["secret"] = secrets.token_hex(32)
             self._raw.setdefault("settings", {}).setdefault("auto_monitors_off", True)
+            self._save_locked()
+            self.data = _merge(DEFAULTS, self._raw)
+
+    def set_notification_topic(self, topic):
+        with self._lock:
+            n = self._raw.get("notifications")
+            if not isinstance(n, dict):
+                n = self._raw["notifications"] = {}
+            n["topic"] = topic
             self._save_locked()
             self.data = _merge(DEFAULTS, self._raw)
 

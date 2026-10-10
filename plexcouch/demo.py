@@ -91,6 +91,13 @@ def _movie(rid, **extra):
     return d
 
 
+def demo_sessions():
+    """The demo movie as an internal Plex session (for arming 'shut down after the movie')."""
+    played = 2843 + int(time.time() - _START)
+    return [{"key": "demo", "title": "Dune: Part Two", "year": 2024, "state": "playing",
+             "progress": round(played / 9960 * 100, 1), "address": "10.0.0.20"}]
+
+
 def demo_status(app_name, power, settings):
     t = time.time()
     played = 2843 + int(t - _START)
@@ -125,7 +132,7 @@ def demo_status(app_name, power, settings):
             "progress": round(played / 9960 * 100, 1), "position": played, "duration": 9960,
             "decision": "direct_play", "decision_ro": "redare directă", "transcode": False,
             "rating_key": "101", "poster": logic.poster_url("plex", "101"),
-            "backdrop": logic.poster_url("plex-art", "101"),
+            "backdrop": logic.poster_url("plex-art", "101"), "on_tv": True,
         }],
         "downloads": [_movie(3, percent=62.0, time_left="8 min", status="Se descarcă", movie_id=3)],
         "waiting": [

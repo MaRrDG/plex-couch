@@ -178,6 +178,15 @@ def disks(letters):
     return out
 
 
+def free_gb(path):
+    """Free space in GB on the drive holding path, or None if it cannot be read."""
+    root = path if path.endswith("\\") else path + "\\"
+    try:
+        return shutil.disk_usage(root).free / 1024 ** 3
+    except OSError:
+        return None
+
+
 def own_ipv4s():
     ips = set()
     try:

@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import ipaddress
 import math
+import ntpath
 import re
 import secrets
 import threading
@@ -652,6 +653,169 @@ def auto_monitor_decision(handled, sessions, own_ips, enabled):
             if enabled and not is_local_player(s.get("address"), own_ips):
                 trigger = True
     return handled & current, trigger
+
+
+def tv_sessions(sessions, own_ips):
+    """Plex sessions on another device (the TV), not on this PC."""
+    return [s for s in sessions or [] if s.get("key") and not is_local_player(s.get("address"), own_ips)]
+
+
+# ---------------------------------------------------------------------------
+# Shut down after the movie
+# ---------------------------------------------------------------------------
+
+AFTER_MOVIE_DONE_PCT = 90.0   # a session that ends at or past this point was watched to the end
+AFTER_MOVIE_IDLE_S = 3 * 3600  # disarm after this long with nothing playing on the TV
+
+
+def _pick_session(sessions, title=None):
+    """The session to follow: the same title if it is back, else one that plays, else any."""
+    if title:
+        same = [s for s in sessions if s.get("title") == title]
+        if same:
+            sessions = same
+    playing = [s for s in sessions if s.get("state") == "playing"]
+    return (playing or sessions or [None])[0]
+
+
+def after_movie_arm(sessions, own_ips, now):
+    """Arm 'shut down after the movie' on what plays on the TV. None if nothing plays there."""
+    s = _pick_session(tv_sessions(sessions, own_ips))
+    if s is None:
+        return None
+    return {"key": s["key"], "title": s.get("title") or "", "since": now,
+            "progress": float(s.get("progress") or 0), "seen": now}
+
+
+def after_movie_step(state, sessions, own_ips, now,
+                     done_pct=AFTER_MOVIE_DONE_PCT, idle_s=AFTER_MOVIE_IDLE_S):
+    """One poll of the Plex sessions while armed. Returns (new_state, action).
+
+    action is None, 'fire' (the followed session ended at >= done_pct: shut down now; the
+    state is cleared, so it fires once) or 'expire' (nothing played on the TV for idle_s).
+    A session that ends earlier (the user stopped it) does not fire: the state stays armed,
+    follows the next session on the TV (the same title first) and expires after idle_s.
+    sessions must be a successful poll; on a failed poll do not call this."""
+    if not state:
+        return None, None
+    state = dict(state)
+    tv = tv_sessions(sessions, own_ips)
+    if state.get("key"):
+        cur = next((s for s in tv if s["key"] == state["key"]), None)
+        if cur is not None:
+            state["progress"] = float(cur.get("progress") or 0)
+            state["title"] = cur.get("title") or state.get("title") or ""
+            state["seen"] = now
+            return state, None
+        if state.get("progress", 0) >= done_pct:
+            return None, "fire"
+        state.update(key=None, seen=now)  # stopped early: stay armed, wait for the next session
+    nxt = _pick_session(tv, state.get("title"))
+    if nxt is not None:
+        state.update(key=nxt["key"], title=nxt.get("title") or state.get("title") or "",
+                     progress=float(nxt.get("progress") or 0), seen=now)
+        return state, None
+    if now - state.get("seen", state.get("since", now)) >= idle_s:
+        return None, "expire"
+    return state, None
+
+
+def public_after_movie(state):
+    """The armed state as /api/status shows it, or None."""
+    if not state:
+        return None
+    return {"armed": True, "title": state.get("title") or "", "since": int(state.get("since") or 0)}
+
+
+# ---------------------------------------------------------------------------
+# Notifications: movie ready, disk low
+# ---------------------------------------------------------------------------
+
+def movie_label(movie):
+    title = movie.get("title") or ""
+    return "%s (%s)" % (title, movie["year"]) if movie.get("year") else title
+
+
+def movie_ready_text(movie, ro):
+    """ro: True (Romanian subtitle found), False (still missing), None (Bazarr unknown)."""
+    label = movie_label(movie)
+    if ro is True:
+        return "%s e gata de vizionat, cu subtitrare RO." % label
+    if ro is False:
+        return "%s e gata de vizionat. Subtitrarea RO încă lipsește." % label
+    return "%s e gata de vizionat." % label
+
+
+MOVIE_READY_FLOOD = 10  # more new movies than this in one poll are recorded, not notified
+
+
+def movie_ready_step(state, movies, ro_map, now, wait_s):
+    """Decide which 'movie ready' notifications to send. Pure; the caller persists the state.
+
+    state: {"primed": bool, "done": [radarr ids], "pending": {"id": first seen with a file}}.
+    movies: Radarr /movie list, or None when Radarr is down (nothing changes then).
+    ro_map: bazarr_ro_map(...) or None when Bazarr is down.
+    The first call only records the movies that already have a file (they never notify).
+    A movie that newly has a file notifies once: right away when Bazarr shows a Romanian
+    subtitle, else once wait_s has passed since it was first seen with a file. Notified ids
+    are kept for good, so a file that disappears and comes back (an upgrade) never repeats.
+    Returns (new_state, [message, ...])."""
+    state = state or {}
+    done = {str(x) for x in state.get("done") or []}
+    pending = {str(k): float(v) for k, v in (state.get("pending") or {}).items()}
+    if movies is None:
+        return {"primed": bool(state.get("primed")), "done": sorted(done, key=_id_order), "pending": pending}, []
+    by_id = {str(m.get("id")): m for m in movies if m.get("id") is not None}
+    with_file = {k for k, m in by_id.items() if m.get("hasFile")}
+    if not state.get("primed"):
+        return {"primed": True, "done": sorted(with_file, key=_id_order), "pending": {}}, []
+
+    new = with_file - done - set(pending)
+    if len(new) > MOVIE_READY_FLOOD:
+        done |= new  # a mass import (or Radarr came back empty-handed earlier): no flood
+    messages = []
+    for mid in sorted(with_file - done, key=_id_order):
+        first = pending.setdefault(mid, now)
+        ro = None if ro_map is None else bool(ro_map.get(by_id[mid].get("id")))
+        if ro:
+            messages.append(movie_ready_text(by_id[mid], True))
+        elif now - first >= wait_s:
+            messages.append(movie_ready_text(by_id[mid], ro))
+        else:
+            continue
+        done.add(mid)
+        pending.pop(mid, None)
+    pending = {k: v for k, v in pending.items() if k in with_file and k not in done}
+    return {"primed": True, "done": sorted(done, key=_id_order), "pending": pending}, messages
+
+
+def _id_order(x):
+    return (0, int(x)) if str(x).isdigit() else (1, str(x))
+
+
+def drive_of(path):
+    r"""'D:\Movies' -> 'D:'; '\\server\share\Movies' -> '\\server\share'; None without a drive."""
+    d = ntpath.splitdrive(str(path or ""))[0]
+    return d.upper() if len(d) == 2 else (d or None)
+
+
+DISK_REARM_GB = 10
+
+
+def disk_low_step(low, free_gb, min_gb, rearm_gb=DISK_REARM_GB):
+    """Hysteresis for the low-disk warning. low: already warned for this drive.
+    Returns (new_low, notify): warn once when free < min_gb, re-arm above min_gb + rearm_gb."""
+    if free_gb is None:
+        return bool(low), False
+    if not low and free_gb < min_gb:
+        return True, True
+    if low and free_gb > min_gb + rearm_gb:
+        return False, False
+    return bool(low), False
+
+
+def disk_low_text(drive, free_gb):
+    return "Mai ai %d GB liberi pe %s. Un film 4K are 20–30 GB." % (int(free_gb), drive)
 
 
 # ---------------------------------------------------------------------------

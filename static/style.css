@@ -290,6 +290,20 @@ a { color: inherit; }
   justify-self: start;
 }
 .btn-text:disabled { opacity: 0.45; }
+
+/* ---------- Notificări: ListGroup rows with a value line and a row button ---------- */
+.topic { color: var(--ink); overflow-wrap: anywhere; -webkit-user-select: all; user-select: all; }
+.li-btn {
+  display: block;
+  width: 100%;
+  min-height: var(--size-tap);
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+}
+.li-btn:disabled { opacity: 0.45; }
+.li-btn:not(:disabled):active { color: var(--muted); }
 .foot { display: grid; gap: var(--space-1); justify-items: start; }
 
 /* ---------- Banners (offline, CountdownBanner) ---------- */
@@ -370,6 +384,7 @@ a { color: inherit; }
 .warn-text { color: var(--accent); }
 .warn-list { display: grid; gap: 4px; }
 .warn-list .meta { color: var(--muted); }
+.sheet-option { display: grid; gap: var(--space-1); }
 
 /* ---------- Toast ---------- */
 .toast-wrap {

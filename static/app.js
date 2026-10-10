@@ -21,6 +21,7 @@
   let offline = false;
   let clockOffset = 0;
   let pendingPower = null;
+  let afterMovie = null;
   let countdownTimer = null;
   let segment = 'lib';
 
@@ -231,9 +232,11 @@
   const busy = new Set();
   function applyDisabled() {
     const off = offline;
-    for (const id of ['mon-off', 'mon-on', 'auto-off', 'logout', 'countdown-cancel']) $(id).disabled = off || busy.has(id);
+    for (const id of ['mon-off', 'mon-on', 'auto-off', 'logout', 'countdown-cancel', 'after-movie-cancel',
+      'notify-test']) $(id).disabled = off || busy.has(id);
     for (const id of ['tile-shutdown', 'btn-shutdown', 'btn-restart']) $(id).disabled = off || !!pendingPower;
     $('sheet-confirm').disabled = off;
+    $('sheet-after').disabled = off;
   }
   function setOffline(on) {
     if (offline === on) return;
@@ -444,8 +447,10 @@
     renderSeed(s.torrents);
     renderDisk(s.pc || {});
     renderServices(svc);
+    renderNotify(s.notifications);
     renderFooter(s);
     setPower(fromCache ? null : s.power);
+    setAfterMovie(fromCache ? null : s.power && s.power.after_movie);
   }
 
   function renderEmpty() {
@@ -608,6 +613,38 @@
     }));
   }
 
+  // ---------- Notificări (ntfy) ----------
+  function renderNotify(n) {
+    const on = !!(n && n.enabled && n.topic);
+    $('notify-off').hidden = on || !n;
+    $('notify-on').hidden = !on;
+    // Only touch the text when it changes, so a selection made for copying survives the poll.
+    if (on && $('notify-topic').textContent !== n.topic) $('notify-topic').textContent = n.topic;
+  }
+  function selectTopic() {
+    const range = document.createRange();
+    range.selectNodeContents($('notify-topic'));
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  $('notify-copy').addEventListener('click', async () => {
+    const topic = $('notify-topic').textContent;
+    if (!topic) return;
+    try {
+      if (!navigator.clipboard || !window.isSecureContext) throw new Error('no clipboard');
+      await navigator.clipboard.writeText(topic);
+      toast('Numele a fost copiat.');
+    } catch (e) {
+      selectTopic();
+      let copied = false;
+      try { copied = document.execCommand('copy'); } catch (err) { copied = false; }
+      toast(copied ? 'Numele a fost copiat.' : 'Numele e selectat. Copiază-l din meniul telefonului.');
+    }
+  });
+  $('notify-test').addEventListener('click', () =>
+    action('notify-test', '/api/notify/test', 'Notificarea de test a fost trimisă.'));
+
   function renderFooter(s) {
     const at = s._at ? hhmm(new Date(s._at)) : '';
     $('updated').textContent = offline ? (at ? `Ultima actualizare la ${at}` : '') : `Actualizat la ${at}`;
@@ -623,7 +660,7 @@
   // ---------- power: CountdownBanner ----------
   function nowSec() { return Date.now() / 1000 + clockOffset; }
   function setPower(p) {
-    pendingPower = p || null;
+    pendingPower = p && p.kind ? { kind: p.kind, at: p.at } : null;
     const on = !!pendingPower;
     $('countdown').hidden = !on;
     applyDisabled();
@@ -660,6 +697,42 @@
     }
   });
 
+  // ---------- power: after the movie (banner without a countdown) ----------
+  function setAfterMovie(a) {
+    afterMovie = a && a.armed ? a : null;
+    $('after-movie').hidden = !afterMovie;
+    if (afterMovie) $('after-movie-text').textContent = `PC-ul se oprește după ${afterMovie.title || 'film'}.`;
+  }
+  function tvMovie() {
+    return ((last && last.now_playing) || []).find((p) => p.on_tv) || null;
+  }
+  async function armAfterMovie() {
+    closeSheet();
+    try {
+      const r = await api('/api/power/after-movie', {});
+      setAfterMovie(r.power && r.power.after_movie);
+      if (afterMovie) $('after-movie-cancel').focus({ preventScroll: true });
+      window.scrollTo({ top: 0, behavior: reducedMotion.matches ? 'auto' : 'smooth' });
+      toast('PC-ul se oprește după film.');
+    } catch (e) {
+      if (e.message !== 'auth') toast(e.message, true);
+    }
+  }
+  $('after-movie-cancel').addEventListener('click', async () => {
+    busy.add('after-movie-cancel');
+    applyDisabled();
+    try {
+      await api('/api/power/after-movie/cancel', {});
+      setAfterMovie(null);
+      toast('Oprirea după film a fost anulată.');
+    } catch (e) {
+      if (e.message !== 'auth') toast(e.message, true);
+    } finally {
+      busy.delete('after-movie-cancel');
+      applyDisabled();
+    }
+  });
+
   // ---------- ActionSheet ----------
   let lastFocus = null;
   let sheetKind = null;
@@ -674,6 +747,13 @@
       ? 'Repornește în 60 de secunde. Poți anula până atunci.'
       : 'Se oprește în 60 de secunde. Poți anula până atunci.';
     $('sheet-confirm').textContent = restart ? 'Repornește PC-ul' : 'Oprește PC-ul';
+    // Second option while a movie plays on the TV: shut down when it ends.
+    const movie = !restart && !afterMovie ? tvMovie() : null;
+    $('sheet-after-wrap').hidden = !movie;
+    if (movie) {
+      $('sheet-after-meta').textContent =
+        `Când se termină ${movie.title}. Dacă îl oprești mai devreme, PC-ul rămâne pornit.`;
+    }
     const warns = (last && last.hr_warnings) || [];
     $('sheet-warn').hidden = !warns.length;
     const lead = warns.length === 1 ? 'Un torrent n-a terminat seed-ul pe FileList.'
@@ -716,11 +796,13 @@
   $('sheet-cancel').addEventListener('click', () => closeSheet());
   $('scrim').addEventListener('click', () => closeSheet());
   $('sheet-confirm').addEventListener('click', () => power(sheetKind));
+  $('sheet-after').addEventListener('click', () => armAfterMovie());
   document.addEventListener('keydown', (e) => {
     if ($('sheet').hidden) return;
     if (e.key === 'Escape') { e.preventDefault(); closeSheet(); return; }
     if (e.key === 'Tab') { // keep focus inside the sheet
-      const items = [$('sheet-confirm'), $('sheet-cancel')].filter((b) => !b.disabled);
+      const items = [$('sheet-confirm'), $('sheet-after'), $('sheet-cancel')]
+        .filter((b) => !b.disabled && !b.closest('[hidden]'));
       const i = items.indexOf(document.activeElement);
       e.preventDefault();
       const next = i < 0 ? (e.shiftKey ? items.length - 1 : 0) : (i + (e.shiftKey ? items.length - 1 : 1)) % items.length;

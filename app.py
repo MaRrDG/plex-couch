@@ -4,6 +4,7 @@ Usage:
   app.py [--host 0.0.0.0] [--port 8765] [--https-port 8766] [--cert F] [--key F] [--ca-cert F]
          [--config config.local.json] [--dry-run]
   app.py --set-pin 1234 [--config config.local.json]
+  app.py --setup-ntfy [--new-topic] [--config config.local.json]
 
 With a certificate and key (see tools/make_certs.py) the app is served over HTTPS on
 --https-port, and --port only serves an install page, the CA certificate and redirects.
@@ -26,10 +27,10 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
-from plexcouch import demo, logic
+from plexcouch import demo, logic, notify
 from plexcouch.config import Config
 from plexcouch.services import Services
-from plexcouch.system import Actions, own_ipv4s, pc_info
+from plexcouch.system import Actions, free_gb, own_ipv4s, pc_info
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -38,6 +39,9 @@ COOKIE = "pc_session"
 CSRF_HEADER = "X-Requested-With"
 CSRF_VALUE = "plex-couch"
 MAX_BODY = 4096
+STATE_FILE = "state.local.json"  # next to the config: what was already notified
+NOTIFY_POLL_SECONDS = 60
+NOTIFY_TEST_TIMEOUT = 6  # below the page's 8 s request timeout
 
 # pythonw.exe has no console: make sure nothing writes to a None stream.
 if sys.stdout is None:
@@ -143,6 +147,12 @@ class App:
         self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="svc")
         self._own_ips = set()
         self._own_ips_at = 0.0
+        self.notifier = notify.Notifier(config, self.dry_run)
+        self.state_file = notify.StateFile(os.path.join(os.path.dirname(config.path), STATE_FILE))
+        self._disk_drive = "D:"
+        # "Shut down after the movie": in memory only, a restart disarms it.
+        self._after_movie = None
+        self._after_movie_lock = threading.Lock()
 
     # -- auth ---------------------------------------------------------------
     def _session_key(self):
@@ -167,7 +177,9 @@ class App:
     # -- status -------------------------------------------------------------
     def status(self):
         if self.demo:
-            return demo.demo_status(self.config.app_name, self.actions.pending(), self.config.settings)
+            st = demo.demo_status(self.config.app_name, self.power_status(), self.config.settings)
+            st["notifications"] = self.notifications_status()
+            return st
         s = self.services
         jobs = {
             "plex": self.pool.submit(s.plex_sessions),
@@ -210,16 +222,157 @@ class App:
             "dry_run": self.dry_run,
             "pc": pc_info(self.config.data.get("disks") or []),
             "services": services,
-            "now_playing": [logic.with_backdrop_fallback(logic.public_session(x), movies)
-                            for x in results.get("plex") or []],
+            "now_playing": [self._public_playing(x, movies) for x in results.get("plex") or []],
             "downloads": None if queue is None else [logic.summarize_queue_record(r) for r in queue],
             "waiting": None if movies is None else logic.summarize_waiting(movies, queue_ids),
             "library": None if movies is None else logic.summarize_library(movies, ro_map),
             "torrents": None if "qbittorrent" not in results else torrents,
             "hr_warnings": logic.hr_warnings(torrents),
-            "power": self.actions.pending(),
+            "power": self.power_status(),
             "settings": self.config.settings,
+            "notifications": self.notifications_status(),
         }
+
+    def _public_playing(self, session, movies):
+        out = logic.with_backdrop_fallback(logic.public_session(session), movies)
+        out["on_tv"] = not logic.is_local_player(session.get("address"), self.own_ips())
+        return out
+
+    def power_status(self):
+        """None, or the pending shutdown/restart ({"kind", "at"}, as before) plus "after_movie".
+        Kept null when nothing is going on, so an older cached page still reads it right."""
+        pending = self.actions.pending()
+        with self._after_movie_lock:
+            after = logic.public_after_movie(self._after_movie)
+        if pending is None and after is None:
+            return None
+        out = dict(pending or {})
+        out["after_movie"] = after
+        return out
+
+    def notifications_status(self):
+        """Only ever returned to logged-in clients (/api/status); the topic is never logged."""
+        n = self.notifier
+        return {"enabled": n.enabled, "topic": n.topic, "server": n.server if n.enabled else None}
+
+    # -- shut down after the movie -----------------------------------------
+    def _sessions_now(self):
+        if self.demo:
+            return demo.demo_sessions()
+        return self.services.plex_sessions()
+
+    def arm_after_movie(self):
+        """Returns (http_status, body)."""
+        if self.actions.pending():
+            return 409, {"error": "Există deja o oprire programată."}
+        try:
+            sessions = self._sessions_now()
+        except Exception as e:
+            log.debug("after-movie: plex poll failed: %s", type(e).__name__)
+            return 503, {"error": "Plex nu răspunde. Repornește PC-ul sau verifică serviciul."}
+        state = logic.after_movie_arm(sessions, self.own_ips(), time.time())
+        if state is None:
+            return 409, {"error": "Nu rulează nimic pe TV acum."}
+        with self._after_movie_lock:
+            self._after_movie = state
+        log.info("after-movie shutdown armed")
+        return 200, {"ok": True, "power": self.power_status()}
+
+    def cancel_after_movie(self):
+        with self._after_movie_lock:
+            was = self._after_movie is not None
+            self._after_movie = None
+        if was:
+            log.info("after-movie shutdown disarmed")
+        return self.power_status()
+
+    def after_movie_poll(self, sessions, now=None):
+        """Called with every successful Plex poll. Starts the normal 60 s shutdown once."""
+        now = time.time() if now is None else now
+        with self._after_movie_lock:
+            if self._after_movie is None:
+                return None
+            self._after_movie, action = logic.after_movie_step(self._after_movie, sessions,
+                                                               self.own_ips(), now)
+        if action == "expire":
+            log.info("after-movie shutdown expired (nothing played for 3 h)")
+        elif action == "fire":
+            log.info("after-movie: the movie ended, shutting down")
+            if self.actions.power("shutdown") is not None:
+                self.notifier.send_async("Oprire după film",
+                                         "PC-ul se oprește în 60 de secunde. Anulează din Plex Couch.",
+                                         priority="high")
+        return action
+
+    # -- notifications -----------------------------------------------------
+    def send_test_notification(self):
+        """Returns (http_status, body)."""
+        if not self.notifier.enabled:
+            return 409, {"error": "Notificările nu sunt pornite. Rulează app.py --setup-ntfy."}
+        if self.demo:
+            return 200, {"ok": True}
+        ok = self.notifier.send(self.config.app_name, "Test Plex Couch: notificările merg.",
+                                timeout=NOTIFY_TEST_TIMEOUT)
+        if not ok:
+            return 502, {"error": "Notificarea nu a plecat. Verifică internetul PC-ului și reîncearcă."}
+        return 200, {"ok": True}
+
+    def _radarr_drive(self):
+        try:
+            for folder in self.services.radarr_root_folders() or []:
+                d = logic.drive_of(folder.get("path"))
+                if d:
+                    self._disk_drive = d
+                    break
+        except Exception as e:
+            log.debug("radarr root folders failed: %s", type(e).__name__)
+        return self._disk_drive
+
+    def notify_tick(self, now=None):
+        """One round of the movie-ready and disk-low checks. Returns what was sent."""
+        now = time.time() if now is None else now
+        cfg = self.config.data.get("notifications") or {}
+        try:
+            movies = self.services.radarr_movies()
+        except Exception as e:
+            log.debug("notify: radarr failed: %s", type(e).__name__)
+            movies = None
+        try:
+            ro_map = logic.bazarr_ro_map(self.services.bazarr_movies())
+        except Exception as e:
+            log.debug("notify: bazarr failed: %s", type(e).__name__)
+            ro_map = None
+        state = self.state_file.load()
+        sent = []
+        wait_s = float(cfg.get("ready_wait_minutes") or 0) * 60
+        state["movie_ready"], ready = logic.movie_ready_step(state.get("movie_ready"), movies, ro_map,
+                                                             now, wait_s)
+        for text in ready:
+            sent.append(("Film gata", text, ["movie_camera"], None))
+
+        drive = self._radarr_drive()
+        free = free_gb(drive)
+        lows = state.get("disk_low") if isinstance(state.get("disk_low"), dict) else {}
+        lows[drive], warn = logic.disk_low_step(lows.get(drive), free, float(cfg.get("disk_min_gb") or 0))
+        state["disk_low"] = lows
+        if warn:
+            sent.append(("Spațiu puțin", logic.disk_low_text(drive, free), ["warning"], "high"))
+
+        self.state_file.save(state)  # before sending: never twice, even after a crash
+        for title, text, tags, prio in sent:
+            self.notifier.send(title, text, tags=tags, priority=prio)
+        return sent
+
+    def notify_loop(self, stop):
+        first = True
+        while not stop.wait(0 if first else NOTIFY_POLL_SECONDS):
+            first = False
+            if not self.notifier.enabled:
+                continue
+            try:
+                self.notify_tick()
+            except Exception:
+                log.exception("notify check failed")
 
     # -- posters ------------------------------------------------------------
     def poster(self, kind, ident):
@@ -251,6 +404,10 @@ class App:
             enabled = primed and bool(self.config.settings.get("auto_monitors_off"))
             handled, trigger = logic.auto_monitor_decision(handled, sessions, self.own_ips(), enabled)
             primed = True
+            try:
+                self.after_movie_poll(sessions)
+            except Exception:
+                log.exception("after-movie check failed")
             if trigger:
                 try:
                     self.actions.monitors_off(reason="auto: film pornit pe TV")
@@ -398,6 +555,17 @@ class Handler(BaseHTTPRequestHandler):
             log.info("action power/cancel from %s", self.client_ip)
             a.cancel_power()
             return self._json(200, {"ok": True, "power": None})
+        if path == "/api/power/after-movie":
+            log.info("action power/after-movie from %s", self.client_ip)
+            code, out = self.app.arm_after_movie()
+            return self._json(code, out)
+        if path == "/api/power/after-movie/cancel":
+            log.info("action power/after-movie/cancel from %s", self.client_ip)
+            return self._json(200, {"ok": True, "power": self.app.cancel_after_movie()})
+        if path == "/api/notify/test":
+            log.info("action notify/test from %s", self.client_ip)
+            code, out = self.app.send_test_notification()
+            return self._json(code, out)
         if path == "/api/settings":
             changes = {}
             if isinstance(body.get("auto_monitors_off"), bool):
@@ -530,6 +698,25 @@ class TLSServer(Server):
                 pass
 
 
+def setup_ntfy(config, replace=False):
+    """--setup-ntfy: make sure the config has a topic, print it and how to subscribe."""
+    notifier = notify.Notifier(config, dry_run=True)
+    topic = notifier.topic
+    if topic is None or replace:
+        topic = notify.new_topic()
+        config.set_notification_topic(topic)
+        log.info("ntfy topic %s via --setup-ntfy", "replaced" if replace else "created")
+        print("New ntfy topic saved to %s" % config.path)
+    else:
+        print("Keeping the existing ntfy topic (use --new-topic to replace it).")
+    print("Topic: %s" % topic)
+    print("Subscribe to it in the ntfy app (server %s), or open: %s"
+          % (notifier.server, notify.subscribe_url(notifier.server, topic)))
+    print("Anyone who knows the topic can read the notifications: keep it private.")
+    print("Restart Plex Couch to start sending notifications.")
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="Plex Couch")
     p.add_argument("--host", default="0.0.0.0")
@@ -542,6 +729,9 @@ def main(argv=None):
     p.add_argument("--config", default=os.path.join(BASE_DIR, "config.local.json"))
     p.add_argument("--dry-run", action="store_true", help="log monitor/power actions, never execute them")
     p.add_argument("--set-pin", metavar="DIGITS", help="store the PIN hash in the config and exit")
+    p.add_argument("--setup-ntfy", action="store_true",
+                   help="create an ntfy topic for phone notifications (keeps an existing one), print it, exit")
+    p.add_argument("--new-topic", action="store_true", help="with --setup-ntfy: replace the existing topic")
     p.add_argument("--demo", action="store_true",
                    help="serve the UI with fake data and no login (screenshots only; 127.0.0.1 only)")
     args = p.parse_args(argv)
@@ -557,6 +747,9 @@ def main(argv=None):
         log.info("PIN changed via --set-pin")
         print("PIN saved to %s" % config.path)
         return 0
+
+    if args.setup_ntfy:
+        return setup_ntfy(config, args.new_topic)
 
     if args.demo and args.host != "127.0.0.1":
         print("--demo only runs with --host 127.0.0.1")
@@ -584,6 +777,7 @@ def main(argv=None):
     stop = threading.Event()
     if not args.demo:
         threading.Thread(target=app.auto_monitor_loop, args=(stop,), name="auto-monitor", daemon=True).start()
+        threading.Thread(target=app.notify_loop, args=(stop,), name="notify", daemon=True).start()
     for srv in servers[1:]:
         threading.Thread(target=srv.serve_forever, name="http", daemon=True).start()
     log.info("started on %s%s", where, " (demo)" if args.demo else (" (dry-run)" if args.dry_run else ""))

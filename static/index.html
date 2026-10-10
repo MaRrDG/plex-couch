@@ -66,6 +66,11 @@
         <button type="button" class="btn btn-primary" id="countdown-cancel">Anulează oprirea</button>
       </section>
 
+      <section class="banner" id="after-movie" role="status" hidden>
+        <p class="body-strong" id="after-movie-text"></p>
+        <button type="button" class="btn btn-plain btn-on-surface" id="after-movie-cancel">Nu mai opri</button>
+      </section>
+
       <!-- Acasă -->
       <section class="view" id="view-acasa" data-view="acasa" aria-labelledby="t-acasa">
         <h1 class="title-screen" id="t-acasa">Acasă</h1>
@@ -141,6 +146,21 @@
           <div class="chips" id="services"></div>
         </section>
 
+        <section class="sec" aria-labelledby="h-notify">
+          <div class="sec-head">
+            <h2 class="body-strong" id="h-notify">Notificări</h2>
+          </div>
+          <p class="meta muted" id="notify-off" hidden>Pornește notificările cu app.py --setup-ntfy.</p>
+          <div class="group" id="notify-on" hidden>
+            <div class="li">
+              <span class="tile-label">Abonează-te în ntfy</span>
+              <span class="data topic" id="notify-topic"></span>
+              <button type="button" class="btn btn-plain btn-on-surface" id="notify-copy">Copiază numele</button>
+            </div>
+            <button type="button" class="li li-btn body-strong" id="notify-test">Trimite un test</button>
+          </div>
+        </section>
+
         <div class="actions">
           <button type="button" class="btn btn-danger" id="btn-shutdown">Oprește PC-ul</button>
           <button type="button" class="btn btn-plain" id="btn-restart">Repornește</button>
@@ -174,6 +194,11 @@
       <ul class="warn-list" id="sheet-warn-list"></ul>
     </div>
     <button type="button" class="btn btn-confirm" id="sheet-confirm"></button>
+    <div class="sheet-option" id="sheet-after-wrap" hidden>
+      <button type="button" class="btn btn-plain btn-on-surface" id="sheet-after"
+              aria-describedby="sheet-after-meta">Oprește după film</button>
+      <p class="meta muted" id="sheet-after-meta"></p>
+    </div>
     <button type="button" class="btn btn-plain btn-on-surface" id="sheet-cancel">Anulează</button>
   </div>
 
