@@ -40,6 +40,11 @@ def _load_make_certs():
 make_certs = _load_make_certs()
 
 
+class _Result:
+    def __init__(self, code):
+        self.returncode = code
+
+
 class TestNoRedirectWithKeys(unittest.TestCase):
     def setUp(self):
         hits = self.hits = []
@@ -85,6 +90,34 @@ class TestNoRedirectWithKeys(unittest.TestCase):
     def test_qbittorrent_opener_has_the_handler(self):
         svc = services.Services(type("C", (), {"data": {}})())
         self.assertTrue(any(isinstance(h, services.NoSecretRedirectHandler) for h in svc._qb.handlers))
+
+
+class TestMakeCertsHardening(unittest.TestCase):
+    def test_ca_constraints_and_eku(self):
+        cfg = make_certs.ca_config()
+        self.assertIn("extendedKeyUsage = serverAuth", cfg)
+        line = [x for x in cfg.splitlines() if x.startswith("nameConstraints")][0]
+        self.assertIn("permitted;email:.invalid", line)
+        self.assertIn("permitted;IP:127.0.0.0/255.0.0.0", line)
+
+    def test_restrict_uses_icacls_on_windows(self):
+        args = make_certs.restrict_args(r"C:\x\server.key", "alice")
+        self.assertTrue(args[0].lower().endswith("icacls.exe") or args[0] == "icacls")
+        self.assertEqual(args[1:], [r"C:\x\server.key", "/inheritance:r", "/grant:r", "alice:F", "SYSTEM:F"])
+        if os.name != "nt":
+            return
+        seen = []
+        old_run = make_certs.subprocess.run
+        make_certs.subprocess.run = lambda a, **k: seen.append(a) or _Result(0)
+        try:
+            self.assertTrue(make_certs._restrict(r"C:\x\server.key"))
+            self.assertIsInstance(seen[0], list)
+            self.assertEqual(seen[0][1:5], [r"C:\x\server.key", "/inheritance:r", "/grant:r",
+                                            "%s:F" % os.environ.get("USERNAME")])
+            make_certs.subprocess.run = lambda a, **k: _Result(5)
+            self.assertFalse(make_certs._restrict(r"C:\x\server.key"))
+        finally:
+            make_certs.subprocess.run = old_run
 
 
 if __name__ == "__main__":

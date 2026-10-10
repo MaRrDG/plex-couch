@@ -14,7 +14,10 @@ Re-running renews only the server certificate. Use --force-ca to replace the CA 
 then has to install the new ca.crt).
 
 The CA carries critical name constraints, so even if its key leaked it could only vouch for
-private-network IP addresses, `localhost` and `*.local` names, never for public web sites.
+private-network IP addresses, `localhost` and `*.local` names, never for public web sites; it
+permits no e-mail names and is limited to TLS server use (extendedKeyUsage = serverAuth).
+The private keys are made readable only by the current user (icacls on Windows, chmod 600
+elsewhere).
 """
 
 import argparse
@@ -40,7 +43,13 @@ NAME_CONSTRAINTS = ",".join([
     "permitted;IP:127.0.0.0/255.0.0.0",
     "permitted;DNS:.local",
     "permitted;DNS:localhost",
+    # No e-mail (S/MIME) names: every rfc822Name must be under the reserved .invalid domain,
+    # so no real address ever matches. ('excluded;email:.' is accepted by openssl but matches
+    # nothing when certificates are verified, so it would exclude nothing.)
+    "permitted;email:.invalid",
 ])
+# The CA may only be used for TLS server certificates (verifiers that check EKU along the chain).
+CA_EKU = "serverAuth"
 
 _DNS_RE = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9-]{1,63})*$")
 
@@ -57,6 +66,7 @@ def ca_config():
         "[v3_ca]",
         "basicConstraints = critical,CA:TRUE,pathlen:0",
         "keyUsage = critical,keyCertSign,cRLSign",
+        "extendedKeyUsage = %s" % CA_EKU,
         "subjectKeyIdentifier = hash",
         "nameConstraints = critical,%s" % NAME_CONSTRAINTS,
         "",
@@ -140,11 +150,38 @@ def _write(path, text):
         f.write(text)
 
 
+def restrict_args(path, user):
+    """icacls argv that leaves only the current user and SYSTEM with access to path. Pure."""
+    return [_icacls_exe(), path, "/inheritance:r", "/grant:r", "%s:F" % user, "SYSTEM:F"]
+
+
+def _icacls_exe():
+    exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
+    return exe if os.path.isfile(exe) else "icacls"
+
+
 def _restrict(path):
+    """Make a private key readable only by the current user. chmod does nothing useful on
+    Windows, so there the file's ACL is replaced with icacls (no inherited entries)."""
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return True
+    user = os.environ.get("USERNAME")
+    if not user:
+        import getpass
+        user = getpass.getuser()
     try:
-        os.chmod(path, 0o600)
+        r = subprocess.run(restrict_args(path, user), capture_output=True, text=True)
+        ok = r.returncode == 0
     except OSError:
-        pass
+        ok = False
+    if not ok:
+        print("warning: could not restrict access to %s; do it by hand with icacls." % path,
+              file=sys.stderr)
+    return ok
 
 
 def make_ca(openssl, out, tmp):
