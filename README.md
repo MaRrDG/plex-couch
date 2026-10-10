@@ -77,11 +77,12 @@ returned. Paths, URLs and the tracker regex can be overridden in the config
 3. Try it in the foreground first, without touching the monitors or power:
 
    ```
-   python app.py --dry-run
+   python app.py --dry-run --allow-http
    ```
 
-   Then open `http://<pc-lan-ip>:8765` on your phone. This already works in the browser; to
-   install it as an app, set up HTTPS (next section).
+   Then open `http://<pc-lan-ip>:8765` on your phone. This already works in the browser, but
+   only with `--allow-http`: without certificates the app otherwise serves just an error page.
+   Set up HTTPS (next section) before you use it for real, then drop `--allow-http`.
 
 4. **Run at logon** with Task Scheduler so it lives in your interactive session (required for the
    monitor controls) without a console window:
@@ -146,8 +147,9 @@ by it; the phone trusts the CA once and then the app is a normal installable PWA
    printed.
 2. Restart the app. When `certs/server.pem` and `certs/server.key` exist it serves the app over
    HTTPS on port **8766**, and port 8765 only serves an install page, the CA certificate
-   (`/ca.crt`) and redirects everything else to HTTPS. Without them it behaves exactly as before
-   (HTTP only).
+   (`/ca.crt`) and redirects everything else to HTTPS. When they are missing or cannot be read,
+   port 8765 serves only a 503 page saying so (and the log says it too); the app, the API and
+   the login are not served at all. Plain HTTP for the whole app needs `--allow-http`.
 3. On the phone open `http://<pc-lan-ip>:8765` and follow the steps on the page: download the
    certificate, install it under *Settings → Security & privacy → More security settings →
    Encryption & credentials → Install a certificate → CA certificate* (names vary slightly by
@@ -166,6 +168,7 @@ Paths and the port can be changed with `--https-port`, `--cert`, `--key`, `--ca-
 ```
 app.py [--host 0.0.0.0] [--port 8765] [--https-port 8766] [--cert certs/server.pem]
        [--key certs/server.key] [--ca-cert certs/ca.crt] [--config config.local.json] [--dry-run]
+       [--allow-http]
 app.py --set-pin <digits> [--config config.local.json]
 app.py --setup-ntfy [--new-topic] [--config config.local.json]
 app.py --demo --host 127.0.0.1 [--port 8765]
@@ -173,6 +176,8 @@ tools/make_certs.py --ip <lan-ip> [--ip ...] [--dns localhost] [--out certs] [--
 ```
 
 `--dry-run` logs monitor and power actions instead of executing them.
+`--allow-http` serves the whole app over plain HTTP when no usable certificate is found (by
+default only a 503 page is served then).
 `--demo` serves the UI with fake data and no login, for screenshots and UI work; it refuses to
 start unless the host is `127.0.0.1` and never executes any action. Open `/#login` to see the
 login keypad in demo mode.
@@ -184,22 +189,43 @@ so check that file if something does not work.
 
 - **LAN only. Never expose this app to the internet** (no port forwarding, no reverse proxy).
   It can shut down your PC.
-- With certificates the app itself is only served over HTTPS (TLS 1.2+); the plain-HTTP port
-  only offers the install page, the CA certificate and redirects. The session cookie gets the
-  `Secure` flag over HTTPS.
+- **HTTPS is required.** With certificates the app itself is only served over HTTPS (TLS 1.2+)
+  with `Strict-Transport-Security: max-age=31536000`; the plain-HTTP port only offers the
+  install page, the CA certificate and redirects (no HSTS there). The session cookie gets the
+  `Secure` flag over HTTPS. If the certificate or key is missing or unreadable, the app does not
+  fall back to plain HTTP: port 8765 answers every request with a 503 page that says to run
+  `tools/make_certs.py`, and the log says the same. Plain HTTP for the whole app only runs with
+  an explicit `--allow-http`.
 - **The local CA is name-constrained.** Its certificate carries a critical X.509
   `nameConstraints` extension that permits only private IPv4 ranges (192.168.0.0/16, 10.0.0.0/8,
   172.16.0.0/12), loopback (127.0.0.0/8), `localhost` and `*.local` names. Even if `ca.key` were
   stolen, certificates it signs for public web sites would be rejected by the phone, so
-  installing it does not let anyone intercept your normal browsing. Still keep `certs/` private
-  and never commit it.
+  installing it does not let anyone intercept your normal browsing. CAs created by
+  `make_certs.py` also permit no e-mail names (`permitted;email:.invalid`) and carry
+  `extendedKeyUsage = serverAuth`, so they are good for TLS server certificates only. Still keep
+  `certs/` private and never commit it.
 - Requests from non-private, non-loopback addresses are rejected with 403.
+- **Host allowlist** (against DNS rebinding): every listener answers only requests whose `Host`
+  is an IP address (IPv4 or IPv6), `localhost` or a `*.local` name, or a name you list in the
+  config (`"allowed_hosts": ["plexpc.lan"]`). Anything else, including a missing `Host`, gets
+  `421 Misdirected Request`.
+- At most 64 connections per port at once (more are closed right away), and a connection that
+  sends nothing for 15 seconds (the TLS handshake included) is dropped.
 - Login with a 4-6 digit PIN; the PIN is stored only as a salted PBKDF2-HMAC-SHA256 hash
   (200k iterations) and verified in constant time.
-- Brute-force protection: 5 wrong PINs from one IP lock that IP for 10 minutes; 20 failures
-  per hour in total lock everyone out for 10 minutes.
-- Sessions are HMAC-signed cookies (`HttpOnly; SameSite=Strict`, 180 days). Changing the PIN
-  invalidates all existing sessions.
+- Brute-force protection: 5 wrong PINs from one IP lock that IP for 10 minutes. Each attempt
+  is counted *before* the PIN is checked, so parallel requests cannot get more than 5 checks per
+  lockout; PINs are checked one at a time and at most 4 login requests are handled at once
+  (more get a 429). After 20 failed attempts within an hour in total, IPs that have not logged
+  in successfully in the last 30 days may try only once a minute (all of them together); IPs
+  that have logged in before are not slowed down, so another device on the network cannot lock
+  you out. Those IPs are remembered for 30 days in `state.local.json` (git-ignored).
+- Sessions are HMAC-signed cookies (`HttpOnly; SameSite=Strict`) valid for 30 days and renewed
+  automatically when less than 15 days are left, so a phone in use stays logged in. *Ieși din
+  cont* logs out that phone (the cookie is deleted). *Ieși de pe toate dispozitivele* (PC tab)
+  invalidates every session at once: each token carries a session epoch kept in the config
+  (`session_epoch`), and the button increments it. Changing the PIN also invalidates all
+  sessions.
 - Every state-changing call is a POST that must carry the `X-Requested-With: plex-couch`
   header (CSRF guard). Strict Content-Security-Policy, no third-party resources.
 - The service worker caches the static app shell and, in a separate small cache (150 entries),
@@ -210,6 +236,19 @@ so check that file if something does not work.
   by the API.
 - `config.local.json` contains the PIN hash, the cookie secret and the ntfy topic; it is
   git-ignored, like `state.local.json`.
+- **Keep the secrets readable only by you.** `make_certs.py` restricts `ca.key` and
+  `server.key` itself (on Windows it removes inherited permissions with `icacls`; elsewhere
+  `chmod 600`). Do the same for the config and the rest of the certs folder, for example in
+  PowerShell from the project folder:
+
+  ```
+  icacls config.local.json /inheritance:r /grant:r "${env:USERNAME}:F" "SYSTEM:F"
+  icacls certs /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F" "SYSTEM:(OI)(CI)F"
+  ```
+
+  (`cmd.exe`: use `"%USERNAME%:F"`.) Run Plex Couch as that same user.
+- Requests to Radarr, Bazarr and Plex that carry an API key or token never follow an HTTP
+  redirect, so a key is never sent to another address.
 - Notifications are sent from the PC to the ntfy server as JSON over HTTPS; they carry only
   movie titles, free disk space and the shutdown notice.
 
@@ -240,7 +279,10 @@ PIN hashing, lockouts, Romanian status text, auto-monitor decisions, HTTPS redir
 flags, the static whitelist, the CA name constraints, release-name parsing, torrent-to-movie
 matching, the poster routes, the generated tokens.css, the ntfy payload, the movie-ready and
 low-disk notifications and the after-movie shutdown decisions) and need no network or Windows
-APIs.
+APIs. `tests/test_security.py` covers the hardening: parallel login bursts against a local test
+server, the session epoch and renewal, the Host allowlist, the HTTPS-required startup, LAN-only
+TV sessions, cancelling after the shutdown command ran (with `shutdown.exe` replaced by a stub),
+the connection cap, upstream redirects and the certificate tool.
 
 ## License
 
