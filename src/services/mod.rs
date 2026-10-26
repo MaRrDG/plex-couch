@@ -12,6 +12,7 @@
 //! API keys and tokens are never logged or returned; failures are logged by type only.
 
 pub mod bazarr;
+pub mod cache;
 pub mod keys;
 pub mod ntfy;
 pub mod plex;
