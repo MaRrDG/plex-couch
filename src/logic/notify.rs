@@ -25,7 +25,7 @@ pub const DISK_REARM_GB: f64 = 10.0;
 /// POST /api/notify/test: `(status, body)`.
 pub async fn send_test_notification(app: &Arc<AppState>) -> (u16, Value) {
     if !app.notifier.enabled() {
-        return (409, json!({"error": "Notificările nu sunt pornite. Rulează app.py --setup-ntfy."}));
+        return (409, json!({"error": "Notificările nu sunt pornite. Rulează plex-couch --setup-ntfy."}));
     }
     if app.demo {
         return (200, json!({"ok": true}));
@@ -683,7 +683,7 @@ mod tests {
         let html = include_str!("../../static/index.html");
         let js = include_str!("../../static/app.js");
         for text in ["Oprește după film", "Nu mai opri", "Notificări", "Abonează-te în ntfy", "Copiază numele",
-                     "Trimite un test", "Pornește notificările cu app.py --setup-ntfy."] {
+                     "Trimite un test", "Pornește notificările cu plex-couch --setup-ntfy."] {
             assert!(html.contains(text), "{text}");
         }
         for text in ["PC-ul se oprește după film.", "Oprirea după film a fost anulată.",

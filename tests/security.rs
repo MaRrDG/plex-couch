@@ -336,7 +336,7 @@ fn only_a_503_page() {
         assert_eq!(r.status, 503, "{path}");
         assert!(r.header("Content-Type").unwrap().starts_with("text/html"));
         if method != "HEAD" {
-            assert!(r.text().contains("make_certs.py"));
+            assert!(r.text().contains("plex-couch make-certs"));
             assert!(r.text().contains("Certificatele HTTPS lipsesc"));
         }
     }
@@ -419,7 +419,7 @@ fn missing_certificates_serve_only_503() {
     let c = start_child(&[]);
     let r = Request::new(c.port, "GET", "/").send();
     assert_eq!(r.status, 503);
-    assert!(r.text().contains("make_certs.py"));
+    assert!(r.text().contains("plex-couch make-certs"));
     assert_eq!(Request::new(c.port, "GET", "/api/status").send().status, 503);
 }
 

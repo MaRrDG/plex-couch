@@ -172,7 +172,7 @@ impl AppState {
         }
         let pin_hash = self.config.pin_hash();
         if pin_hash.is_empty() {
-            return (503, json!({"error": "PIN-ul nu este setat. Rulează app.py --set-pin."}), None);
+            return (503, json!({"error": "PIN-ul nu este setat. Rulează plex-couch --set-pin."}), None);
         }
         let (ticket, wait) = self.guard.reserve(ip, None);
         let Some(ticket) = ticket.filter(|_| wait == 0) else {

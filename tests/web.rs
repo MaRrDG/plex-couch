@@ -214,7 +214,7 @@ fn post_rules() {
 fn no_pin_and_demo_login() {
     let srv = TestServer::start(Setup { pin: None, ..Default::default() });
     let r = srv.login("1234");
-    assert_eq!((r.status, r.json()), (503, json!({"error": "PIN-ul nu este setat. Rulează app.py --set-pin."})));
+    assert_eq!((r.status, r.json()), (503, json!({"error": "PIN-ul nu este setat. Rulează plex-couch --set-pin."})));
     let demo = TestServer::start(Setup { pin: None, opts: AppOptions { demo: true, ..Default::default() }, ..Default::default() });
     let r = demo.login("whatever");
     assert_eq!((r.status, r.json()), (200, json!({"ok": true})));

@@ -5,7 +5,7 @@ Plex Couch is a phone remote for a Windows PC that runs Plex. It is used in a da
 - Use three tabs, in this order: **Acasă**, **Filme**, **PC**. Build them with `TabBar`. No other navigation, no hamburger menu.
 - **Acasă** answers "what is on the TV and what can I do now": a `NowPlayingCard`, then four `ControlTile`s in a 2×2 grid (Stinge monitoarele, Aprinde monitoarele, Stinge la play, Oprește PC-ul), then at most one compact "Se descarcă" row.
 - **Filme**: a `SegmentedControl` (Bibliotecă / Urmează) over a 3-column grid of `PosterCard`s. "Urmează" lists Watchlist movies not yet downloaded, with a plain status ("Apare digital pe 17 nov", "Se caută în 4K pe FileList", "Se descarcă, 62%").
-- **PC**: a `ListGroup` for Seed FileList, the D: disk as a `ProgressBar` with a data line, services as `StatusChip`s, a "Notificări" `ListGroup` (the ntfy topic in `data` with a `plain` "Copiază numele", and a "Trimite un test" row; when off, only the footnote "Pornește notificările cu app.py --setup-ntfy."), and the destructive `Button` "Oprește PC-ul" last.
+- **PC**: a `ListGroup` for Seed FileList, the D: disk as a `ProgressBar` with a data line, services as `StatusChip`s, a "Notificări" `ListGroup` (the ntfy topic in `data` with a `plain` "Copiază numele", and a "Trimite un test" row; when off, only the footnote "Pornește notificările cu plex-couch --setup-ntfy."), and the destructive `Button` "Oprește PC-ul" last.
 - Keep one screen, one job. Details move to another tab before a screen gets a fourth section.
 
 ## Content and voice
