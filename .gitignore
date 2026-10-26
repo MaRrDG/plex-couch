@@ -5,3 +5,4 @@ certs/
 *.local.json
 *.local.json.tmp
 /target/
+/plex-couch.exe
