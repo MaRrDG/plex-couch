@@ -18,9 +18,13 @@
 //! Per completed FileList torrent: `seconds` seeded, `last_tick`, and the Radarr/Sonarr
 //! mapping once found (`movie_id`, or `series_id` + `episode_ids`; remembered because the
 //! *arr apps drop the history of a deleted item). A new entry starts at qBittorrent's
-//! `seeding_time`; afterwards each tick adds the time since the last tick, at most 10 min,
-//! and only while qBittorrent answers, the torrent is seeding (`uploading`, `stalledUP`,
-//! `forcedUP`) and a FileList tracker reports status 2 (working).
+//! `seeding_time`; afterwards each tick adds the time since this process's previous tick
+//! (a monotonic clock that stops while the PC sleeps; nothing on the first tick after a
+//! start; at most the interval + 30 s), and only while qBittorrent answers, the torrent is
+//! seeding (`uploading`, `stalledUP`, `forcedUP`) and a FileList tracker reports status 2
+//! (working). The mapping also stores the item's tmdb (movie) / tvdb (series) id, checked
+//! against the current item before Watched/Gone are trusted. An unreadable ledger skips
+//! the tick (never overwritten).
 //!
 //! ## Deletion (`deleteFiles=true`: the download copy; the library hardlink stays)
 //! Only for categories `radarr` / `sonarr`, content under `D:\Media\Downloads`, and only
@@ -28,14 +32,15 @@
 //! (Radarr: movie file -> Plex section 1 `viewCount > 0`, or the movie is no longer in
 //! Radarr; Sonarr: every episode of the download watched in Plex section 2, or the series
 //! is no longer in Sonarr). Fallback for an unmapped torrent (no *arr history at all and no
-//! stored mapping, e.g. the movie was deleted with its history): once H&R is satisfied it
+//! stored mapping, e.g. the movie was deleted with its history, and the hash is not in the
+//! *arr queue, which a never-imported torrent would be): once H&R is satisfied it
 //! is deleted only if every file of the torrent exists under the downloads root with a
 //! hard-link count of 1 (no library copy shares it). Any other unknown mapping, API error,
 //! missing file, failed link query or link count > 1 keeps the torrent. Dry-run:
 //! the ledger is kept (it is the app's own file), deletions are only logged.
 
 use crate::app::AppState;
-use crate::jobs::common::{id_of, job_str, unix_now, Quiet};
+use crate::jobs::common::{id_of, job_str, unbiased_secs, unix_now, Quiet};
 use crate::jobs::Stop;
 use crate::services::arr_jobs::Arr;
 use crate::services::plex_jobs::{path_key, PlexJobs};
@@ -55,8 +60,8 @@ pub const LEDGER_FILE: &str = "seed-ledger.json";
 /// FileList asks for 48 h; one hour of margin.
 pub const HR_SECONDS: f64 = 49.0 * 3600.0;
 pub const HR_RATIO: f64 = 1.0;
-/// One tick never adds more than this.
-pub const MAX_TICK_SECONDS: f64 = 600.0;
+/// One tick never adds more than this (the interval plus some slack).
+pub const MAX_TICK_SECONDS: f64 = 330.0;
 /// Ledger entries of torrents gone from qBittorrent are dropped after this.
 pub const PRUNE_AFTER_SECONDS: f64 = 7.0 * 86_400.0;
 const SEEDING_STATES: [&str; 3] = ["uploading", "stalledUP", "forcedUP"];
@@ -92,24 +97,36 @@ pub fn snapshot(app: &AppState) -> HashMap<String, SeedInfo> {
     if let Some(s) = g.get(&path) {
         return s.clone();
     }
-    let s = infos_of(&load_ledger(&path));
-    g.insert(path, s.clone());
-    s
+    match load_ledger(&path) {
+        Ok(l) => {
+            let s = infos_of(&l);
+            g.insert(path, s.clone());
+            s
+        }
+        Err(_) => HashMap::new(),
+    }
 }
 
 fn publish(path: &Path, infos: HashMap<String, SeedInfo>) {
     snapshots().lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_path_buf(), infos);
 }
 
-/// `{"torrents": {"<hash>": {...}}}`; a missing or broken file is empty.
-pub fn load_ledger(path: &Path) -> Map<String, Value> {
-    let Ok(bytes) = std::fs::read(path) else { return Map::new() };
+/// `{"torrents": {"<hash>": {...}}}`. Only a missing file is empty; an unreadable or
+/// unparsable file is an error (the tick is skipped, the file is not overwritten).
+pub fn load_ledger(path: &Path) -> Result<Map<String, Value>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(e) => return Err(crate::state::io_error_name(&e).to_string()),
+    };
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(Value::Object(m)) => match m.get("torrents") {
-            Some(Value::Object(t)) => t.clone(),
-            _ => Map::new(),
+            Some(Value::Object(t)) => Ok(t.clone()),
+            None => Ok(Map::new()),
+            Some(_) => Err("TypeError".into()),
         },
-        _ => Map::new(),
+        Ok(_) => Err("TypeError".into()),
+        Err(_) => Err("JSONDecodeError".into()),
     }
 }
 
@@ -140,12 +157,13 @@ fn infos_of(torrents: &Map<String, Value>) -> HashMap<String, SeedInfo> {
 
 // -- decisions ----------------------------------------------------------------------------
 
-/// The ledger's new `seconds` for one tick (pure).
-pub fn accrue(seconds: f64, last_tick: f64, now: f64, seeding: bool, tracker_working: bool) -> f64 {
-    if !(seeding && tracker_working) {
-        return seconds;
+/// The ledger's new `seconds` for one tick (pure). `prev` is this process's monotonic time
+/// of the previous tick for the torrent (None on the first tick after a start: credit 0).
+pub fn accrue(seconds: f64, prev: Option<f64>, mono: f64, seeding: bool, tracker_working: bool) -> f64 {
+    match prev {
+        Some(p) if seeding && tracker_working => seconds + (mono - p).clamp(0.0, MAX_TICK_SECONDS),
+        _ => seconds,
     }
-    seconds + (now - last_tick).clamp(0.0, MAX_TICK_SECONDS)
 }
 
 pub fn hr_done(seconds: f64, ratio: f64) -> bool {
@@ -239,7 +257,9 @@ pub fn no_library_copy(save_path: &str, content_path: &str, root: &str, names: &
 #[derive(Default)]
 struct Ctx {
     movies: Option<Result<HashMap<i64, Value>, String>>,
-    series: Option<Result<HashSet<i64>, String>>,
+    series: Option<Result<HashMap<i64, Value>, String>>,
+    /// Keyed by "is Radarr".
+    queue: HashMap<bool, Result<HashSet<String>, String>>,
     views: HashMap<u32, Result<HashMap<String, i64>, String>>,
     episodes: HashMap<i64, Result<SeriesEpisodes, String>>,
 }
@@ -253,6 +273,8 @@ pub struct Keeper {
     filelist: Regex,
     last: HashMap<String, String>,
     quiet: Quiet,
+    /// Monotonic time of the previous tick per torrent (this process only).
+    mono: HashMap<String, f64>,
 }
 
 impl Keeper {
@@ -264,7 +286,7 @@ impl Keeper {
             .unwrap_or_else(|| crate::config::DEFAULT_FILELIST_REGEX.into());
         let filelist = Regex::new(&format!("(?i){pat}"))
             .unwrap_or_else(|_| Regex::new(&format!("(?i){}", crate::config::DEFAULT_FILELIST_REGEX)).expect("regex"));
-        Keeper { qbit: QbitJobs::new(app.services.qbittorrent.c.clone()), links: Box::new(Win32Links), filelist, last: HashMap::new(), quiet: Quiet::default() }
+        Keeper { qbit: QbitJobs::new(app.services.qbittorrent.c.clone()), links: Box::new(Win32Links), filelist, last: HashMap::new(), quiet: Quiet::default(), mono: HashMap::new() }
     }
 
     /// Log a keep/delete reason when its kind changes for this torrent.
@@ -284,7 +306,7 @@ pub fn spawn(app: Arc<AppState>, mut stop: Stop) {
         }
         let mut k = Keeper::new(&app);
         loop {
-            tick(&app, &mut k, unix_now()).await;
+            tick(&app, &mut k, unix_now(), unbiased_secs()).await;
             if stop.sleep(INTERVAL).await {
                 return;
             }
@@ -300,9 +322,20 @@ fn f(t: &Value, k: &str) -> f64 {
     t.get(k).and_then(Value::as_f64).unwrap_or(0.0)
 }
 
-/// One run. `now` is unix seconds.
-pub async fn tick(app: &AppState, k: &mut Keeper, now: f64) {
+/// One run. `now` is unix seconds (pruning, `last_tick`), `mono` the monotonic clock in
+/// seconds (accrual).
+pub async fn tick(app: &AppState, k: &mut Keeper, now: f64, mono: f64) {
     let path = ledger_path(app);
+    let mut ledger = match load_ledger(&path) {
+        Ok(l) => {
+            k.quiet.clear("ledger");
+            l
+        }
+        Err(t) => {
+            k.quiet.warn("ledger", format!("seed keeper: the ledger is unreadable ({t}), tick skipped"));
+            return;
+        }
+    };
     let torrents = match k.qbit.torrents().await {
         Ok(t) => {
             if k.quiet.clear("qbit") {
@@ -316,7 +349,6 @@ pub async fn tick(app: &AppState, k: &mut Keeper, now: f64) {
         }
     };
     let root = job_str(app, "seed_keeper", "downloads_root", "D:\\Media\\Downloads");
-    let mut ledger = load_ledger(&path);
     let mut ctx = Ctx::default();
     let mut present = HashSet::new();
     for t in &torrents {
@@ -347,8 +379,8 @@ pub async fn tick(app: &AppState, k: &mut Keeper, now: f64) {
         let seeding = SEEDING_STATES.contains(&s(t, "state"));
         let secs = accrue(
             entry.get("seconds").and_then(Value::as_f64).unwrap_or(0.0),
-            entry.get("last_tick").and_then(Value::as_f64).unwrap_or(now),
-            now,
+            k.mono.insert(hash.clone(), mono),
+            mono,
             seeding,
             fl_working && trackers.is_ok(),
         );
@@ -426,23 +458,38 @@ pub async fn tick(app: &AppState, k: &mut Keeper, now: f64) {
 }
 
 
-async fn movies(app: &AppState, ctx: &mut Ctx) -> Result<HashMap<i64, Value>, String> {
-    if ctx.movies.is_none() {
-        let r = Arr::radarr(app.services.radarr.c.clone()).items().await.map_err(|e| format!("Radarr movies: {e}"));
-        // An empty library is suspicious (fresh database, wrong instance): never "gone".
-        let r = r.and_then(|l| if l.is_empty() { Err("Radarr returned no movies".into()) } else { Ok(l) });
-        ctx.movies = Some(r.map(|l| l.into_iter().filter_map(|m| Some((id_of(m.get("id"))?, m))).collect()));
+/// Radarr movies or Sonarr series by id, fetched once per tick. An empty library is
+/// suspicious (fresh database, wrong instance): an error, never "gone".
+async fn items(app: &AppState, ctx: &mut Ctx, radarr: bool) -> Result<HashMap<i64, Value>, String> {
+    let slot = if radarr { &ctx.movies } else { &ctx.series };
+    if let Some(r) = slot {
+        return r.clone();
     }
-    ctx.movies.clone().unwrap_or_else(|| Err("unreachable".into()))
+    let arr = if radarr { Arr::radarr(app.services.radarr.c.clone()) } else { app.services.sonarr.arr() };
+    let r = arr.items().await.map_err(|e| format!("{} items: {e}", arr.label()));
+    let r = r.and_then(|l| if l.is_empty() { Err(format!("{} returned an empty library", arr.label())) } else { Ok(l) });
+    let r: Result<HashMap<i64, Value>, String> = r.map(|l| l.into_iter().filter_map(|m| Some((id_of(m.get("id"))?, m))).collect());
+    if radarr {
+        ctx.movies = Some(r.clone());
+    } else {
+        ctx.series = Some(r.clone());
+    }
+    r
 }
 
-async fn series_ids(app: &AppState, ctx: &mut Ctx) -> Result<HashSet<i64>, String> {
-    if ctx.series.is_none() {
-        let r = app.services.sonarr.arr().items().await.map_err(|e| format!("Sonarr series: {e}"));
-        let r = r.and_then(|l| if l.is_empty() { Err("Sonarr returned no series".into()) } else { Ok(l) });
-        ctx.series = Some(r.map(|l| l.iter().filter_map(|s| id_of(s.get("id"))).collect()));
+/// The upper-case download ids in the Radarr/Sonarr queue (all pages), once per tick.
+async fn queue_ids(app: &AppState, ctx: &mut Ctx, radarr: bool) -> Result<HashSet<String>, String> {
+    if let Some(r) = ctx.queue.get(&radarr) {
+        return r.clone();
     }
-    ctx.series.clone().unwrap_or_else(|| Err("unreachable".into()))
+    let arr = if radarr { Arr::radarr(app.services.radarr.c.clone()) } else { app.services.sonarr.arr() };
+    let r = arr
+        .queue_all()
+        .await
+        .map(|q| q.iter().filter_map(|x| x.get("downloadId").and_then(Value::as_str)).map(|d| d.trim().to_ascii_uppercase()).collect())
+        .map_err(|e| format!("{} queue: {e}", arr.label()));
+    ctx.queue.insert(radarr, r.clone());
+    r
 }
 
 async fn views(app: &AppState, ctx: &mut Ctx, section: u32) -> Result<HashMap<String, i64>, String> {
@@ -457,45 +504,89 @@ async fn views(app: &AppState, ctx: &mut Ctx, section: u32) -> Result<HashMap<St
     r
 }
 
+/// The external id that identifies an item across *arr ids: tmdb (movies), tvdb (series).
+fn ext_field(radarr: bool) -> (&'static str, &'static str) {
+    if radarr {
+        ("tmdbId", "tmdb_id")
+    } else {
+        ("tvdbId", "tvdb_id")
+    }
+}
+
 /// Resolve (and remember) the mapping, then decide watched / gone / unknown.
 async fn watch_state(app: &AppState, cat: &str, hash: &str, entry: &mut Map<String, Value>, ctx: &mut Ctx) -> Watch {
     let radarr = cat == "radarr";
     let arr = if radarr { Arr::radarr(app.services.radarr.c.clone()) } else { app.services.sonarr.arr() };
     let id_key = if radarr { "movie_id" } else { "series_id" };
+    let (ext_api, ext_key) = ext_field(radarr);
     if id_of(entry.get(id_key)).is_none() {
         let recs = match arr.history_for_download(hash).await {
             Ok(r) => r,
             Err(e) => return Watch::Unknown(format!("{} history: {e}", arr.label())),
         };
-        let field = if radarr { "movieId" } else { "seriesId" };
         if recs.is_empty() {
-            return Watch::Unmapped;
+            // Never imported: a torrent still in the queue (or added by hand and tracked as
+            // an unknown queue item) is not "unmapped".
+            return match queue_ids(app, ctx, radarr).await {
+                Ok(q) if q.contains(&hash.to_ascii_uppercase()) => Watch::Unknown(format!("in the {} queue", arr.label())),
+                Ok(_) => Watch::Unmapped,
+                Err(e) => Watch::Unknown(e),
+            };
         }
+        let field = if radarr { "movieId" } else { "seriesId" };
         let ids: HashSet<i64> = recs.iter().filter_map(|r| id_of(r.get(field))).collect();
         if ids.len() != 1 {
             return Watch::Unknown(format!("{} history has {} item(s) for it", arr.label(), ids.len()));
         }
         let id = *ids.iter().next().unwrap_or(&0);
+        let lib = match items(app, ctx, radarr).await {
+            Ok(m) => m,
+            Err(e) => return Watch::Unknown(e),
+        };
+        let Some(ext) = lib.get(&id).and_then(|m| id_of(m.get(ext_api))) else {
+            return Watch::Unknown(format!("{} item {id} from the history is not in the library", arr.label()));
+        };
+        let mut eps: Vec<i64> = recs.iter().filter_map(|r| id_of(r.get("episodeId"))).collect::<HashSet<_>>().into_iter().collect();
+        eps.sort_unstable();
+        if !radarr && eps.is_empty() {
+            return Watch::Unknown("Sonarr history has no episodes for it".into());
+        }
         entry.insert("arr".into(), json!(cat));
         entry.insert(id_key.into(), json!(id));
+        entry.insert(ext_key.into(), json!(ext));
         if !radarr {
-            let mut eps: Vec<i64> = recs.iter().filter_map(|r| id_of(r.get("episodeId"))).collect::<HashSet<_>>().into_iter().collect();
-            eps.sort_unstable();
-            if eps.is_empty() {
-                entry.remove(id_key);
-                return Watch::Unknown("Sonarr history has no episodes for it".into());
-            }
             entry.insert("episode_ids".into(), json!(eps));
         }
     }
     let id = id_of(entry.get(id_key)).unwrap_or(0);
+    let lib = match items(app, ctx, radarr).await {
+        Ok(m) => m,
+        Err(e) => return Watch::Unknown(e),
+    };
+    let stored_ext = id_of(entry.get(ext_key));
+    let item = match (lib.get(&id), stored_ext) {
+        (Some(it), Some(ext)) if id_of(it.get(ext_api)) == Some(ext) => it,
+        (Some(_), Some(_)) => return Watch::Unknown(format!("{} id {id} now belongs to another title", arr.label())),
+        (Some(it), None) => match id_of(it.get(ext_api)) {
+            // A mapping stored before the external id was recorded: record it now.
+            Some(ext) => {
+                entry.insert(ext_key.into(), json!(ext));
+                it
+            }
+            None => return Watch::Unknown(format!("{} item {id} has no {ext_api}", arr.label())),
+        },
+        (None, Some(ext)) => {
+            // Gone only if the title is not back under a new id.
+            return if lib.values().any(|m| id_of(m.get(ext_api)) == Some(ext)) {
+                Watch::Unknown(format!("re-added to {} under a new id", arr.label()))
+            } else {
+                Watch::Gone
+            };
+        }
+        (None, None) => return Watch::Unknown(format!("{} item {id} is gone but its {ext_api} was never recorded", arr.label())),
+    };
     if radarr {
-        let m = match movies(app, ctx).await {
-            Ok(m) => m,
-            Err(e) => return Watch::Unknown(e),
-        };
-        let Some(movie) = m.get(&id) else { return Watch::Gone };
-        let Some(file) = movie.get("movieFile").and_then(|f| f.get("path")).and_then(Value::as_str) else {
+        let Some(file) = item.get("movieFile").and_then(|f| f.get("path")).and_then(Value::as_str) else {
             return Watch::Unknown("the movie has no file".into());
         };
         let v = match views(app, ctx, PLEX_MOVIES).await {
@@ -507,13 +598,6 @@ async fn watch_state(app: &AppState, cat: &str, hash: &str, entry: &mut Map<Stri
             Some(_) => Watch::NotWatched,
             None => Watch::Unknown("not in Plex".into()),
         };
-    }
-    let ids = match series_ids(app, ctx).await {
-        Ok(s) => s,
-        Err(e) => return Watch::Unknown(e),
-    };
-    if !ids.contains(&id) {
-        return Watch::Gone;
     }
     let cached = ctx.episodes.get(&id).cloned();
     let r = match cached {
@@ -574,6 +658,7 @@ mod tests {
         tracker_status: Mutex<i64>,
         radarr_history: Mutex<Resp>,
         movies: Mutex<Resp>,
+        queue: Mutex<Resp>,
         plex_movie_views: Mutex<i64>,
         sonarr_series: Value,
         sonarr_eps_watched: Vec<i64>,
@@ -585,14 +670,29 @@ mod tests {
                "content_path": "D:\\Media\\Downloads\\radarr\\Dune.2021.2160p", "save_path": "D:\\Media\\Downloads\\radarr"})
     }
 
+    fn hist(recs: Value) -> Resp {
+        let n = recs.as_array().map(Vec::len).unwrap_or(0);
+        ok(json!({"page": 1, "pageSize": 200, "totalRecords": n, "records": recs}))
+    }
+
+    fn dune_history() -> Resp {
+        hist(json!([{"movieId": 10, "downloadId": H.to_uppercase()}]))
+    }
+
+    fn movies() -> Value {
+        json!([{"id": 10, "title": "Dune", "tmdbId": 438631, "movieFile": {"path": "D:\\Media\\Movies\\Dune (2021)\\Dune.mkv"}},
+               {"id": 11, "tmdbId": 1}])
+    }
+
     fn world() -> World {
         World {
             torrent: Mutex::new(torrent("radarr", "stalledUP", 1000, 0.1)),
             tracker_status: Mutex::new(2),
-            radarr_history: Mutex::new(ok(json!({"records": [{"movieId": 10, "downloadId": H.to_uppercase()}]}))),
-            movies: Mutex::new(ok(json!([{"id": 10, "title": "Dune", "movieFile": {"path": "D:\\Media\\Movies\\Dune (2021)\\Dune.mkv"}}, {"id": 11}]))),
+            radarr_history: Mutex::new(dune_history()),
+            movies: Mutex::new(ok(movies())),
+            queue: Mutex::new(hist(json!([{"downloadId": "OTHER"}]))),
             plex_movie_views: Mutex::new(0),
-            sonarr_series: json!([{"id": 4, "title": "Show"}]),
+            sonarr_series: json!([{"id": 4, "title": "Show", "tvdbId": 77}]),
             sonarr_eps_watched: vec![],
         }
     }
@@ -616,9 +716,13 @@ mod tests {
             }
             if p.starts_with("/api/v3/history") {
                 if sonarr {
-                    return ok(json!({"records": [{"seriesId": 4, "episodeId": 41}, {"seriesId": 4, "episodeId": 42}]}));
+                    let dl = H.to_uppercase();
+                    return hist(json!([{"seriesId": 4, "episodeId": 41, "downloadId": dl}, {"seriesId": 4, "episodeId": 42, "downloadId": dl}]));
                 }
                 return w.radarr_history.lock().unwrap().clone();
+            }
+            if p.starts_with("/api/v3/queue") {
+                return w.queue.lock().unwrap().clone();
             }
             if p == "/api/v3/movie" {
                 return w.movies.lock().unwrap().clone();
@@ -653,14 +757,24 @@ mod tests {
         (f, a, w, k)
     }
 
+    /// One tick with the same wall and monotonic time.
+    async fn at(a: &AppState, k: &mut Keeper, t: f64) {
+        tick(a, k, t, t).await;
+    }
+
     fn entry(a: &AppState) -> Value {
-        load_ledger(&ledger_path(a)).get(H).cloned().unwrap_or(Value::Null)
+        load_ledger(&ledger_path(a)).unwrap().get(H).cloned().unwrap_or(Value::Null)
     }
 
     fn set_entry(a: &AppState, e: Value) {
         let mut m = Map::new();
         m.insert(H.into(), e);
         save_ledger(&ledger_path(a), &m);
+    }
+
+    /// An entry already mapped to Dune (movie 10, tmdb 438631) with `secs` seeded.
+    fn dune_entry(secs: f64) -> Value {
+        json!({"seconds": secs, "last_tick": 0.0, "arr": "radarr", "movie_id": 10, "tmdb_id": 438631})
     }
 
     fn deletes(f: &Fake) -> Vec<Req> {
@@ -670,32 +784,52 @@ mod tests {
     #[tokio::test]
     async fn new_entry_starts_at_qbittorrent_seeding_time_then_accrues_capped() {
         let (_f, a, _w, mut k) = setup(world(), false).await;
-        tick(&a, &mut k, 10_000.0).await;
+        at(&a, &mut k, 10_000.0).await;
         assert_eq!(entry(&a)["seconds"], json!(1000.0));
-        // 1 hour later: only 10 minutes are added.
-        tick(&a, &mut k, 13_600.0).await;
-        assert_eq!(entry(&a)["seconds"], json!(1600.0));
+        // 1 hour later (monotonic): only interval + 30 s are added.
+        at(&a, &mut k, 13_600.0).await;
+        assert_eq!(entry(&a)["seconds"], json!(1330.0));
         // 5 minutes later: 5 minutes.
-        tick(&a, &mut k, 13_900.0).await;
-        assert_eq!(entry(&a)["seconds"], json!(1900.0));
+        at(&a, &mut k, 13_900.0).await;
+        assert_eq!(entry(&a)["seconds"], json!(1630.0));
         assert_eq!(entry(&a)["movie_id"], json!(10));
+        assert_eq!(entry(&a)["tmdb_id"], json!(438631));
         let snap = snapshot(&a);
-        assert_eq!(snap[H], SeedInfo { seconds: 1900.0, watched: Some(false), waiting_watch: false });
+        assert_eq!(snap[H], SeedInfo { seconds: 1630.0, watched: Some(false), waiting_watch: false });
+    }
+
+    #[tokio::test]
+    async fn wall_clock_jumps_do_not_count_only_the_monotonic_clock() {
+        let (_f, a, _w, mut k) = setup(world(), false).await;
+        tick(&a, &mut k, 1000.0, 50.0).await;
+        // The PC slept 8 hours: wall time jumped, the unbiased clock moved 300 s.
+        tick(&a, &mut k, 1000.0 + 8.0 * 3600.0, 350.0).await;
+        assert_eq!(entry(&a)["seconds"], json!(1300.0));
+    }
+
+    #[tokio::test]
+    async fn first_tick_after_a_restart_credits_nothing() {
+        let (_f, a, _w, mut k) = setup(world(), false).await;
+        set_entry(&a, dune_entry(5000.0));
+        at(&a, &mut k, 9_999_999.0).await;
+        assert_eq!(entry(&a)["seconds"], json!(5000.0));
+        at(&a, &mut k, 9_999_999.0 + 120.0).await;
+        assert_eq!(entry(&a)["seconds"], json!(5120.0));
     }
 
     #[tokio::test]
     async fn no_accrual_without_a_working_tracker_or_while_stopped() {
         let (_f, a, w, mut k) = setup(world(), false).await;
-        tick(&a, &mut k, 0.0).await;
+        at(&a, &mut k, 0.0).await;
         *w.tracker_status.lock().unwrap() = 4;
-        tick(&a, &mut k, 300.0).await;
+        at(&a, &mut k, 300.0).await;
         assert_eq!(entry(&a)["seconds"], json!(1000.0));
         *w.tracker_status.lock().unwrap() = 2;
         *w.torrent.lock().unwrap() = torrent("radarr", "stoppedUP", 1000, 0.1);
-        tick(&a, &mut k, 600.0).await;
+        at(&a, &mut k, 600.0).await;
         assert_eq!(entry(&a)["seconds"], json!(1000.0));
         *w.torrent.lock().unwrap() = torrent("radarr", "uploading", 1000, 0.1);
-        tick(&a, &mut k, 900.0).await;
+        at(&a, &mut k, 900.0).await;
         assert_eq!(entry(&a)["seconds"], json!(1300.0));
     }
 
@@ -705,16 +839,30 @@ mod tests {
         let (a, _d) = app(&f.base, false, json!({}));
         let mut k = Keeper::new(&a);
         set_entry(&a, json!({"seconds": 5.0, "last_tick": 0.0}));
-        tick(&a, &mut k, 300.0).await;
+        at(&a, &mut k, 300.0).await;
         assert_eq!(entry(&a)["seconds"], json!(5.0));
+    }
+
+    #[tokio::test]
+    async fn unreadable_ledger_skips_the_tick_and_is_not_overwritten() {
+        let (f, a, w, mut k) = setup(world(), false).await;
+        *w.plex_movie_views.lock().unwrap() = 1;
+        *w.torrent.lock().unwrap() = torrent("radarr", "stalledUP", 999_999, 5.0);
+        std::fs::write(ledger_path(&a), "{\"torrents\": {broken").unwrap();
+        at(&a, &mut k, 0.0).await;
+        assert!(f.requests().is_empty(), "nothing asked, nothing deleted");
+        assert_eq!(std::fs::read_to_string(ledger_path(&a)).unwrap(), "{\"torrents\": {broken");
+        assert!(load_ledger(&ledger_path(&a)).is_err());
+        std::fs::remove_file(ledger_path(&a)).unwrap();
+        assert_eq!(load_ledger(&ledger_path(&a)), Ok(Map::new()));
     }
 
     #[tokio::test]
     async fn hr_and_watched_deletes_with_files() {
         let (f, a, w, mut k) = setup(world(), false).await;
         *w.plex_movie_views.lock().unwrap() = 1;
-        set_entry(&a, json!({"seconds": HR_SECONDS - 100.0, "last_tick": 0.0}));
-        tick(&a, &mut k, 300.0).await;
+        set_entry(&a, json!({"seconds": HR_SECONDS, "last_tick": 0.0}));
+        at(&a, &mut k, 300.0).await;
         let d = deletes(&f);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].body, format!("hashes={H}&deleteFiles=true"));
@@ -728,7 +876,7 @@ mod tests {
         let (f, a, w, mut k) = setup(world(), false).await;
         *w.plex_movie_views.lock().unwrap() = 3;
         *w.torrent.lock().unwrap() = torrent("radarr", "stalledUP", 10, 1.0);
-        tick(&a, &mut k, 0.0).await;
+        at(&a, &mut k, 0.0).await;
         assert_eq!(deletes(&f).len(), 1);
     }
 
@@ -736,7 +884,7 @@ mod tests {
     async fn hr_but_unwatched_keeps_and_waits() {
         let (f, a, _w, mut k) = setup(world(), false).await;
         set_entry(&a, json!({"seconds": HR_SECONDS + 1.0, "last_tick": 0.0}));
-        tick(&a, &mut k, 300.0).await;
+        at(&a, &mut k, 300.0).await;
         assert!(deletes(&f).is_empty());
         let s = snapshot(&a);
         assert_eq!(s[H].watched, Some(false));
@@ -747,7 +895,7 @@ mod tests {
     async fn watched_but_hr_pending_keeps() {
         let (f, a, w, mut k) = setup(world(), false).await;
         *w.plex_movie_views.lock().unwrap() = 1;
-        tick(&a, &mut k, 0.0).await;
+        at(&a, &mut k, 0.0).await;
         assert!(deletes(&f).is_empty());
         assert_eq!(snapshot(&a)[H], SeedInfo { seconds: 1000.0, watched: Some(true), waiting_watch: false });
     }
@@ -755,33 +903,76 @@ mod tests {
     #[tokio::test]
     async fn removed_from_radarr_deletes_using_the_remembered_mapping() {
         let (f, a, w, mut k) = setup(world(), false).await;
-        tick(&a, &mut k, 0.0).await; // mapping remembered: movie 10
+        at(&a, &mut k, 0.0).await; // mapping remembered: movie 10, tmdb 438631
         // Radarr deleted the movie and its history.
-        *w.radarr_history.lock().unwrap() = ok(json!({"records": []}));
-        *w.movies.lock().unwrap() = ok(json!([{"id": 11}]));
+        *w.radarr_history.lock().unwrap() = hist(json!([]));
+        *w.movies.lock().unwrap() = ok(json!([{"id": 11, "tmdbId": 1}]));
         let mut e = entry(&a);
         e["seconds"] = json!(HR_SECONDS);
         set_entry(&a, e);
-        tick(&a, &mut k, 300.0).await;
+        at(&a, &mut k, 300.0).await;
         assert_eq!(deletes(&f).len(), 1);
     }
 
     #[tokio::test]
+    async fn reused_id_or_readded_title_is_not_trusted() {
+        // Movie id 10 now belongs to another title (different tmdb): neither watched nor gone.
+        let (f, a, w, mut k) = setup(world(), false).await;
+        *w.plex_movie_views.lock().unwrap() = 1;
+        *w.movies.lock().unwrap() = ok(json!([{"id": 10, "tmdbId": 999, "movieFile": {"path": "D:\\Media\\Movies\\Dune (2021)\\Dune.mkv"}}]));
+        set_entry(&a, dune_entry(HR_SECONDS + 1.0));
+        at(&a, &mut k, 0.0).await;
+        assert!(deletes(&f).is_empty());
+        assert_eq!(snapshot(&a)[H].watched, None);
+        // Dune deleted and re-added under id 12: not "gone".
+        let (f, a, w, mut k) = setup(world(), false).await;
+        *w.movies.lock().unwrap() = ok(json!([{"id": 12, "tmdbId": 438631}]));
+        set_entry(&a, dune_entry(HR_SECONDS + 1.0));
+        at(&a, &mut k, 0.0).await;
+        assert!(deletes(&f).is_empty());
+    }
+
+    #[tokio::test]
     async fn api_errors_and_unknown_mappings_keep() {
-        for case in 0..4 {
+        for case in 0..5 {
             let (f, a, w, mut k) = setup(world(), false).await;
             *w.plex_movie_views.lock().unwrap() = 1;
             match case {
                 0 => *w.radarr_history.lock().unwrap() = status(500),
-                1 => *w.radarr_history.lock().unwrap() = ok(json!({"records": []})),
+                1 => *w.radarr_history.lock().unwrap() = ok(json!({"records": []})), // no totalRecords
                 2 => *w.movies.lock().unwrap() = status(503),
-                _ => *w.movies.lock().unwrap() = ok(json!([])), // empty library is never "gone"
+                3 => *w.movies.lock().unwrap() = ok(json!([])), // empty library is never "gone"
+                _ => *w.movies.lock().unwrap() = ok(json!([{"id": 11, "tmdbId": 1}])), // history item not in Radarr
             }
             set_entry(&a, json!({"seconds": HR_SECONDS + 1.0, "last_tick": 0.0}));
-            tick(&a, &mut k, 300.0).await;
+            at(&a, &mut k, 300.0).await;
             assert!(deletes(&f).is_empty(), "case {case}");
             assert_eq!(snapshot(&a)[H].watched, None, "case {case}");
         }
+    }
+
+    #[tokio::test]
+    async fn history_is_filtered_by_download_id_and_paged() {
+        // The server ignores the filter and pages: only our record counts.
+        let pages = Arc::new(Mutex::new(0));
+        let p2 = pages.clone();
+        let f = fake(move |r: &Req| {
+            if r.path.starts_with("/api/v3/history") {
+                *p2.lock().unwrap() += 1;
+                let rec = if r.path.contains("page=1&") {
+                    json!([{"movieId": 99, "downloadId": "SOMETHINGELSE"}])
+                } else {
+                    json!([{"movieId": 10, "downloadId": H.to_lowercase()}])
+                };
+                return ok(json!({"totalRecords": 2, "records": rec}));
+            }
+            status(404)
+        })
+        .await;
+        let (a, _d) = app(&f.base, false, json!({}));
+        let r = Arr::radarr(a.services.radarr.c.clone()).history_for_download(H).await.unwrap();
+        assert_eq!(r, vec![json!({"movieId": 10, "downloadId": H.to_lowercase()})]);
+        assert_eq!(*pages.lock().unwrap(), 2);
     }
 
     #[tokio::test]
@@ -808,7 +999,7 @@ mod tests {
             *w.plex_movie_views.get_mut().unwrap() = 1;
             *w.torrent.get_mut().unwrap() = t;
             let (f, a, _w, mut k) = setup(w, false).await;
-            tick(&a, &mut k, 0.0).await;
+            at(&a, &mut k, 0.0).await;
             assert!(deletes(&f).is_empty());
         }
     }
@@ -823,11 +1014,12 @@ mod tests {
             t["save_path"] = json!("D:\\Media\\Downloads\\sonarr");
             *w.torrent.get_mut().unwrap() = t;
             let (f, a, _w, mut k) = setup(w, false).await;
-            tick(&a, &mut k, 0.0).await;
+            at(&a, &mut k, 0.0).await;
             assert_eq!(deletes(&f).len(), expect);
             if expect == 0 {
                 assert_eq!(entry(&a)["episode_ids"], json!([41, 42]));
                 assert_eq!(entry(&a)["series_id"], json!(4));
+                assert_eq!(entry(&a)["tvdb_id"], json!(77));
             }
         }
     }
@@ -835,13 +1027,14 @@ mod tests {
     #[tokio::test]
     async fn ledger_survives_a_restart() {
         let (_f, a, _w, mut k) = setup(world(), false).await;
-        tick(&a, &mut k, 0.0).await;
-        tick(&a, &mut k, 300.0).await;
+        at(&a, &mut k, 0.0).await;
+        at(&a, &mut k, 300.0).await;
         // A new process: new keeper, snapshot cache cleared, qBittorrent lost seeding_time.
         snapshots().lock().unwrap().remove(&ledger_path(&a));
         assert_eq!(snapshot(&a)[H].seconds, 1300.0);
         let mut k2 = Keeper::new(&a);
-        tick(&a, &mut k2, 600.0).await;
+        at(&a, &mut k2, 600.0).await; // first tick of the new process: +0
+        at(&a, &mut k2, 900.0).await;
         assert_eq!(entry(&a)["seconds"], json!(1600.0));
         let text = std::fs::read_to_string(ledger_path(&a)).unwrap();
         assert!(text.starts_with("{\n  \"torrents\": {"), "{text}");
@@ -853,7 +1046,7 @@ mod tests {
         let (f, a, w, mut k) = setup(world(), true).await;
         *w.plex_movie_views.lock().unwrap() = 1;
         set_entry(&a, json!({"seconds": HR_SECONDS + 1.0, "last_tick": 0.0}));
-        tick(&a, &mut k, 300.0).await;
+        at(&a, &mut k, 300.0).await;
         assert!(f.mutations().is_empty(), "{:?}", f.mutations());
         assert!(entry(&a).is_object());
     }
@@ -936,27 +1129,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    async fn unmapped_tick(dry: bool, l: Box<FakeLinks>, history: Resp) -> (Fake, Arc<AppState>) {
+    async fn unmapped_tick(dry: bool, l: Box<FakeLinks>, history: Resp, queue: Resp) -> (Fake, Arc<AppState>) {
         let w = world();
         *w.radarr_history.lock().unwrap() = history;
+        *w.queue.lock().unwrap() = queue;
         let (f, a, _w, mut k) = setup(w, dry).await;
         k.links = l;
         set_entry(&a, json!({"seconds": HR_SECONDS + 1.0, "last_tick": 0.0}));
-        tick(&a, &mut k, 300.0).await;
+        at(&a, &mut k, 300.0).await;
         (f, a)
+    }
+
+    fn empty_queue() -> Resp {
+        hist(json!([{"downloadId": "OTHER"}]))
     }
 
     #[tokio::test]
     async fn unmapped_with_no_library_copy_is_deleted() {
-        let (f, a) = unmapped_tick(false, links(Some(1), Some(1)), ok(json!({"records": []}))).await;
+        let (f, a) = unmapped_tick(false, links(Some(1), Some(1)), hist(json!([])), empty_queue()).await;
         assert_eq!(deletes(&f).len(), 1);
         assert_eq!(entry(&a), Value::Null);
+        assert!(!f.find("GET", "/api/v3/queue").is_empty());
+    }
+
+    #[tokio::test]
+    async fn unmapped_but_in_the_queue_or_queue_error_is_kept() {
+        for q in [
+            hist(json!([{"downloadId": "x"}, {"downloadId": H.to_uppercase()}])),
+            status(500),
+            ok(json!({"records": []})), // no totalRecords
+        ] {
+            let (f, _a) = unmapped_tick(false, links(Some(1), Some(1)), hist(json!([])), q).await;
+            assert!(deletes(&f).is_empty());
+            assert!(f.find("GET", "/api/v2/torrents/files").is_empty());
+        }
     }
 
     #[tokio::test]
     async fn unmapped_with_a_library_link_or_missing_file_is_kept() {
         for l in [links(Some(2), Some(1)), links(Some(1), None), links(None, None)] {
-            let (f, _a) = unmapped_tick(false, l, ok(json!({"records": []}))).await;
+            let (f, _a) = unmapped_tick(false, l, hist(json!([])), empty_queue()).await;
             assert!(deletes(&f).is_empty());
         }
     }
@@ -964,10 +1176,10 @@ mod tests {
     #[tokio::test]
     async fn unmapped_but_hr_pending_is_kept() {
         let w = world();
-        *w.radarr_history.lock().unwrap() = ok(json!({"records": []}));
+        *w.radarr_history.lock().unwrap() = hist(json!([]));
         let (f, a, _w, mut k) = setup(w, false).await;
         k.links = links(Some(1), Some(1));
-        tick(&a, &mut k, 0.0).await;
+        at(&a, &mut k, 0.0).await;
         assert!(deletes(&f).is_empty());
         assert!(f.find("GET", "/api/v2/torrents/files").is_empty());
     }
@@ -975,31 +1187,34 @@ mod tests {
     #[tokio::test]
     async fn fallback_never_applies_to_known_or_errored_mappings() {
         // Known mapping, unwatched: kept even with link count 1.
-        let (f, _a) = unmapped_tick(false, links(Some(1), Some(1)), ok(json!({"records": [{"movieId": 10}]}))).await;
+        let (f, _a) = unmapped_tick(false, links(Some(1), Some(1)), dune_history(), empty_queue()).await;
         assert!(deletes(&f).is_empty());
         assert!(f.find("GET", "/api/v2/torrents/files").is_empty());
         // History error: kept.
-        let (f, _a) = unmapped_tick(false, links(Some(1), Some(1)), status(500)).await;
+        let (f, _a) = unmapped_tick(false, links(Some(1), Some(1)), status(500), empty_queue()).await;
         assert!(deletes(&f).is_empty());
         // History with records but no movie id: kept.
-        let (f, _a) = unmapped_tick(false, links(Some(1), Some(1)), ok(json!({"records": [{"eventType": "grabbed"}]}))).await;
+        let recs = hist(json!([{"eventType": "grabbed", "downloadId": H.to_uppercase()}]));
+        let (f, _a) = unmapped_tick(false, links(Some(1), Some(1)), recs, empty_queue()).await;
         assert!(deletes(&f).is_empty());
     }
 
     #[tokio::test]
     async fn unmapped_dry_run_only_logs() {
         crate::log::start_capture();
-        let (f, _a) = unmapped_tick(true, links(Some(1), Some(1)), ok(json!({"records": []}))).await;
+        let (f, _a) = unmapped_tick(true, links(Some(1), Some(1)), hist(json!([])), empty_queue()).await;
         assert!(f.mutations().is_empty());
         assert!(crate::log::captured().iter().any(|l| l.contains("dry-run: would delete torrent 'Dune.2021.2160p'") && l.contains("no library copy (link count 1)")));
     }
 
     #[test]
     fn pure_rules() {
-        assert_eq!(accrue(10.0, 0.0, 5000.0, true, true), 610.0);
-        assert_eq!(accrue(10.0, 100.0, 50.0, true, true), 10.0);
-        assert_eq!(accrue(10.0, 0.0, 300.0, false, true), 10.0);
-        assert_eq!(accrue(10.0, 0.0, 300.0, true, false), 10.0);
+        assert_eq!(accrue(10.0, Some(0.0), 5000.0, true, true), 10.0 + MAX_TICK_SECONDS);
+        assert_eq!(accrue(10.0, Some(100.0), 50.0, true, true), 10.0);
+        assert_eq!(accrue(10.0, Some(0.0), 300.0, false, true), 10.0);
+        assert_eq!(accrue(10.0, Some(0.0), 300.0, true, false), 10.0);
+        assert_eq!(accrue(10.0, None, 300.0, true, true), 10.0);
+        assert_eq!(MAX_TICK_SECONDS, INTERVAL.as_secs_f64() + 30.0);
         assert!(hr_done(HR_SECONDS, 0.0) && hr_done(0.0, 1.0) && !hr_done(48.0 * 3600.0, 0.99));
         assert!(under_root("d:/media/downloads/radarr/x", "D:\\Media\\Downloads"));
         assert!(!under_root("D:\\Media\\Downloads", "D:\\Media\\Downloads"));
