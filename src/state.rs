@@ -35,11 +35,28 @@ impl StateFile {
     }
 
     fn load_locked(&self) -> Map<String, Value> {
-        let Ok(bytes) = fs::read(&self.path) else { return Map::new() };
         // Python opens it as plain utf-8: a BOM makes json.load fail -> {}.
+        self.try_load_locked().unwrap_or_default()
+    }
+
+    /// Like [`StateFile::load`], but only a missing file is empty: an unreadable or
+    /// unparsable file (or a non-object) is an error naming its type. The background jobs
+    /// use this so a broken file never makes them forget what they already did.
+    pub fn try_load(&self) -> Result<Map<String, Value>, &'static str> {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.try_load_locked()
+    }
+
+    fn try_load_locked(&self) -> Result<Map<String, Value>, &'static str> {
+        let bytes = match fs::read(&self.path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+            Err(e) => return Err(io_error_name(&e)),
+        };
         match serde_json::from_slice::<Value>(&bytes) {
-            Ok(Value::Object(m)) => m,
-            _ => Map::new(),
+            Ok(Value::Object(m)) => Ok(m),
+            Ok(_) => Err("TypeError"),
+            Err(_) => Err("JSONDecodeError"),
         }
     }
 
@@ -48,10 +65,18 @@ impl StateFile {
         self.save_locked(data);
     }
 
-    /// Merge the given top-level keys into the file (load + save under one lock).
+    /// Merge the given top-level keys into the file (load + save under one lock). An
+    /// existing file that cannot be read or parsed is left alone (WARNING), so one bad read
+    /// never wipes the other keys.
     pub fn update(&self, changes: Map<String, Value>) {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut data = self.load_locked();
+        let mut data = match self.try_load_locked() {
+            Ok(d) => d,
+            Err(t) => {
+                log_warning!("cannot update the state file, it is unreadable: {t}");
+                return;
+            }
+        };
         for (k, v) in changes {
             data.insert(k, v);
         }
@@ -114,6 +139,14 @@ mod tests {
         assert!(s.load().is_empty());
         fs::write(s.path(), "{broken").unwrap();
         assert!(s.load().is_empty());
+        assert_eq!(s.try_load(), Err("JSONDecodeError"));
+        // update() never overwrites a file it cannot parse.
+        let mut m = Map::new();
+        m.insert("k".into(), json!(1));
+        s.update(m);
+        assert_eq!(fs::read_to_string(s.path()).unwrap(), "{broken");
+        fs::remove_file(s.path()).unwrap();
+        assert_eq!(s.try_load(), Ok(Map::new()));
         let _ = fs::remove_dir_all(&d);
     }
 }
