@@ -21,13 +21,17 @@ use std::time::Duration;
 /// The shared deadline of the upstream calls.
 pub const STATUS_DEADLINE: Duration = Duration::from_secs(6);
 
-/// What the seed keeper knows per torrent hash (lower case): ledger seconds and watched.
-///
-/// Seam to Phase 2b (`jobs::seed_keeper`); empty until its ledger exists, and a torrent the
+/// What the seed keeper knows per torrent hash (lower case): ledger seconds, watched and
+/// its own "H&R done, not watched yet" (`jobs::seed_keeper::snapshot`). A torrent the
 /// ledger does not know falls back to qBittorrent's `seeding_time` and `watched: null`.
 pub fn seed_snapshot(app: &AppState) -> HashMap<String, SeedInfo> {
-    let _ = app;
-    HashMap::new()
+    crate::jobs::seed_keeper::snapshot(app)
+        .into_iter()
+        .map(|(hash, s)| {
+            let info = SeedInfo { seconds: Some(s.seconds), watched: s.watched, waiting_watch: Some(s.waiting_watch) };
+            (hash.to_lowercase(), info)
+        })
+        .collect()
 }
 
 async fn until<T>(deadline: tokio::time::Instant, name: &str, f: impl Future<Output = UpResult<T>>) -> Option<T> {
@@ -426,6 +430,28 @@ mod tests {
         let took = t0.elapsed();
         assert!(took < Duration::from_millis(4000), "{took:?}");
         assert_eq!((st["services"]["prowlarr"].clone(), st["services"]["radarr"].clone()), (json!(false), json!(true)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_uses_the_seed_ledger() {
+        let w = world().await;
+        let app = world_app(&w);
+        let ledger = json!({"version": 1, "torrents": {
+            H1: {"seconds": 50.0 * 3600.0, "watched": false, "waiting_watch": true},
+            H2: {"seconds": 70.0 * 3600.0, "watched": true, "waiting_watch": false},
+        }});
+        std::fs::write(crate::jobs::seed_keeper::ledger_path(&app), crate::json::dumps(&ledger)).unwrap();
+        let st = status(&app).await;
+        let t = st["torrents"].as_array().unwrap();
+        let by: HashMap<&str, &Value> = t.iter().map(|x| (x["title"].as_str().unwrap(), x)).collect();
+        let g = by["The Godfather"];
+        assert_eq!((g["hr"].clone(), g["seed_hours"].clone(), g["watched"].clone(), g["waiting_watch"].clone()),
+                   (json!("safe"), json!(50.0), json!(false), json!(true)));
+        let p = by["Past Lives (2023)"];
+        assert_eq!((p["watched"].clone(), p["waiting_watch"].clone()), (json!(true), json!(false)));
+        let a = by["Anatomy of a Fall"]; // not in the ledger: qBittorrent's numbers
+        assert_eq!((a["watched"].clone(), a["waiting_watch"].clone(), a["seed_hours"].clone()), (Value::Null, json!(false), json!(0.0)));
+        assert_eq!(st["hr_warnings"], json!([])); // the ledger's 50 h satisfy the rule
     }
 
     #[test]
