@@ -1,4 +1,6 @@
 //! Plex Couch: a LAN-only phone remote for a Plex PC (Rust rewrite of app.py).
+
+pub mod auth;
 pub mod config;
 pub mod json;
 pub mod log;
