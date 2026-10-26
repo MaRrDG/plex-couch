@@ -9,9 +9,12 @@
 //! dry-run; only log what would happen), use the service URLs from the config (tests run
 //! the exe with every service on a closed port), and stop when [`Stop`] fires.
 
+pub mod common;
 pub mod seed_keeper;
 pub mod strip_dv;
 pub mod watchlist;
+#[cfg(test)]
+pub mod testutil;
 
 use crate::app::AppState;
 use std::sync::Arc;
