@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! plex-couch [--host 0.0.0.0] [--port 8765] [--https-port N] [--cert F] [--key F] [--ca-cert F]
-//!            [--config <exe dir>\config.local.json] [--dry-run] [--allow-http] [--demo]
+//!            [--config <exe dir>\config.local.json] [--dry-run] [--allow-http] [--demo] [--no-tray]
 //! plex-couch --set-pin 1234 [--config F]
 //! plex-couch --setup-ntfy [--new-topic] [--config F]
 //! plex-couch make-certs --ip 192.168.1.50 [--dns localhost] [--out certs] [--force-ca]
@@ -11,12 +11,16 @@
 //!
 //! Like argparse: `--opt value` and `--opt=value`, unique prefixes (`--allow` =
 //! `--allow-http`), usage errors exit 2.
+//!
+//! The server shows a tray icon (Windows, see [`crate::system::tray`]) unless `--no-tray`;
+//! its "Ieșire" stops the app like Ctrl+C.
 
 use crate::app::{AppOptions, AppState};
 use crate::auth::pin;
 use crate::config::{absolute, Config};
 use crate::http::server::{self, ListenerCfg, Role};
 use crate::services::ntfy;
+use crate::system::tray::{self, OpenTarget};
 use crate::{jobs, log_error, log_info, log_warning};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -41,11 +45,12 @@ pub struct Args {
     pub setup_ntfy: bool,
     pub new_topic: bool,
     pub demo: bool,
+    pub no_tray: bool,
 }
 
 const USAGE: &str = "usage: plex-couch [-h] [--host HOST] [--port PORT] [--https-port HTTPS_PORT] [--cert CERT] \
 [--key KEY] [--ca-cert CA_CERT] [--config CONFIG] [--dry-run] [--allow-http] [--set-pin DIGITS] [--setup-ntfy] \
-[--new-topic] [--demo]\n       plex-couch make-certs [-h] [--ip IP] [--dns DNS] [--out OUT] [--force-ca]";
+[--new-topic] [--demo] [--no-tray]\n       plex-couch make-certs [-h] [--ip IP] [--dns DNS] [--out OUT] [--force-ca]";
 
 const HELP: &str = "
 Plex Couch
@@ -67,6 +72,7 @@ options:
   --setup-ntfy          create an ntfy topic for phone notifications (keeps an existing one), print it, exit
   --new-topic           with --setup-ntfy: replace the existing topic
   --demo                serve the UI with fake data and no login (screenshots only; 127.0.0.1 only)
+  --no-tray             no system-tray icon (default: an icon that opens the app; right click to exit)
 
 make-certs: create the local CA and the server certificate (see `plex-couch make-certs -h`).";
 
@@ -79,7 +85,7 @@ pub enum ParseOutcome {
 }
 
 const VALUE_OPTS: [&str; 8] = ["--host", "--port", "--https-port", "--cert", "--key", "--ca-cert", "--config", "--set-pin"];
-const FLAG_OPTS: [&str; 6] = ["--dry-run", "--allow-http", "--setup-ntfy", "--new-topic", "--demo", "--help"];
+const FLAG_OPTS: [&str; 7] = ["--dry-run", "--allow-http", "--setup-ntfy", "--new-topic", "--demo", "--no-tray", "--help"];
 
 fn port_value(opt: &str, v: &str) -> Result<u16, String> {
     let n: i64 = v.trim().parse().map_err(|_| format!("argument {opt}: invalid int value: '{v}'"))?;
@@ -127,6 +133,7 @@ pub fn parse(args: &[String]) -> ParseOutcome {
                 "--setup-ntfy" => a.setup_ntfy = true,
                 "--new-topic" => a.new_topic = true,
                 "--demo" => a.demo = true,
+                "--no-tray" => a.no_tray = true,
                 _ => {}
             }
             i += 1;
@@ -318,8 +325,11 @@ async fn serve(a: Args, config: Arc<Config>) -> i32 {
     let allow_http = a.allow_http || a.demo; // --demo is 127.0.0.1 only and has no real data
     let host = a.host.as_str();
     let mut listeners: Vec<(String, u16, ListenerCfg)> = Vec::new();
+    // what the tray icon opens: the app over HTTPS, else whatever the http port serves
+    let mut open = OpenTarget { secure: false, port: a.port, bind_host: a.host.clone(), cert: None };
     let where_ = match server::load_tls(&tls.cert, &tls.key) {
         Ok(acceptor) => {
+            open = OpenTarget { secure: true, port: tls.port, bind_host: a.host.clone(), cert: Some(PathBuf::from(&tls.cert)) };
             listeners.push((host.into(), tls.port, ListenerCfg::new(Role::App { secure: true }, Some(acceptor))));
             let install = Role::Install { https_port: tls.port, ca_cert: PathBuf::from(&tls.ca_cert) };
             listeners.push((host.into(), a.port, ListenerCfg::new(install, None)));
@@ -371,10 +381,38 @@ async fn serve(a: Args, config: Arc<Config>) -> i32 {
     if config.pin_hash().is_empty() {
         log_warning!("no PIN set; run plex-couch --set-pin <digits>");
     }
-    let _ = tokio::signal::ctrl_c().await;
+    let quit = Arc::new(tokio::sync::Notify::new());
+    let tray = if a.no_tray { None } else { start_tray(&config, open, quit.clone()) };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = quit.notified() => {}
+    }
     stop_handle.stop();
+    if let Some(t) = tray {
+        t.stop();
+    }
     log_info!("stopped");
     0
+}
+
+/// The tray icon (Windows); a failure is logged and the server runs on without it.
+fn start_tray(config: &Config, open: OpenTarget, quit: Arc<tokio::sync::Notify>) -> Option<tray::Tray> {
+    if !cfg!(windows) {
+        return None;
+    }
+    log_info!("tray: a click opens {}", open.url());
+    let opts = tray::TrayOptions {
+        app_name: config.app_name(),
+        url: Box::new(move || open.url()),
+        on_exit: Box::new(move || quit.notify_one()),
+    };
+    match tray::start(opts) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            log_warning!("no tray icon: {e}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +434,13 @@ mod tests {
         assert!(a.allow_http && a.dry_run);
         assert_eq!(a.config, Some(PathBuf::from("x.json")));
         assert_eq!(a.set_pin.as_deref(), Some("1234"));
+        assert!(!a.no_tray);
+        let ParseOutcome::Run(a) = p(&["--no-tray", "--demo"]) else { panic!() };
+        assert!(a.no_tray && a.demo);
+        let ParseOutcome::Run(a) = p(&["--no-t"]) else { panic!() };
+        assert!(a.no_tray);
+        assert!(matches!(p(&["--no-tray=1"]), ParseOutcome::Error(e) if e.contains("ignored explicit argument")));
+        assert!(matches!(p(&["--n"]), ParseOutcome::Error(e) if e.contains("ambiguous")));
     }
 
     #[test]
