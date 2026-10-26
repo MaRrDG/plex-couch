@@ -37,6 +37,27 @@ pub fn unix_now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
+/// A monotonic clock in seconds that does not advance while the PC sleeps or hibernates
+/// (`QueryUnbiasedInterruptTime`, 100 ns units). Only differences within one process
+/// mean anything.
+#[cfg(windows)]
+pub fn unbiased_secs() -> f64 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn QueryUnbiasedInterruptTime(unbiased_time: *mut u64) -> i32;
+    }
+    let mut t: u64 = 0;
+    // SAFETY: writes one u64 we own.
+    unsafe { QueryUnbiasedInterruptTime(&mut t) };
+    t as f64 / 10_000_000.0
+}
+
+#[cfg(not(windows))]
+pub fn unbiased_secs() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+
 /// Days since 1970-01-01 of a civil date (Howard Hinnant's algorithm).
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
@@ -99,5 +120,13 @@ mod tests {
         assert_eq!(parse_iso_utc("2026-10-26"), Some(1_792_972_800));
         assert_eq!(parse_iso_utc("nope"), None);
         assert_eq!(parse_iso_utc(""), None);
+    }
+
+    #[test]
+    fn unbiased_clock_moves_forward() {
+        let a = unbiased_secs();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let b = unbiased_secs();
+        assert!(a > 0.0 && b > a && b - a < 5.0, "{a} {b}");
     }
 }

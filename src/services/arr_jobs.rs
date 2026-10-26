@@ -10,6 +10,8 @@ use std::time::Duration;
 
 /// Jobs are not latency-critical; manual import scans the download folder.
 pub const ARR_TIMEOUT: Duration = Duration::from_secs(30);
+pub const PAGE_SIZE: usize = 200;
+pub const MAX_PAGES: usize = 100;
 
 #[derive(Clone)]
 pub struct Arr {
@@ -78,10 +80,35 @@ impl Arr {
         self.send(Method::POST, "/command", Some(body)).await
     }
 
-    /// `GET /queue?pageSize=100` -> `.records`.
+    /// `GET /queue?pageSize=100` -> `.records` (first page; the watchlist auto-import).
     pub async fn queue(&self) -> UpResult<Vec<Value>> {
         let v = self.get("/queue?pageSize=100").await?;
         Ok(v.and_then(|v| v.get("records").and_then(Value::as_array).cloned()).unwrap_or_default())
+    }
+
+    /// Every record of a paged endpoint (`<path>&page=N&pageSize=200`) up to
+    /// `totalRecords`. A page without `records`/`totalRecords`, an empty page before the
+    /// total is reached, or more than [`MAX_PAGES`] pages is an error.
+    pub async fn paged(&self, path_with_query: &str) -> UpResult<Vec<Value>> {
+        let mut out = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let v = self.get(&format!("{path_with_query}&page={page}&pageSize={PAGE_SIZE}")).await?.ok_or(UpstreamError::Body)?;
+            let total = v.get("totalRecords").and_then(Value::as_u64).ok_or(UpstreamError::Body)? as usize;
+            let recs = v.get("records").and_then(Value::as_array).ok_or(UpstreamError::Body)?;
+            out.extend(recs.iter().cloned());
+            if out.len() >= total {
+                return Ok(out);
+            }
+            if recs.is_empty() {
+                return Err(UpstreamError::Other("paging ended before totalRecords"));
+            }
+        }
+        Err(UpstreamError::Other("too many pages"))
+    }
+
+    /// Every queue record (all pages).
+    pub async fn queue_all(&self) -> UpResult<Vec<Value>> {
+        self.paged("/queue?includeUnknownMovieItems=true&includeUnknownSeriesItems=true").await
     }
 
     /// `GET /manualimport?downloadId=..&<movieId|seriesId>=..&filterExistingFiles=false`.
@@ -90,18 +117,16 @@ impl Arr {
         as_array(self.get(&format!("/manualimport?downloadId={dl}&{id_param}={id}&filterExistingFiles=false")).await?)
     }
 
-    /// `GET /history?downloadId=<UPPER>&pageSize=200` -> `.records` (the filter is
-    /// case-sensitive and the *arr apps store the hash upper-case).
+    /// The history records of one download: `GET /history?downloadId=<UPPER>` (the *arr
+    /// apps store the hash upper-case), every page, then filtered client-side by
+    /// `downloadId` (case-insensitive) in case the server ignores the filter.
     pub async fn history_for_download(&self, download_id: &str) -> UpResult<Vec<Value>> {
-        let dl = urlencode(&download_id.trim().to_ascii_uppercase());
-        let v = self.get(&format!("/history?downloadId={dl}&pageSize=200")).await?;
-        match v {
-            Some(v) => match v.get("records") {
-                Some(Value::Array(a)) => Ok(a.clone()),
-                _ => Err(UpstreamError::Body),
-            },
-            None => Err(UpstreamError::Body),
-        }
+        let want = download_id.trim().to_ascii_uppercase();
+        let recs = self.paged(&format!("/history?downloadId={}", urlencode(&want))).await?;
+        Ok(recs
+            .into_iter()
+            .filter(|r| r.get("downloadId").and_then(Value::as_str).is_some_and(|d| d.trim().eq_ignore_ascii_case(&want)))
+            .collect())
     }
 
     /// `GET /movie` (Radarr) or `GET /series` (Sonarr), uncached.
@@ -111,6 +136,12 @@ impl Arr {
             Some(Value::Array(a)) => Ok(a),
             _ => Err(UpstreamError::Body),
         }
+    }
+
+    /// Sonarr `GET /tag` -> the id of the tag with this label (case-insensitive).
+    pub async fn tag_id(&self, label: &str) -> UpResult<Option<i64>> {
+        let tags = as_array(self.get("/tag").await?)?;
+        Ok(tags.iter().find(|t| t.get("label").and_then(Value::as_str).is_some_and(|l| l.eq_ignore_ascii_case(label))).and_then(|t| t.get("id").and_then(Value::as_i64)))
     }
 
     /// Sonarr `GET /series/<id>`.
