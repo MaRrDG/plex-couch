@@ -99,7 +99,7 @@ pub fn free_gb(path: &str) -> Option<f64> {
 
 /// This PC's IPv4 addresses.
 pub fn own_ipv4s() -> HashSet<String> {
-    use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+    use std::net::{SocketAddr, ToSocketAddrs};
     let mut ips = HashSet::new();
     if let Ok(addrs) = (hostname().as_str(), 0u16).to_socket_addrs() {
         for a in addrs {
@@ -108,15 +108,22 @@ pub fn own_ipv4s() -> HashSet<String> {
             }
         }
     }
-    // the primary outbound interface (a UDP connect sends no packet)
-    if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
-        if s.connect("10.255.255.255:1").is_ok() {
-            if let Ok(SocketAddr::V4(v4)) = s.local_addr() {
-                ips.insert(v4.ip().to_string());
-            }
-        }
+    if let Some(ip) = primary_ipv4() {
+        ips.insert(ip.to_string());
     }
     ips
+}
+
+/// The IPv4 of the primary outbound interface: the local address of a UDP "connect" to
+/// 10.255.255.255:1 (no packet is sent).
+pub fn primary_ipv4() -> Option<std::net::Ipv4Addr> {
+    use std::net::{SocketAddr, UdpSocket};
+    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("10.255.255.255:1").ok()?;
+    match s.local_addr() {
+        Ok(SocketAddr::V4(v4)) if !v4.ip().is_unspecified() => Some(*v4.ip()),
+        _ => None,
+    }
 }
 
 #[cfg(all(test, windows))]

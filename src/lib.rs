@@ -17,6 +17,7 @@ pub mod certs;
 pub mod cli;
 pub mod config;
 pub mod http;
+pub mod icon;
 pub mod jobs;
 pub mod json;
 pub mod log;

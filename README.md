@@ -62,6 +62,8 @@ comes next, as a poster grid) and **PC** (seeding, disk, services, notifications
   authority, a service worker that caches the app shell, and a clear "PC-ul nu răspunde"
   state when the PC is off. Without certificates the app only serves an error page, unless
   you start it with `--allow-http`.
+- **Tray icon** on the PC: a click opens the app in the browser, the right-click menu stops it
+  (see [Tray icon](#tray-icon)).
 
 ### Background jobs
 
@@ -191,8 +193,8 @@ Stop the running copy before you replace the exe.
    Set up HTTPS (next section) before you use it for real, then drop `--allow-http`.
 
    The release exe has no console window. Started from a terminal it prints to it, but the
-   shell does not wait for it; stop it from Task Manager, or run a debug build in the
-   foreground with `cargo run -- --dry-run --allow-http` (Ctrl+C stops it).
+   shell does not wait for it; stop it with *Ieșire* in its tray icon's menu, or run a debug
+   build in the foreground with `cargo run -- --dry-run --allow-http` (Ctrl+C stops it).
 
 4. **Run at logon** with Task Scheduler so it lives in your interactive session (required for
    the monitor controls):
@@ -209,6 +211,26 @@ Stop the running copy before you replace the exe.
    New-NetFirewallRule -DisplayName "plex-couch" -Direction Inbound -Protocol TCP -LocalPort 8765,8766 `
      -Profile Private -RemoteAddress LocalSubnet -Action Allow
    ```
+
+### Tray icon
+
+While it runs, Plex Couch shows its icon in the notification area of the taskbar, with the
+`app_name` as tooltip.
+
+- **Click** (or double-click) opens the app in the default browser at
+  `https://<pc-lan-ip>:8766/`: the IP the server certificate was made for (if the PC still has
+  it), else the PC's private LAN IPv4, else `127.0.0.1`; with the HTTPS port from the command
+  line or config. Without certificates it opens `http://<pc-lan-ip>:8765/` instead. With a
+  specific `--host` that address is used.
+- **Right-click** shows a menu with *Deschide Plex Couch* (the same as a click; the name follows
+  `app_name`) and *Ieșire*,
+  which stops the server cleanly, like Ctrl+C, and removes the icon. To start it again, run the
+  scheduled task (or log off and on).
+- If Explorer restarts, the icon comes back by itself; if the taskbar is not up yet at logon,
+  the icon is added as soon as it is.
+- `--no-tray` starts without the icon.
+
+The log says which address a click opens (`tray: a click opens https://...`) at startup.
 
 ### Configuration
 
@@ -313,7 +335,7 @@ Paths and the port can be changed with `--https-port`, `--cert`, `--key`, `--ca-
 ```
 plex-couch [--host 0.0.0.0] [--port 8765] [--https-port 8766] [--cert certs/server.pem]
            [--key certs/server.key] [--ca-cert certs/ca.crt] [--config config.local.json]
-           [--dry-run] [--allow-http]
+           [--dry-run] [--allow-http] [--no-tray]
 plex-couch --set-pin <digits> [--config config.local.json]
 plex-couch --setup-ntfy [--new-topic] [--config config.local.json]
 plex-couch --demo --host 127.0.0.1 [--port 8765]
@@ -326,7 +348,8 @@ actions instead of executing them, and makes the background jobs read-only (see 
 default only a 503 page is served then). `--demo` serves the UI with fake data and no login, for
 screenshots and UI work; it refuses to start unless the host is `127.0.0.1`, never executes any
 action and runs no background job. Open `/#login` to see the login keypad in demo mode.
-Options can be abbreviated to a unique prefix (`--allow` = `--allow-http`), `-h` prints the
+`--no-tray` starts without the system-tray icon (see [Tray icon](#tray-icon)); the one-shot
+commands (`--set-pin`, `--setup-ntfy`, `make-certs`) never show one. Options can be abbreviated to a unique prefix (`--allow` = `--allow-http`), `-h` prints the
 help, and a usage error exits with code 2.
 
 Logs go to `plex-couch.log` next to the exe (rotating, 1 MB x 2). The exe has no console when
@@ -405,9 +428,10 @@ writes its own log (`jobs.strip_dv.log`).
 
 ## Resource use
 
-One process with a small async runtime (two worker threads, plus a thread for the DV strip job
-and short-lived ones for blocking calls). It typically uses about 8-18 MB of RAM and next to no
-CPU between polls; ffmpeg runs only while a file is remuxed, at below-normal priority.
+One process with a small async runtime (two worker threads, plus a thread for the DV strip job,
+one for the tray icon and short-lived ones for blocking calls). It typically uses about 8-20 MB
+of RAM (the tray icon accounts for about 3 MB of that) and next to no CPU between polls; ffmpeg
+runs only while a file is remuxed, at below-normal priority.
 
 ## Design system
 
@@ -426,18 +450,29 @@ is [Figtree](https://github.com/erikdkennedy/figtree) (SIL Open Font License 1.1
 `static/fonts/OFL.txt`), self-hosted as two variable woff2 files (latin and latin-ext, weights
 400-700) so the app works offline and Romanian diacritics render in the same face.
 
+The exe has its own icon (Explorer, Task Manager, the tray): `assets/plex-couch.ico`, drawn from
+the shapes of `static/icon.svg` at 16, 24, 32, 48 and 256 px, and embedded by `build.rs` at build
+time. After changing `icon.svg`, update the shapes in `src/icon.rs` and run:
+
+```
+cargo run --example make_icon              # writes assets/plex-couch.ico
+cargo run --example make_icon -- --check   # exits 1 if assets/plex-couch.ico is out of date
+```
+
 ## Development
 
 ```
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo run --example build_tokens -- --check
+cargo run --example make_icon -- --check
 ```
 
 The unit tests live next to the code and cover the pure logic (hit & run rule, tracker
 matching, IP checks, session tokens, PIN hashing, lockouts, Romanian status text, auto-monitor
 decisions, release-name parsing, torrent-to-movie matching, the ntfy payload, the movie-ready
-and low-disk notifications, the after-movie shutdown decisions, the CA name constraints) and the
+and low-disk notifications, the after-movie shutdown decisions, the CA name constraints, the
+address the tray icon opens, the generated icon) and the
 background jobs against fake Radarr/Sonarr/Plex/qBittorrent servers and a fake ffmpeg: the
 watchlist guards, the next-season rule, the DV strip replacement and its failure paths, the
 seed keeper's ledger and every keep/delete case. The tests in `tests/` run the real listeners:
