@@ -182,7 +182,7 @@ pub fn app_with(config: Arc<Config>, mut opts: AppOptions) -> Arc<AppState> {
     AppState::new(config, opts).unwrap()
 }
 
-/// A Plex session as the logic sees it (`session()` of test_notify.py).
+/// A Plex session as the logic sees it.
 pub fn session(key: &str, title: &str, progress: f64, address: &str, state: &str) -> Value {
     json!({"key": key, "title": title, "progress": progress, "address": address, "state": state})
 }

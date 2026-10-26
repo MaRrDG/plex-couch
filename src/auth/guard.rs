@@ -1,4 +1,4 @@
-//! Brute-force guard for the PIN login (spec 4.3, logic.py:384-553), ported 1:1.
+//! Brute-force guard for the PIN login (spec 4.3).
 //!
 //! Per IP: 5 wrong PINs lock that IP for 10 minutes. Every attempt is reserved under the lock
 //! *before* the PIN is checked, so parallel requests cannot run more than 5 checks per
@@ -372,7 +372,7 @@ mod tests {
     }
 
     // py: test_known_ips_expire_after_30_days_and_round_trip
-    // (Python also passes the int key 5; JSON object keys are always strings, so that case
+    // (The original test also passed the int key 5; JSON object keys are always strings, so that case
     //  cannot occur in Rust and is left out.)
     #[test]
     fn known_ips_expire_after_30_days_and_round_trip() {

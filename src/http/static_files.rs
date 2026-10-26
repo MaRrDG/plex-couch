@@ -1,4 +1,4 @@
-//! The static whitelist (app.py:61-83), embedded at build time. Exact path match only; no
+//! The static whitelist, embedded at build time. Exact path match only; no
 //! directory serving. `install.html` is only for the install listener, `fonts/OFL.txt` is
 //! never served.
 
@@ -95,7 +95,7 @@ pub const NO_CERT_PAGE: &str = "<!doctype html>
 <body>
 <h1>Certificatele HTTPS lipsesc</h1>
 <p>{name} nu pornește fără HTTPS: certificatul sau cheia lipsesc ori nu pot fi citite.</p>
-<p>Pe PC, rulează <code>python tools/make_certs.py --ip &lt;IP-ul PC-ului&gt;</code> și repornește {name}.</p>
+<p>Pe PC, rulează <code>plex-couch make-certs --ip &lt;IP-ul PC-ului&gt;</code> și repornește {name}.</p>
 </body>
 </html>
 ";

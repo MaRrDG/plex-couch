@@ -5,7 +5,7 @@
 //! ```json
 //! "jobs": {
 //!   "watchlist":   {"discover_url": "https://discover.provider.plex.tv"},
-//!   "strip_dv":    {"ffmpeg_bin": "", "ffmpeg_packages": "C:\\Users\\dragu\\AppData\\Local\\Microsoft\\WinGet\\Packages",
+//!   "strip_dv":    {"ffmpeg_bin": "", "ffmpeg_packages": "%LOCALAPPDATA%\\Microsoft\\WinGet\\Packages",
 //!                   "tmp_dir": "D:\\Media\\Downloads\\.strip-dv", "log": "D:\\Media\\scripts\\logs\\strip-dv.log",
 //!                   "seen": "D:\\Media\\scripts\\logs\\strip-dv-seen.txt",
 //!                   "libraries": [{"path": "D:\\Media\\Movies", "arr": "radarr", "section": 1},
@@ -103,7 +103,7 @@ impl Quiet {
     }
 }
 
-/// `true` for a JSON number/bool/string that Python would call truthy as an id (`-not $q.movieId`).
+/// A usable id: a non-zero JSON integer (the scripts' `-not $q.movieId`).
 pub fn id_of(v: Option<&Value>) -> Option<i64> {
     v.and_then(Value::as_i64).filter(|n| *n != 0)
 }

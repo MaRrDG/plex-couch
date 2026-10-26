@@ -1,4 +1,4 @@
-//! Fake status data and drawn posters for `--demo` (plexcouch/demo.py; spec 8). No network,
+//! Fake status data and drawn posters for `--demo` (spec 8). No network,
 //! no secrets. Posters are SVGs served from the same `/img/...` URLs the real app proxies.
 
 use crate::logic::images::poster_url;
@@ -133,7 +133,7 @@ pub fn demo_torrents() -> Vec<Value> {
     list
 }
 
-/// `demo_status(app_name, power, settings)` (demo.py:101-152); `played` = seconds into the
+/// `demo_status(app_name, power, settings)`; `played` = seconds into the
 /// demo movie.
 pub fn demo_status(app_name: &str, power: Value, settings: Value, played: i64, now: f64) -> Value {
     let torrents = demo_torrents();
@@ -179,8 +179,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn svg_like_python() {
-        // python -c "from plexcouch import demo; print(demo.poster('movie','2')[0].decode())"
+    fn svg_reference() {
+        // The reference SVG for movie 2, byte for byte.
         let (svg, ct) = poster("movie", "2").unwrap();
         assert_eq!(ct, "image/svg+xml");
         let s = String::from_utf8(svg).unwrap();

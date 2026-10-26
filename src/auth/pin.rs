@@ -1,6 +1,6 @@
 //! PIN hashing (spec 4.1): `pbkdf2_sha256$<iterations>$<salt hex>$<dk hex>`,
 //! PBKDF2-HMAC-SHA256 over the PIN's UTF-8 bytes, 16-byte salt, 32-byte key. Hashes written
-//! by the Python app verify unchanged.
+//! by the former Python app verify unchanged.
 
 use crate::config::hex;
 
@@ -62,10 +62,10 @@ pub fn verify_pin(pin: &str, stored: &str) -> bool {
     if parts.len() != 4 || parts[0] != "pbkdf2_sha256" {
         return false;
     }
-    // Python int(): surrounding whitespace and a + sign are fine.
+    // Like int(): surrounding whitespace and a + sign are fine.
     let Ok(iters) = parts[1].trim().trim_start_matches('+').parse::<u32>() else { return false };
     if iters == 0 {
-        return false; // Python's pbkdf2_hmac raises here; refusing is the safe equivalent.
+        return false; // zero iterations is invalid: refuse.
     }
     let (Some(salt), Some(expected)) = (from_hex(parts[2]), from_hex(parts[3])) else {
         return false;
@@ -102,9 +102,10 @@ mod tests {
         assert_eq!(h1.split('$').nth(2).unwrap().len(), 32);
     }
 
-    /// A hash computed by Python's hashlib verifies (and is reproduced) byte for byte.
+    /// A reference hash (made by another PBKDF2 implementation) verifies and is reproduced
+    /// byte for byte.
     #[test]
-    fn python_hash_verifies() {
+    fn reference_hash_verifies() {
         let py = "pbkdf2_sha256$1000$000102030405060708090a0b0c0d0e0f$\
                   2240ea2a22754a3c4610356ef8e4d7acf25af2ac3d2d11866de97a8b7812c52c";
         let salt: Vec<u8> = (0u8..16).collect();

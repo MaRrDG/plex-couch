@@ -71,7 +71,7 @@ pub fn captured() -> Vec<String> {
     s.capture.clone().unwrap_or_default()
 }
 
-/// Write one record. DEBUG is below the logger level and is dropped (like Python's INFO
+/// Write one record. DEBUG is below the logger level and is dropped (an INFO
 /// logger), so debug lines never reach the file.
 pub fn emit(level: Level, msg: &str) {
     if level < Level::Info {
@@ -94,7 +94,7 @@ pub fn emit(level: Level, msg: &str) {
     }
 }
 
-/// Python RotatingFileHandler.shouldRollover: never for an empty file or a non-regular file;
+/// Rollover rule: never for an empty file or a non-regular file;
 /// otherwise when the current size plus the new record reaches maxBytes.
 fn should_rollover(s: &mut Sink, add: u64) -> bool {
     let Some(path) = s.path.as_ref() else { return false };
@@ -127,7 +127,7 @@ fn do_rollover(s: &mut Sink) {
     s.file = OpenOptions::new().create(true).append(true).open(&path).ok();
 }
 
-/// Python's asctime: local time `YYYY-MM-DD HH:MM:SS,mmm`.
+/// The record time: local time `YYYY-MM-DD HH:MM:SS,mmm`.
 pub fn asctime() -> String {
     let t = local_time();
     format!(
@@ -192,7 +192,7 @@ macro_rules! log_error {
     ($($arg:tt)*) => { $crate::log::emit($crate::log::Level::Error, &format!($($arg)*)) };
 }
 
-/// Dropped (the logger level is INFO), kept so the code documents what Python logged at DEBUG.
+/// Dropped (the logger level is INFO), kept so the code documents what is logged at DEBUG.
 #[macro_export]
 macro_rules! log_debug {
     ($($arg:tt)*) => {{

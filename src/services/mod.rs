@@ -55,7 +55,7 @@ pub enum UpstreamError {
 }
 
 impl UpstreamError {
-    /// The Python exception class the original logged (`type(e).__name__`).
+    /// The error type name the log shows (never the URL or the message).
     pub fn type_name(&self) -> &'static str {
         match self {
             UpstreamError::RedirectRefused => "RedirectRefused",

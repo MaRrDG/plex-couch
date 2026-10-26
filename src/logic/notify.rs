@@ -1,5 +1,4 @@
-//! Notifications: movie ready, disk low, the test notification (spec 7; logic.py:903-990,
-//! app.py:386-456).
+//! Notifications: movie ready, disk low, the test notification (spec 7).
 //!
 //! The `notify` loop runs a tick at once, then every 60 s, skipped while the notifier is
 //! disabled. A tick writes `movie_ready` / `disk_low` to the state file *before* sending, so
@@ -25,7 +24,7 @@ pub const DISK_REARM_GB: f64 = 10.0;
 /// POST /api/notify/test: `(status, body)`.
 pub async fn send_test_notification(app: &Arc<AppState>) -> (u16, Value) {
     if !app.notifier.enabled() {
-        return (409, json!({"error": "Notificările nu sunt pornite. Rulează app.py --setup-ntfy."}));
+        return (409, json!({"error": "Notificările nu sunt pornite. Rulează plex-couch --setup-ntfy."}));
     }
     if app.demo {
         return (200, json!({"ok": true}));
@@ -505,7 +504,7 @@ mod tests {
         Upstreams { radarr, bazarr, movies, subs }
     }
 
-    /// The `AppCase` of test_notify.py: a dry-run app on a temp config whose ntfy server is
+    /// The `AppCase` of the notify tests: a dry-run app on a temp config whose ntfy server is
     /// a local fake (dry-run still posts to a loopback server).
     pub async fn app_case(up: &Upstreams, ntfy: &Fake) -> (Arc<AppState>, Arc<crate::config::Config>) {
         let cfg = testutil::config(json!({
@@ -683,7 +682,7 @@ mod tests {
         let html = include_str!("../../static/index.html");
         let js = include_str!("../../static/app.js");
         for text in ["Oprește după film", "Nu mai opri", "Notificări", "Abonează-te în ntfy", "Copiază numele",
-                     "Trimite un test", "Pornește notificările cu app.py --setup-ntfy."] {
+                     "Trimite un test", "Pornește notificările cu plex-couch --setup-ntfy."] {
             assert!(html.contains(text), "{text}");
         }
         for text in ["PC-ul se oprește după film.", "Oprirea după film a fost anulată.",

@@ -1,6 +1,5 @@
 ﻿config.local.json
 *.log
-__pycache__/
 certs/
 *.local.json
 *.local.json.tmp

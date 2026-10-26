@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to config.local.json (or pass --config). pin_hash and secret are written by the app (--set-pin / first run). Leave api_key/token empty to read them from the service config files or the registry at runtime.",
+  "_comment": "Copy to config.local.json next to plex-couch.exe (or pass --config). pin_hash and secret are written by the app (--set-pin / first run). Leave api_key/token empty to read them from the service config files or the registry at runtime. Empty strings in jobs mean the built-in default.",
   "app_name": "Plex Couch",
   "settings": {
     "auto_monitors_off": true
@@ -7,6 +7,7 @@
   "filelist_tracker_regex": "thefl\\.org|filelist\\.(io|ro)|flro\\.org",
   "disks": ["C:", "D:"],
   "plex_poll_seconds": 10,
+  "allowed_hosts": [],
   "notifications": {
     "server": "https://ntfy.sh",
     "topic": null,
@@ -31,6 +32,11 @@
       "api_key": "",
       "config_xml": "C:\\ProgramData\\Radarr\\config.xml"
     },
+    "sonarr": {
+      "url": "http://127.0.0.1:8989",
+      "api_key": "",
+      "config_xml": "C:\\ProgramData\\Sonarr\\config.xml"
+    },
     "bazarr": {
       "url": "http://127.0.0.1:6767",
       "api_key": "",
@@ -43,6 +49,25 @@
       "url": "http://127.0.0.1:8080",
       "username": "",
       "password": ""
+    }
+  },
+  "jobs": {
+    "watchlist": {
+      "discover_url": "https://discover.provider.plex.tv"
+    },
+    "strip_dv": {
+      "ffmpeg_bin": "",
+      "ffmpeg_packages": "",
+      "tmp_dir": "D:\\Media\\Downloads\\.strip-dv",
+      "log": "D:\\Media\\scripts\\logs\\strip-dv.log",
+      "seen": "D:\\Media\\scripts\\logs\\strip-dv-seen.txt",
+      "libraries": [
+        {"path": "D:\\Media\\Movies", "arr": "radarr", "section": 1},
+        {"path": "D:\\Media\\Seriale", "arr": "sonarr", "section": 2}
+      ]
+    },
+    "seed_keeper": {
+      "downloads_root": "D:\\Media\\Downloads"
     }
   }
 }

@@ -76,7 +76,7 @@ fn demo_needs_localhost_and_bad_args() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-// The validation half of test_web.TestMakeCerts / make_certs.py main(): errors exit 2.
+// The validation half of test_web.TestMakeCerts: errors exit 2.
 #[test]
 fn make_certs_validation() {
     let d = temp_dir("mc");

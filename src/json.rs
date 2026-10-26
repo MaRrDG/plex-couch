@@ -1,17 +1,19 @@
-//! JSON output that matches Python's `json` module byte for byte, plus Python-like coercions.
+//! JSON output in the exact byte format the app has always written (config, state and API
+//! answers), plus the value coercions the logic relies on.
 //!
 //! - [`dumps`]: `json.dumps(obj, ensure_ascii=False)`: separators `", "` and `": "`, raw UTF-8.
 //!   Every HTTP JSON response uses it.
 //! - [`dump_pretty`]: `json.dump(obj, indent=2, ensure_ascii=False)` (config and state files).
-//! - Floats are written like Python's `repr(float)`: `19.0`, `1761500000.123`, `1e-05`, `1e+16`.
+//! - Floats are written as the shortest repr that round-trips: 19.0, 1761500000.123,
+//!   1e-05, 1e+16.
 //!
-//! serde_json is built with `preserve_order`, so objects keep insertion order like Python dicts.
+//! serde_json is built with `preserve_order`, so objects keep insertion order.
 
 use serde_json::ser::{CompactFormatter, Formatter, PrettyFormatter};
 use serde_json::{Map, Value};
 use std::io;
 
-/// Python `round(x, ndigits)`: correctly rounded on the exact binary value, ties to even
+/// `round(x, ndigits)`: correctly rounded on the exact binary value, ties to even
 /// (`round(0.125, 2) == 0.12`, `round(19.04, 1) == 19.0`).
 pub fn py_round(x: f64, ndigits: usize) -> f64 {
     if !x.is_finite() {
@@ -20,7 +22,7 @@ pub fn py_round(x: f64, ndigits: usize) -> f64 {
     format!("{:.*}", ndigits, x).parse().unwrap_or(x)
 }
 
-/// Python `repr(float)` for a finite f64.
+/// `repr(float)` for a finite f64: shortest round-trip digits, `.0` for integral values.
 pub fn py_float_repr(x: f64) -> String {
     if x.is_nan() {
         return "NaN".into();
@@ -82,7 +84,7 @@ impl Formatter for PyCompact {
     }
 }
 
-/// `indent=2`: serde's pretty layout is the same as Python's; only floats differ.
+/// `indent=2`: serde's pretty layout, with floats written by [`py_float_repr`].
 struct PyPretty<'a>(PrettyFormatter<'a>);
 
 macro_rules! delegate {
@@ -153,7 +155,7 @@ pub fn sorted(v: &Value) -> Value {
     }
 }
 
-/// Python truthiness of a JSON value.
+/// Truthiness of a JSON value: null, false, 0, "" and empty arrays/objects are false.
 pub fn truthy(v: Option<&Value>) -> bool {
     match v {
         None | Some(Value::Null) => false,
@@ -165,7 +167,7 @@ pub fn truthy(v: Option<&Value>) -> bool {
     }
 }
 
-/// Python `int(x)` for a JSON value: ints, floats (truncated), bools, and strings of an
+/// `int(x)` for a JSON value: ints, floats (truncated), bools, and strings of an
 /// optionally signed decimal integer (surrounding whitespace and `_` separators allowed).
 pub fn py_int(v: &Value) -> Option<i64> {
     match v {
@@ -196,7 +198,7 @@ pub fn py_int(v: &Value) -> Option<i64> {
     }
 }
 
-/// Python `str(x)` for a JSON value (only what a config value can hold).
+/// `str(x)` for a JSON value (only what a config value can hold).
 pub fn py_str(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -211,7 +213,7 @@ pub fn py_str(v: &Value) -> String {
     }
 }
 
-/// Python `repr(dict)` of a flat `{str: bool}` map, e.g. `{'auto_monitors_off': True}`.
+/// `repr(dict)` of a flat `{str: bool}` map, e.g. `{'auto_monitors_off': True}`.
 pub fn py_repr_bool_map(pairs: &[(&str, bool)]) -> String {
     let items: Vec<String> = pairs
         .iter()
@@ -251,7 +253,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn float_repr_like_python() {
+    fn float_repr() {
         let cases = [
             (19.0, "19.0"),
             (0.5, "0.5"),
@@ -271,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn round_like_python() {
+    fn round_half_even() {
         assert_eq!(py_round(0.125, 2), 0.12);
         assert_eq!(py_round(2.5, 0), 2.0);
         assert_eq!(py_round(2.675, 2), 2.67); // 2.67499999... in binary
@@ -280,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn dumps_like_python() {
+    fn dumps_format() {
         let v = json!({"error": "Autentificare necesară.", "a": [1, 2.0, true, null], "b": {}});
         assert_eq!(
             String::from_utf8(dumps(&v)).unwrap(),
@@ -289,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn pretty_like_python() {
+    fn pretty_format() {
         let v = json!({"secret": "x", "settings": {"auto_monitors_off": true}, "l": [], "f": 1.0});
         assert_eq!(
             String::from_utf8(dump_pretty(&v)).unwrap(),

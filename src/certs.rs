@@ -1,5 +1,5 @@
 //! `plex-couch make-certs`: the local, name-constrained CA and the server certificate
-//! (replaces tools/make_certs.py, spec 9.1). Pure Rust (rcgen + rsa); no openssl needed.
+//! (spec 9.1). Pure Rust (rcgen + rsa); no openssl needed.
 //!
 //! ```text
 //! plex-couch make-certs --ip 192.168.1.50 [--ip 127.0.0.1] [--dns localhost] [--out certs]
@@ -14,7 +14,7 @@
 //! The CA carries critical name constraints (private IPv4 ranges, `localhost`, `*.local`,
 //! no e-mail names) and is limited to TLS servers (EKU serverAuth). Key identifiers are the
 //! SHA-1 of the public key, like openssl's `subjectKeyIdentifier = hash`, so a CA made by
-//! the Python tool keeps working with server certificates made here.
+//! a CA made earlier with openssl keeps working with server certificates made here.
 
 use rcgen::{
     BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType, ExtendedKeyUsagePurpose,

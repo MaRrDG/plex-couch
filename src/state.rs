@@ -35,7 +35,7 @@ impl StateFile {
     }
 
     fn load_locked(&self) -> Map<String, Value> {
-        // Python opens it as plain utf-8: a BOM makes json.load fail -> {}.
+        // Read as plain UTF-8: a BOM makes the parse fail -> {}.
         self.try_load_locked().unwrap_or_default()
     }
 
@@ -94,7 +94,7 @@ impl StateFile {
     }
 }
 
-/// The Python exception class name for an io error (logs name the type, never paths).
+/// The error type name for an io error (logs name the type, never paths).
 pub fn io_error_name(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind::*;
     match e.kind() {

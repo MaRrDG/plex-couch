@@ -1,5 +1,5 @@
 //! FileList hit & run rule, torrent summaries and movie titles for torrents
-//! (logic.py:15-209; spec 5.5 and 5.2 "Torrent hash -> title", "release_title").
+//! (spec 5.5 and 5.2 "Torrent hash -> title", "release_title").
 //!
 //! New (plan "New behaviour" 3): the seed keeper's ledger seconds replace qBittorrent's
 //! `seeding_time` for the H&R rule when it knows the torrent, and every summary carries
@@ -17,7 +17,7 @@ pub const HR_RATIO: f64 = 1.0;
 pub const HR_SEED_HOURS: f64 = 48.0;
 
 /// `re.compile(pattern or DEFAULT, re.IGNORECASE)`. A pattern the regex engine rejects
-/// falls back to the default (Python would refuse to start).
+/// falls back to the default.
 pub fn compile_tracker_regex(pattern: Option<&str>) -> Regex {
     let p = pattern.filter(|p| !p.is_empty()).unwrap_or(DEFAULT_FILELIST_REGEX);
     RegexBuilder::new(p).case_insensitive(true).build().unwrap_or_else(|_| {
@@ -331,7 +331,7 @@ mod tests {
         assert!((rule_progress(0.75, 12.0 * H) - 0.75).abs() < 1e-9);
         assert_eq!(rule_progress(3.0, 0.0), 1.0);
         assert_eq!(rule_progress(0.0, 100.0 * H), 1.0);
-        // (None, None) in Python: missing values read as 0
+        // (None, None): missing values read as 0
         assert_eq!(rule_progress(val::f(None), val::f(None)), 0.0);
         assert_eq!(rule_progress(-1.0, -5.0), 0.0);
     }
@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(hr_warnings(&s), vec![json!({"title": "A", "name": "A", "remaining": "mai are nevoie de 48 h sau ratio 1"})]);
         assert!(s[0].get("tracker").is_none());
         assert!(s[0].get("hash").is_none());
-        // the Python field types: floats stay floats, ints stay ints
+        // the field types: floats stay floats, ints stay ints
         let enc = String::from_utf8(crate::json::dumps(&s[2])).unwrap();
         assert!(enc.contains("\"progress\": 40.0") && enc.contains("\"ratio\": 0.0") && enc.contains("\"seed_hours\": 0.0"), "{enc}");
         assert!(enc.contains("\"dlspeed\": 0") && enc.contains("\"rule_progress\": 0.0"), "{enc}");

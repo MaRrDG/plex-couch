@@ -50,13 +50,13 @@ impl Req {
         cookie_token(self.header("Cookie"))
     }
 
-    /// `Content-Length` as Python reads it: missing or not an int counts as 0.
+    /// `Content-Length`: missing or not an int counts as 0.
     fn content_length(&self) -> i64 {
         self.header(CONTENT_LENGTH.as_str()).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0)
     }
 }
 
-/// Raw target: origin-form `path?query`; absolute-form keeps the whole URI like Python did.
+/// Raw target: origin-form `path?query`; absolute-form keeps the whole URI.
 fn raw_target(uri: &hyper::Uri) -> String {
     if uri.scheme().is_some() {
         return uri.to_string();

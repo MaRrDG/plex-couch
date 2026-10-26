@@ -1,5 +1,4 @@
-//! Shut down after the movie, TV sessions and auto monitors off (spec 6.4, 6.5;
-//! logic.py:806-905, app.py:320-384).
+//! Shut down after the movie, TV sessions and auto monitors off (spec 6.4, 6.5).
 //!
 //! Sessions are the parsed Plex sessions as JSON objects (`parse_plex_sessions` output:
 //! `key`, `title`, `state`, `progress`, `address`, ...).
@@ -133,7 +132,7 @@ pub fn after_movie_arm(sessions: &[Value], own_ips: &HashSet<String>, now: f64) 
     })
 }
 
-/// One successful Plex poll while armed: `(new state, action)` (logic.py:863-893).
+/// One successful Plex poll while armed: `(new state, action)`.
 pub fn after_movie_step(
     state: Option<&AfterMovie>,
     sessions: &[Value],
@@ -427,7 +426,7 @@ mod tests {
         assert!(trig);
     }
 
-    /// `session()` of test_notify.py: the TV at 192.168.0.40, playing "The Godfather".
+    /// The test TV at 192.168.0.40, playing "The Godfather".
     fn tv(key: &str, progress: f64) -> Value {
         session(key, "The Godfather", progress, "192.168.0.40", "playing")
     }

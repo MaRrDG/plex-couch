@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 pub struct Qbittorrent {
     pub c: Client,
-    /// Cookie name -> value (the cookie jar of the Python opener).
+    /// Cookie name -> value (the session cookie jar).
     cookies: Mutex<Vec<(String, String)>>,
     login_lock: tokio::sync::Mutex<()>,
     /// Torrent hash -> is FileList. Never stores URLs.
@@ -103,7 +103,7 @@ impl Qbittorrent {
         Ok(parsed)
     }
 
-    /// `POST /api/v2/auth/login`, serialized; the answer is not checked (Python did not).
+    /// `POST /api/v2/auth/login`, serialized; the answer is not checked.
     async fn login(&self) -> UpResult<()> {
         let _one = self.login_lock.lock().await;
         let svc = self.c.config.service("qbittorrent");

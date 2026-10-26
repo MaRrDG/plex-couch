@@ -140,11 +140,17 @@ impl DvConfig {
             log: s("log", "D:\\Media\\scripts\\logs\\strip-dv.log").into(),
             seen: s("seen", "D:\\Media\\scripts\\logs\\strip-dv-seen.txt").into(),
             ffmpeg_bin: s("ffmpeg_bin", ""),
-            ffmpeg_packages: s("ffmpeg_packages", "C:\\Users\\dragu\\AppData\\Local\\Microsoft\\WinGet\\Packages"),
+            ffmpeg_packages: s("ffmpeg_packages", &default_winget_packages()),
             delete_wait: DELETE_WAIT,
             force_cross_volume: false,
         }
     }
+}
+
+/// Where winget unpacks portable packages such as Gyan.FFmpeg for the current user.
+fn default_winget_packages() -> String {
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    format!("{base}\\Microsoft\\WinGet\\Packages")
 }
 
 // -- probing and decisions (pure) ---------------------------------------------------------

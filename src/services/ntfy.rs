@@ -81,7 +81,7 @@ pub fn is_loopback_url(url: &str) -> bool {
     host == "localhost" || crate::http::security::is_loopback_str(&host)
 }
 
-/// Python `repr(str)` (the log quotes titles like `'%r'`).
+/// `repr(str)`: the log quotes titles like `'%r'`.
 pub fn py_repr_str(s: &str) -> String {
     let q = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
     let mut out = String::with_capacity(s.len() + 2);

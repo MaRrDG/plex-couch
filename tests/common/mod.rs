@@ -1,6 +1,6 @@
 //! Test helpers: a real `AppState` on a temp config, served on an ephemeral 127.0.0.1 port by
-//! the real listener code (Python's `ServerCase`), and a tiny blocking HTTP/1.1 client
-//! (Python's `http.client` usage in the tests).
+//! the real listener code (`ServerCase`), and a tiny blocking HTTP/1.1 client
+//! for the requests.
 
 #![allow(dead_code)]
 
@@ -34,7 +34,7 @@ pub struct TestServer {
 pub struct Setup {
     pub role: Role,
     pub opts: AppOptions,
-    /// Hash this PIN into the config first (1000 iterations, like the Python tests).
+    /// Hash this PIN into the config first (1000 iterations, to keep the tests fast).
     pub pin: Option<&'static str>,
     pub max_connections: Option<usize>,
     pub timeout: Option<Duration>,

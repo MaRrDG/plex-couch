@@ -1,4 +1,4 @@
-//! Radarr and Bazarr summaries in Romanian (logic.py:555-717; spec 5.2, 5.3): downloads,
+//! Radarr and Bazarr summaries in Romanian (spec 5.2, 5.3): downloads,
 //! waiting, library, release dates, the RO-subtitle map.
 //!
 //! Plan fix 17: a bad `timeleft` day part makes that item's time unknown (`""`, like a bad

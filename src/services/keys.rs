@@ -1,4 +1,4 @@
-//! API keys and tokens (spec 2.4, services.py:104-163).
+//! API keys and tokens (spec 2.4).
 //!
 //! - Plex: `services.plex.token`, else `HKCU\<token_registry_key>` value
 //!   `<token_registry_value>`.

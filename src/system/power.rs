@@ -1,11 +1,10 @@
-//! Shutdown/restart with our own 60 s countdown (spec 6.2, system.py:27-176).
+//! Shutdown/restart with our own 60 s countdown (spec 6.2).
 //!
 //! `shutdown /s /hybrid /t 0` or `shutdown /r /t 0`, never `/f` (`/t` above 0 would imply
 //! it). One request at a time; it stays pending until 10 s after `at`. Cancel before it
 //! fires stops the timer; after it fired, waits for shutdown.exe and runs `shutdown /a`.
 //!
-//! Implemented in Phase 1 because tests/test_security.py exercises it (TestCancelAfterFire);
-//! test_logic.TestPower / TestPowerArgs / TestPowerTimer are ported here too.
+//! Tests: TestCancelAfterFire (tests/security.rs) and TestPower / TestPowerArgs / TestPowerTimer here.
 
 use crate::{log_info, log_warning};
 use serde_json::{json, Value};
@@ -469,7 +468,7 @@ mod tests {
     // py: test_logic.TestPowerArgs.test_unknown_kind_raises
     #[test]
     fn unknown_kind_raises() {
-        // Python raises KeyError; here the kind is refused (None) and nothing is scheduled
+        // An unknown kind is refused (None) and nothing is scheduled
         assert_eq!(power_args("hibernate", "shutdown.exe"), None);
         let (f, r) = fake();
         let a = acts(false, FAST, r);

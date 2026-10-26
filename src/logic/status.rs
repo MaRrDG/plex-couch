@@ -139,7 +139,7 @@ pub async fn status(app: &Arc<AppState>) -> Value {
     Value::Object(out)
 }
 
-/// Demo status (fixed data, demo.py:101-152).
+/// Demo status (fixed data).
 pub fn demo_status(app: &Arc<AppState>) -> Value {
     let played = 2843 + app.started.elapsed().as_secs() as i64;
     crate::logic::demo::demo_status(
