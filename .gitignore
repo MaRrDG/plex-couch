@@ -4,3 +4,4 @@ __pycache__/
 certs/
 *.local.json
 *.local.json.tmp
+/target/

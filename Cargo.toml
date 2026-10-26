@@ -1,0 +1,66 @@
+[package]
+name = "plex-couch"
+version = "0.1.0"
+edition = "2021"
+description = "LAN-only phone remote for a Plex PC"
+license = "MIT"
+publish = false
+
+[lib]
+name = "plex_couch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "plex-couch"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+bytes = "1.12.1"
+getrandom = "0.2"
+hmac = { version = "0.12", default-features = false }
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+rsa = { version = "0.9.10", default-features = false, features = ["std", "pem", "u64_digit"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+serde = "1.0.229"
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+time = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "fs", "signal"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Console",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# Unwind (not abort): a panic in one request handler is caught by its task and only drops
+# that connection, like the Python server's handle_error.
+panic = "unwind"
+
+# PBKDF2 and RSA key generation are painfully slow unoptimised; keep tests fast.
+[profile.dev.package."*"]
+opt-level = 2
+
+[dev-dependencies]
+x509-parser = "0.16"
