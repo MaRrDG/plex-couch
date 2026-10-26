@@ -89,6 +89,14 @@ pub async fn tick(app: &AppState, mem: &mut Mem) {
     };
     let Some(series) = sonarr_series(&sonarr, &mut mem.quiet).await else { return };
     let kept = sonarr_cleanup(app, &sonarr, watch.as_deref(), &series, verbose).await;
+    if verbose {
+        let (items, shows) = watch.as_deref().map(|w| (w.len(), w.iter().filter(|i| i.kind == "show").count())).unwrap_or((0, 0));
+        log_info!(
+            "watchlist: Plex Watchlist {items} item(s), {shows} show(s); Sonarr {} series, {} from the Watchlist",
+            series.len(),
+            kept.len()
+        );
+    }
     if let Some(w) = watch.as_deref() {
         next_season(app, &sonarr, &plex, w, &kept, &mut mem.quiet).await;
     }
