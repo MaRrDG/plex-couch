@@ -1,7 +1,14 @@
-//! App logic on top of the services (Phase 2a fills most of it). Add new files here freely
-//! (e.g. `torrents.rs`, `radarr.rs` for the summaries); keep pure functions testable.
+//! App logic on top of the services. Pure functions are kept testable; the Python module
+//! each one ports is named in its header.
 
+pub mod demo;
 pub mod images;
+pub mod movies;
 pub mod notify;
+pub mod plex;
 pub mod power;
 pub mod status;
+#[cfg(test)]
+pub mod testutil;
+pub mod torrents;
+pub mod val;

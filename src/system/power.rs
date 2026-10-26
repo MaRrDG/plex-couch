@@ -4,9 +4,8 @@
 //! it). One request at a time; it stays pending until 10 s after `at`. Cancel before it
 //! fires stops the timer; after it fired, waits for shutdown.exe and runs `shutdown /a`.
 //!
-//! Implemented in Phase 1 because tests/test_security.py exercises it (TestCancelAfterFire).
-//! TODO(Phase 2a): nothing structural; port test_logic.TestPower / TestPowerArgs /
-//! TestPowerTimer against this module.
+//! Implemented in Phase 1 because tests/test_security.py exercises it (TestCancelAfterFire);
+//! test_logic.TestPower / TestPowerArgs / TestPowerTimer are ported here too.
 
 use crate::{log_info, log_warning};
 use serde_json::{json, Value};
@@ -429,5 +428,79 @@ mod tests {
         assert_eq!(pending_power("shutdown", 1060.4, 1000.0), Some(PendingPower { kind: "shutdown".into(), at: 1060 }));
         assert_eq!(pending_power("shutdown", 1060.0, 1100.0), None);
         a.cancel_power();
+    }
+
+    // py: test_logic.TestPower.test_pending
+    #[test]
+    fn pending() {
+        // pending_power(None) is None: an Actions with nothing scheduled
+        let (_f, r) = fake();
+        assert!(acts(true, Duration::from_secs(5), r).pending().is_none());
+        assert_eq!(pending_power("shutdown", 1060.4, 1000.0), Some(PendingPower { kind: "shutdown".into(), at: 1060 }));
+        assert_eq!(pending_power("shutdown", 1060.4, 1000.0).unwrap().to_json(), serde_json::json!({"kind": "shutdown", "at": 1060}));
+        assert_eq!(pending_power("shutdown", 1060.0, 1100.0), None);
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // py: test_logic.TestPowerArgs.test_shutdown_is_hybrid_and_immediate
+    #[test]
+    fn shutdown_is_hybrid_and_immediate() {
+        assert_eq!(power_args("shutdown", "shutdown.exe").unwrap(), strs(&["shutdown.exe", "/s", "/hybrid", "/t", "0"]));
+    }
+
+    // py: test_logic.TestPowerArgs.test_restart_has_no_hybrid
+    #[test]
+    fn restart_has_no_hybrid() {
+        assert_eq!(power_args("restart", "shutdown.exe").unwrap(), strs(&["shutdown.exe", "/r", "/t", "0"]));
+    }
+
+    // py: test_logic.TestPowerArgs.test_never_forced
+    #[test]
+    fn never_forced() {
+        // /t above 0 implies /f; /t 0 lets unsaved work stop it, like Start > Shut down
+        for kind in ["shutdown", "restart"] {
+            assert!(!power_args(kind, "shutdown.exe").unwrap().contains(&"/f".to_string()));
+        }
+    }
+
+    // py: test_logic.TestPowerArgs.test_unknown_kind_raises
+    #[test]
+    fn unknown_kind_raises() {
+        // Python raises KeyError; here the kind is refused (None) and nothing is scheduled
+        assert_eq!(power_args("hibernate", "shutdown.exe"), None);
+        let (f, r) = fake();
+        let a = acts(false, FAST, r);
+        assert!(a.power("hibernate").is_none());
+        assert!(a.pending().is_none());
+        std::thread::sleep(FAST * 3);
+        assert!(f.calls.lock().unwrap().is_empty());
+    }
+
+    // py: test_logic.TestPowerTimer.test_cancel_stops_it
+    #[test]
+    fn cancel_stops_it() {
+        let (f, r) = fake();
+        let a = acts(true, Duration::from_millis(200), r);
+        assert!(a.power("shutdown").is_some());
+        assert!(a.power("restart").is_none()); // one at a time
+        a.cancel_power();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(a.pending().is_none());
+        assert!(!a.has_fired());
+        assert!(f.calls.lock().unwrap().is_empty());
+    }
+
+    // py: test_logic.TestPowerTimer.test_dry_run_never_executes
+    #[test]
+    fn dry_run_never_executes() {
+        let (f, r) = fake();
+        let a = acts(true, Duration::from_millis(200), r);
+        a.power("shutdown");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(a.has_fired());
+        assert!(f.calls.lock().unwrap().is_empty());
     }
 }

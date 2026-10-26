@@ -565,7 +565,7 @@
       value = `se descarcă, ${n0.format(t.progress || 0)}%`;
       pct = t.progress;
     } else if (t.hr === 'safe') {
-      value = 'gata';
+      value = t.waiting_watch ? 'gata, aștept să-l vezi' : 'gata';
       pct = 100;
       tone = 'ok';
     } else {
