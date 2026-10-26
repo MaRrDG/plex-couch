@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-/// Shutdown signal for the loops (Python's `stop` Event). Clone one per job.
+/// Shutdown signal for the loops. Clone one per job.
 #[derive(Clone)]
 pub struct Stop {
     rx: watch::Receiver<bool>,

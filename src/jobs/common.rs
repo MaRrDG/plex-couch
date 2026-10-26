@@ -103,7 +103,7 @@ impl Quiet {
     }
 }
 
-/// `true` for a JSON number/bool/string that Python would call truthy as an id (`-not $q.movieId`).
+/// A usable id: a non-zero JSON integer (the scripts' `-not $q.movieId`).
 pub fn id_of(v: Option<&Value>) -> Option<i64> {
     v.and_then(Value::as_i64).filter(|n| *n != 0)
 }

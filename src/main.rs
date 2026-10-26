@@ -1,4 +1,4 @@
-// No console window when started by Task Scheduler (pythonw equivalent).
+// No console window when started by Task Scheduler.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {

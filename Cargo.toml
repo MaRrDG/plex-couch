@@ -56,7 +56,7 @@ lto = true
 codegen-units = 1
 strip = true
 # Unwind (not abort): a panic in one request handler is caught by its task and only drops
-# that connection, like the Python server's handle_error.
+# that connection.
 panic = "unwind"
 
 # PBKDF2 and RSA key generation are painfully slow unoptimised; keep tests fast.

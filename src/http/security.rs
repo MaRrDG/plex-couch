@@ -1,5 +1,5 @@
 //! Request-level security rules (spec 3.1, 3.2, 4.6, 4.7): the response security headers,
-//! the LAN-only client IP rule with Python's exact `ipaddress.is_private` semantics, the
+//! the LAN-only client IP rule (the IANA special-purpose registries behind `is_private`), the
 //! Host allowlist (DNS rebinding), the HTTPS redirect URL and the install page CSP.
 
 use base64::Engine;
@@ -33,7 +33,7 @@ fn v6_in(a: Ipv6Addr, net: &str, prefix: u32) -> bool {
     (u128::from(a) & mask) == (u128::from(n) & mask)
 }
 
-/// Python 3.12+ `IPv4Address.is_private`.
+/// `IPv4Address.is_private`: the IANA IPv4 special-purpose ranges that are not globally reachable.
 pub fn v4_is_private(a: Ipv4Addr) -> bool {
     const PRIVATE: [([u8; 4], u32); 14] = [
         ([0, 0, 0, 0], 8),
@@ -55,7 +55,7 @@ pub fn v4_is_private(a: Ipv4Addr) -> bool {
     PRIVATE.iter().any(|(n, p)| v4_in(a, *n, *p)) && !EXCEPTIONS.iter().any(|(n, p)| v4_in(a, *n, *p))
 }
 
-/// Python 3.12+ `IPv6Address.is_private` (for an address that is not IPv4-mapped).
+/// `IPv6Address.is_private` (for an address that is not IPv4-mapped).
 pub fn v6_is_private(a: Ipv6Addr) -> bool {
     const PRIVATE: [(&str, u32); 11] = [
         ("::1", 128),
@@ -81,7 +81,7 @@ pub fn v6_is_private(a: Ipv6Addr) -> bool {
     PRIVATE.iter().any(|(n, p)| v6_in(a, n, *p)) && !EXCEPTIONS.iter().any(|(n, p)| v6_in(a, n, *p))
 }
 
-/// Python `ipaddress.ip_address(s)`: a strict dotted quad (no leading zeros) or IPv6.
+/// `ip_address(s)`: a strict dotted quad (no leading zeros) or IPv6.
 pub fn parse_ip(s: &str) -> Option<IpAddr> {
     if s.contains(':') {
         s.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
@@ -124,7 +124,7 @@ pub fn is_private_client(ip: Option<&str>) -> bool {
     }
 }
 
-/// `ipaddress.ip_address(a).is_loopback` (no mapped unwrapping, like Python).
+/// `ip_address(a).is_loopback` (an IPv4-mapped address is not unwrapped).
 pub fn is_loopback_str(s: &str) -> bool {
     match parse_ip(s) {
         Some(IpAddr::V4(a)) => a.is_loopback(),
@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn python_is_private_table() {
+    fn is_private_table() {
         for a in ["0.1.2.3", "192.0.0.5", "192.0.0.171", "192.0.2.9", "198.19.1.1", "198.51.100.3",
                   "203.0.113.7", "240.0.0.1", "255.255.255.255"] {
             assert!(is_private_client(Some(a)), "{a}");
@@ -327,7 +327,7 @@ mod tests {
         assert!(host_allowed(Some("plexpc.lan:8766"), &["PlexPC.lan".into()]));
         assert!(host_allowed(Some("plexpc.lan"), &["plexpc.lan.".into()]));
         assert!(!host_allowed(Some("other.lan"), &["plexpc.lan".into()]));
-        // Python also passes None and 5: Config::allowed_hosts drops non-strings before this.
+        // None and 5 cannot reach this: Config::allowed_hosts drops non-strings before this.
         assert!(!host_allowed(Some("plexpc.lan"), &["".into()]));
     }
 
@@ -377,7 +377,7 @@ mod tests {
         assert!(csp.contains("style-src 'sha256-"));
         assert!(csp.contains("default-src 'none'"));
         assert!(!csp.contains("script-src"));
-        // python: base64.b64encode(hashlib.sha256(b"body{color:red}").digest())
+        // base64(sha256("body{color:red}"))
         assert!(csp.contains("'sha256-FcQqt3aNlV7AZnGV4zkQRVeCeJOxbMPnQSx258L803E='"), "{csp}");
         assert!(install_csp(b"<html></html>").contains("style-src 'none';"));
     }

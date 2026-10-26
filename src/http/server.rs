@@ -3,11 +3,11 @@
 //! - At most [`MAX_CONNECTIONS`] connections per listener; one more is closed right away
 //!   without a response.
 //! - [`CONNECTION_TIMEOUT`] (15 s) for the TLS handshake, for the request headers (the
-//!   keep-alive idle time included), for a request body and per blocked write (Python had
+//!   keep-alive idle time included), for a request body and per blocked write (the original had
 //!   one per-socket-operation timeout; see [`TimeoutIo`]).
 //! - The TLS handshake runs in the connection task, never in the accept loop.
 //! - A handler that panics drops its connection with no response; the panic is logged at
-//!   ERROR (`request error from <ip>`). Connection errors are not logged (Python: DEBUG).
+//!   ERROR (`request error from <ip>`). Connection errors are not logged (DEBUG).
 //! - HTTP/1.1 keep-alive, title-case header names, `Server: PlexCouch`, a `Date` header.
 
 use crate::app::AppState;
@@ -78,7 +78,7 @@ pub struct ConnCtx {
 // Binding and TLS
 // ---------------------------------------------------------------------------
 
-/// Bind `host:port`. Names resolve with IPv4 preferred (the Python server was AF_INET).
+/// Bind `host:port`. Names resolve with IPv4 preferred.
 pub fn bind(host: &str, port: u16) -> io::Result<std::net::TcpListener> {
     let mut addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()?.collect();
     addrs.sort_by_key(|a| !a.is_ipv4());
@@ -127,7 +127,7 @@ fn make_tls(cert: &Path, key: &Path) -> Result<TlsAcceptor, String> {
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|_| unreadable("SSLError"))?;
-    // No ALPN: HTTP/1.1 only, like the Python server.
+    // No ALPN: HTTP/1.1 only.
     Ok(TlsAcceptor::from(Arc::new(cfg)))
 }
 
@@ -305,8 +305,8 @@ where
     let _ = b.serve_connection(TokioIo::new(io), svc).await;
 }
 
-/// Log panics (Python: `log.exception`), in place of the default stderr hook (pythonw and a
-/// GUI-subsystem exe have no stderr).
+/// Log panics, in place of the default stderr hook (a
+/// GUI-subsystem exe has no stderr).
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let msg = info

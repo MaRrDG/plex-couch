@@ -1,4 +1,4 @@
-//! Plex `/status/sessions` parsing (logic.py:718-785; spec 5.1).
+//! Plex `/status/sessions` parsing (spec 5.1).
 
 use crate::json::{py_round, truthy};
 use crate::logic::images::poster_url;

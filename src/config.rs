@@ -14,7 +14,7 @@ pub const DEFAULT_FILELIST_REGEX: &str = r"thefl\.org|filelist\.(io|ro)|flro\.or
 /// Keys of `settings` the app writes itself (`SETTINGS_KEYS`); all are bools.
 pub const SETTINGS_KEYS: &[&str] = &["auto_monitors_off"];
 
-/// The defaults (config.py:10-68). Key order matters only for display.
+/// The defaults. Key order matters only for display.
 pub fn defaults() -> Value {
     json!({
         "app_name": DEFAULT_APP_NAME,
@@ -55,7 +55,7 @@ pub fn defaults() -> Value {
                 "api_key": "",
                 "config_yaml": "C:\\ProgramData\\Bazarr\\config\\config.yaml"
             },
-            // New in the Rust app (watchlist sync jobs); not in the Python defaults.
+            // Used only by the background jobs (watchlist sync, strip-dv, seed keeper).
             "sonarr": {
                 "url": "http://127.0.0.1:8989",
                 "api_key": "",
@@ -266,7 +266,7 @@ impl Config {
     pub fn update_settings(&self, changes: &[(&str, bool)]) -> io::Result<()> {
         let mut g = self.write();
         if !matches!(g.raw.get("settings"), Some(Value::Object(_))) {
-            // setdefault("settings", {}); Python would fail on a non-dict, we replace it.
+            // setdefault("settings", {}); a non-object value is replaced.
             g.raw.insert("settings".into(), json!({}));
         }
         if let Some(Value::Object(s)) = g.raw.get_mut("settings") {
@@ -498,7 +498,7 @@ fn split_drive(p: &str) -> (&str, &str) {
     ("", p)
 }
 
-/// `ntpath.isabs` (Python 3.13+): a drive or UNC share followed by a separator.
+/// Windows `isabs`: a drive or UNC share followed by a separator.
 pub fn is_abs(p: &str) -> bool {
     let (drive, rest) = split_drive(p);
     if drive.starts_with("\\\\") || drive.starts_with("//") {

@@ -1,4 +1,4 @@
-//! Python-like reads of upstream JSON (`d.get(k) or default`, `float(x or 0)`, `str(x)`).
+//! Lenient reads of upstream JSON (`d.get(k) or default`, `float(x or 0)`, `str(x)`).
 
 use crate::json::{py_int, py_str, truthy};
 use serde_json::Value;
@@ -39,7 +39,7 @@ pub fn i(v: Option<&Value>) -> i64 {
     }
 }
 
-/// A JSON value as a dict key (`2` and `"2"` differ, like Python).
+/// A JSON value as a map key (`2` and `"2"` differ).
 pub fn key(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_default()
 }

@@ -1,5 +1,5 @@
-//! App logic on top of the services. Pure functions are kept testable; the Python module
-//! each one ports is named in its header.
+//! App logic on top of the services. Pure functions are kept testable; each module
+//! names the spec section it implements in its header.
 
 pub mod demo;
 pub mod images;

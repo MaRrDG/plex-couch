@@ -1,4 +1,4 @@
-//! The shared application state (Python's `App`, app.py:158-178) and the auth flows that
+//! The shared application state and the auth flows that
 //! sit on it: sessions, login, logout everywhere.
 //!
 //! Phase 2 code receives `&Arc<AppState>` and reaches everything through it: the config,
@@ -33,7 +33,7 @@ pub type CancelFn = Arc<dyn Fn() -> CancelOutcome + Send + Sync>;
 pub type VerifyFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 pub type OwnIpsFn = Arc<dyn Fn() -> HashSet<String> + Send + Sync>;
 
-/// Test seams (the Python tests monkeypatch exactly these). All `None` in production.
+/// Test seams: tests replace exactly these. All `None` in production.
 #[derive(Default, Clone)]
 pub struct Overrides {
     /// Replaces `GET /api/status`'s body.

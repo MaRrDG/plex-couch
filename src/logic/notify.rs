@@ -1,5 +1,4 @@
-//! Notifications: movie ready, disk low, the test notification (spec 7; logic.py:903-990,
-//! app.py:386-456).
+//! Notifications: movie ready, disk low, the test notification (spec 7).
 //!
 //! The `notify` loop runs a tick at once, then every 60 s, skipped while the notifier is
 //! disabled. A tick writes `movie_ready` / `disk_low` to the state file *before* sending, so
@@ -505,7 +504,7 @@ mod tests {
         Upstreams { radarr, bazarr, movies, subs }
     }
 
-    /// The `AppCase` of test_notify.py: a dry-run app on a temp config whose ntfy server is
+    /// The `AppCase` of the notify tests: a dry-run app on a temp config whose ntfy server is
     /// a local fake (dry-run still posts to a loopback server).
     pub async fn app_case(up: &Upstreams, ntfy: &Fake) -> (Arc<AppState>, Arc<crate::config::Config>) {
         let cfg = testutil::config(json!({

@@ -2,7 +2,7 @@
 //! The token comes only from `services.plex.token` or HKCU (plan fix 24: one token source,
 //! always sent as a header, never in a URL).
 //!
-//! The session parsing (logic.py:746-785) is in [`crate::logic::plex`].
+//! The session parsing is in [`crate::logic::plex`].
 
 use crate::services::{Client, UpResult, TIMEOUT};
 use serde_json::Value;

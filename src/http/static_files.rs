@@ -1,4 +1,4 @@
-//! The static whitelist (app.py:61-83), embedded at build time. Exact path match only; no
+//! The static whitelist, embedded at build time. Exact path match only; no
 //! directory serving. `install.html` is only for the install listener, `fonts/OFL.txt` is
 //! never served.
 

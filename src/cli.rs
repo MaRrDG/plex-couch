@@ -1,5 +1,5 @@
-//! Command line and startup (spec 1.1, 1.2): the same flags as app.py, plus the
-//! `make-certs` subcommand (replaces tools/make_certs.py).
+//! Command line and startup (spec 1.1, 1.2): the app flags, plus the
+//! `make-certs` subcommand.
 //!
 //! ```text
 //! plex-couch [--host 0.0.0.0] [--port 8765] [--https-port N] [--cert F] [--key F] [--ca-cert F]
@@ -164,7 +164,7 @@ pub fn parse(args: &[String]) -> ParseOutcome {
     ParseOutcome::Run(a)
 }
 
-/// The folder of the executable (Python's `BASE_DIR`): default config and the log file.
+/// The folder of the executable: default config and the log file.
 pub fn app_dir() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -249,7 +249,7 @@ pub fn main(argv: Vec<String>) -> i32 {
     run(a)
 }
 
-/// Startup order of app.py main() (spec 1.2).
+/// Startup order (spec 1.2).
 pub fn run(a: Args) -> i32 {
     let dir = app_dir();
     let _ = crate::log::init_file(&dir.join(crate::log::LOG_FILE));

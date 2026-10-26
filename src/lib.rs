@@ -1,4 +1,4 @@
-//! Plex Couch: a LAN-only phone remote for a Plex PC (Rust rewrite of app.py).
+//! Plex Couch: a LAN-only phone remote for a Plex PC (ported from the former Python app).
 //!
 //! Behaviour reference: plans/rust-rewrite-spec.md. Module map:
 //! - [`cli`]: flags, startup order, `--set-pin`, `--setup-ntfy`, `make-certs` ([`certs`]).
@@ -9,7 +9,7 @@
 //! - [`app`]: `AppState`, shared by everything.
 //! - [`services`], [`logic`], [`system`], [`jobs`]: integrations, app logic, Windows
 //!   actions, background jobs (mostly Phase 2 stubs; see each module's TODOs).
-//! - [`json`]: Python-compatible JSON output and coercions.
+//! - [`json`]: the JSON output format and value coercions.
 
 pub mod app;
 pub mod auth;

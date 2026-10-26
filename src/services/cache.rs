@@ -1,4 +1,4 @@
-//! The TTL cache of services.py (`_TTLCache`): only successful results are stored, a failed
+//! The TTL cache of the upstream reads: only successful results are stored, a failed
 //! load is not cached, and there is no single-flight (two callers may both load).
 
 use crate::services::UpResult;

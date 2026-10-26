@@ -123,7 +123,7 @@ mod tests {
     const KEY: &[u8] = &[b'k'; 32];
 
     #[test]
-    fn key_matches_python() {
+    fn key_matches_reference() {
         let k = session_key("secret", "pbkdf2_sha256$1000$aa$bb");
         assert_eq!(hex(&k), "10f2246d55afe082bc7f315144efb50bbfd3786dc99e35df7936b06c0a8bd454");
     }

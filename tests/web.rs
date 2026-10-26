@@ -1,4 +1,4 @@
-//! Ports of the server-level and tooling cases of tests/test_web.py (pure ones live next to
+//! Server-level and tooling web tests (pure ones live next to
 //! their code: http::security, http::static_files, cli, certs), plus end-to-end checks of
 //! the HTTPS listener with certificates from `make-certs`.
 
@@ -136,7 +136,7 @@ fn every_token_is_a_variable() {
 }
 
 // ---------------------------------------------------------------------------
-// Extra (not in the Python suite): response rules the routes rely on
+// Extra (not in the original suite): response rules the routes rely on
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -161,7 +161,7 @@ fn static_and_security_headers() {
     assert_eq!(h.status, 200);
     let g = srv.req("GET", "/app.js").send();
     assert_eq!(h.header("Content-Length"), Some(g.body.len().to_string().as_str()));
-    // JSON: no-store, Python separators
+    // JSON: no-store, ", " and ": " separators
     let r = srv.req("GET", "/api/status").send();
     assert_eq!(r.status, 401);
     assert_eq!(r.header("Cache-Control"), Some("no-store"));

@@ -2,7 +2,7 @@
 //!
 //! - [`uptime_seconds`]: `GetTickCount64() / 1000`.
 //! - [`disks`]: per configured letter, `GetDiskFreeSpaceExW` on `<letter>\`;
-//!   `{"drive", "free_gb", "total_gb", "used_pct"}` rounded like Python; an error skips it.
+//!   `{"drive", "free_gb", "total_gb", "used_pct"}` rounded half to even; an error skips it.
 //! - [`free_gb`]: the same, unrounded, None on error.
 //! - [`own_ipv4s`]: every IPv4 of the host name plus the local address of a UDP "connect"
 //!   to 10.255.255.255:1 (no packet is sent).
