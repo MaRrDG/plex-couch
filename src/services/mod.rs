@@ -11,12 +11,15 @@
 //!
 //! API keys and tokens are never logged or returned; failures are logged by type only.
 
+pub mod arr_jobs;
 pub mod bazarr;
 pub mod cache;
 pub mod keys;
 pub mod ntfy;
 pub mod plex;
+pub mod plex_jobs;
 pub mod prowlarr;
+pub mod qbit_jobs;
 pub mod qbittorrent;
 pub mod radarr;
 pub mod sonarr;
