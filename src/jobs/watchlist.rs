@@ -8,11 +8,15 @@
 //!    to series by ID" (Sonarr) and `importBlocked`: GET manualimport for that download,
 //!    import the files without rejections (`ManualImport`, `importMode: auto`).
 //! 3. Sonarr cleanup: delete (`deleteFiles=true`) every series that came from the Plex
-//!    Watchlist and is no longer on it. Sonarr keeps no "added by list" marker on a
-//!    series, so a series counts as "from the Watchlist" when its tvdb id was seen on the
-//!    Watchlist at least once (`state.local.json` key `watchlist.seen_tvdb`). Guards: a
-//!    failed, partial or empty Watchlist fetch, or a failed Sonarr series fetch, deletes
-//!    nothing; a series whose title is still on the Watchlist is kept.
+//!    Watchlist and is no longer on it. A candidate carries the Sonarr tag
+//!    `plex-watchlist` (set on the import list; looked up by label each tick, no tag ->
+//!    nothing deleted) AND its tvdb id was seen on the Watchlist at least once
+//!    (`watchlist.seen_tvdb` in the state file). Still on the list = same tvdb, tmdb or
+//!    imdb id, or the same title without a trailing `(...)`. Guards: a failed, partial,
+//!    shifting or empty Watchlist fetch, a show without a tvdb id, a failed Sonarr fetch or
+//!    an unreadable state file delete nothing; a series is deleted only after it was absent
+//!    in 2+ successful fetches at least 5 min apart (`watchlist.missing`); more than 2
+//!    deletions in one tick delete none and send one ntfy warning.
 //! 4. Next season: for those series still on the Watchlist, when every episode but the
 //!    last 2 of the highest monitored season is watched in Plex (section 2, matched by file
 //!    path, `viewCount > 0`), monitor the next season (if it has aired episodes), run
@@ -28,7 +32,7 @@ use crate::log_info;
 use crate::services::arr_jobs::Arr;
 use crate::services::plex_jobs::{path_key, PlexJobs, WatchItem, DISCOVER_URL};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,7 +58,7 @@ pub fn spawn(app: Arc<AppState>, mut stop: Stop) {
         }
         let mut mem = Mem::default();
         loop {
-            tick(&app, &mut mem).await;
+            tick(&app, &mut mem, unix_now()).await;
             if stop.sleep(INTERVAL).await {
                 return;
             }
@@ -63,7 +67,7 @@ pub fn spawn(app: Arc<AppState>, mut stop: Stop) {
 }
 
 /// One run of every step (errors are logged and never stop the loop).
-pub async fn tick(app: &AppState, mem: &mut Mem) {
+pub async fn tick(app: &AppState, mem: &mut Mem, now: f64) {
     let verbose = app.dry_run || mem.ticks.is_multiple_of(VERBOSE_EVERY);
     mem.ticks += 1;
     let radarr = Arr::radarr(app.services.radarr.c.clone());
@@ -88,7 +92,7 @@ pub async fn tick(app: &AppState, mem: &mut Mem) {
         }
     };
     let Some(series) = sonarr_series(&sonarr, &mut mem.quiet).await else { return };
-    let kept = sonarr_cleanup(app, &sonarr, watch.as_deref(), &series, verbose).await;
+    let kept = sonarr_cleanup(app, &sonarr, watch.as_deref(), &series, now, &mut mem.quiet).await;
     if verbose {
         let (items, shows) = watch.as_deref().map(|w| (w.len(), w.iter().filter(|i| i.kind == "show").count())).unwrap_or((0, 0));
         log_info!(
@@ -98,7 +102,7 @@ pub async fn tick(app: &AppState, mem: &mut Mem) {
         );
     }
     if let Some(w) = watch.as_deref() {
-        next_season(app, &sonarr, &plex, w, &kept, &mut mem.quiet).await;
+        next_season(app, &sonarr, &plex, w, &kept, now as i64, &mut mem.quiet).await;
     }
 }
 
@@ -265,105 +269,232 @@ async fn sonarr_series(sonarr: &Arr, quiet: &mut Quiet) -> Option<Vec<Value>> {
 }
 
 /// `watchlist` in the state file.
-fn load_state(app: &AppState) -> (BTreeSet<i64>, BTreeSet<String>) {
-    let st = app.state_file.load();
-    let w = st.get(STATE_KEY);
-    let seen = w
-        .and_then(|w| w.get("seen_tvdb"))
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_i64).collect())
-        .unwrap_or_default();
-    let done = w
-        .and_then(|w| w.get("next_season"))
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    (seen, done)
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct WState {
+    /// tvdb ids ever seen on the Watchlist.
+    pub seen: BTreeSet<i64>,
+    /// `tvdb:season` keys of next seasons already started.
+    pub done: BTreeSet<String>,
+    /// tvdb id -> (first missing at, successful fetches it was missing in, last of them).
+    pub missing: BTreeMap<i64, (f64, u32, f64)>,
+    /// The "too many deletions" warning was sent and the condition has not cleared.
+    pub cap_warned: bool,
 }
 
-fn save_state(app: &AppState, seen: &BTreeSet<i64>, done: &BTreeSet<String>) {
-    let mut m = Map::new();
-    m.insert(STATE_KEY.into(), json!({"seen_tvdb": seen, "next_season": done}));
-    app.state_file.update(m);
-}
-
-/// What the cleanup decided for one Sonarr series.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// Still on the Watchlist (or never seen there: not ours).
-    Keep,
-    Delete,
-}
-
-/// Pure decision: `shows` = tvdb ids of the shows now on the Watchlist (None: the fetch
-/// failed or returned nothing at all), `seen` = tvdb ids ever seen there.
-pub fn cleanup_verdicts(
-    series: &[Value],
-    watch: Option<&[WatchItem]>,
-    seen: &BTreeSet<i64>,
-) -> Option<Vec<(i64, String, Verdict)>> {
-    let w = watch.filter(|w| !w.is_empty())?;
-    let shows: Vec<&WatchItem> = w.iter().filter(|i| i.kind == "show").collect();
-    let on_list: HashSet<i64> = shows.iter().filter_map(|s| s.tvdb()).collect();
-    let titles: HashSet<String> = shows.iter().map(|s| s.title.trim().to_lowercase()).collect();
-    Some(
-        series
-            .iter()
-            .filter_map(|s| {
-                let id = id_of(s.get("id"))?;
-                let tvdb = id_of(s.get("tvdbId"))?;
-                let title = s.get("title").and_then(Value::as_str).unwrap_or("").to_string();
-                let gone = seen.contains(&tvdb) && !on_list.contains(&tvdb) && !titles.contains(&title.trim().to_lowercase());
-                Some((id, title, if gone { Verdict::Delete } else { Verdict::Keep }))
+impl WState {
+    /// Only a missing file is empty; an unreadable state file is an error (skip the step).
+    pub fn load(app: &AppState) -> Result<WState, &'static str> {
+        let st = app.state_file.try_load()?;
+        let w = st.get(STATE_KEY);
+        let arr = |k: &str| w.and_then(|w| w.get(k)).and_then(Value::as_array).cloned().unwrap_or_default();
+        let missing = w
+            .and_then(|w| w.get("missing"))
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        let n = |f: &str| v.get(f).and_then(Value::as_f64);
+                        Some((k.parse().ok()?, (n("since")?, n("count")? as u32, n("last")?)))
+                    })
+                    .collect()
             })
-            .collect(),
-    )
+            .unwrap_or_default();
+        Ok(WState {
+            seen: arr("seen_tvdb").iter().filter_map(Value::as_i64).collect(),
+            done: arr("next_season").iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+            missing,
+            cap_warned: w.and_then(|w| w.get("cap_warned")).and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
+
+    pub fn save(&self, app: &AppState) {
+        let missing: Map<String, Value> = self
+            .missing
+            .iter()
+            .map(|(k, (since, count, last))| (k.to_string(), json!({"since": since, "count": count, "last": last})))
+            .collect();
+        let mut m = Map::new();
+        m.insert(
+            STATE_KEY.into(),
+            json!({"seen_tvdb": self.seen, "next_season": self.done, "missing": missing, "cap_warned": self.cap_warned}),
+        );
+        app.state_file.update(m);
+    }
 }
 
-/// Returns the series ids that stay (and came from the Watchlist), for the next-season step.
-async fn sonarr_cleanup(app: &AppState, sonarr: &Arr, watch: Option<&[WatchItem]>, series: &[Value], verbose: bool) -> Vec<i64> {
-    let (mut seen, done) = load_state(app);
-    if let Some(w) = watch.filter(|w| !w.is_empty()) {
-        let before = seen.len();
-        seen.extend(w.iter().filter(|i| i.kind == "show").filter_map(WatchItem::tvdb));
-        if seen.len() != before {
-            save_state(app, &seen, &done);
+/// Lower-case, collapsed spaces, trailing `(...)` groups (year, country) removed.
+pub fn norm_title(t: &str) -> String {
+    let mut s = t.trim().to_lowercase();
+    while s.ends_with(')') {
+        match s.rfind('(') {
+            Some(i) if i > 0 => s = s[..i].trim_end().to_string(),
+            _ => break,
         }
     }
-    let Some(verdicts) = cleanup_verdicts(series, watch, &seen) else {
-        let ours = series.iter().filter(|s| id_of(s.get("tvdbId")).is_some_and(|t| seen.contains(&t))).count();
-        if ours > 0 && verbose {
-            log_info!("watchlist: Plex Watchlist unavailable or empty, Sonarr cleanup skipped ({ours} list series kept)");
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A Sonarr series the cleanup may consider: from the list (tag) and seen on the Watchlist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ours {
+    pub id: i64,
+    pub title: String,
+    pub tvdb: i64,
+    pub on_list: bool,
+}
+
+/// Which of our series are still on the Watchlist (by tvdb, tmdb, imdb or normalized
+/// title). Err (abort the whole cleanup) when the Watchlist is empty or any show on it has
+/// no parseable tvdb id.
+pub fn classify(series: &[Value], watch: &[WatchItem], seen: &BTreeSet<i64>, tag: i64) -> Result<Vec<Ours>, String> {
+    if watch.is_empty() {
+        return Err("the Plex Watchlist is empty".into());
+    }
+    let shows: Vec<&WatchItem> = watch.iter().filter(|i| i.kind == "show").collect();
+    if let Some(s) = shows.iter().find(|s| s.tvdb().is_none()) {
+        return Err(format!("the Watchlist show '{}' has no tvdb id", s.title));
+    }
+    let tvdbs: HashSet<i64> = shows.iter().filter_map(|s| s.tvdb()).collect();
+    let tmdbs: HashSet<i64> = shows.iter().filter_map(|s| s.tmdb()).collect();
+    let imdbs: HashSet<String> = shows.iter().filter_map(|s| s.imdb()).collect();
+    let titles: HashSet<String> = shows.iter().map(|s| norm_title(&s.title)).filter(|t| !t.is_empty()).collect();
+    Ok(series
+        .iter()
+        .filter_map(|s| {
+            let id = id_of(s.get("id"))?;
+            let tvdb = id_of(s.get("tvdbId"))?;
+            let tagged = s.get("tags").and_then(Value::as_array).is_some_and(|t| t.iter().any(|x| x.as_i64() == Some(tag)));
+            if !tagged || !seen.contains(&tvdb) {
+                return None;
+            }
+            let title = s.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+            let imdb = s.get("imdbId").and_then(Value::as_str).map(|x| x.trim().to_lowercase()).filter(|x| !x.is_empty());
+            let on_list = tvdbs.contains(&tvdb)
+                || id_of(s.get("tmdbId")).is_some_and(|t| tmdbs.contains(&t))
+                || imdb.is_some_and(|i| imdbs.contains(&i))
+                || titles.contains(&norm_title(&title));
+            Some(Ours { id, title, tvdb, on_list })
+        })
+        .collect())
+}
+
+/// Grace rule: missing in at least this many successful complete fetches...
+pub const GRACE_FETCHES: u32 = 2;
+/// ... spanning at least this long.
+pub const GRACE_SECONDS: f64 = 300.0;
+/// More deletions than this in one tick: delete none and warn.
+pub const MAX_DELETES: usize = 2;
+pub const LIST_TAG: &str = "plex-watchlist";
+
+/// Update the missing counters for one successful complete fetch; returns the series due.
+pub fn due_for_delete(st: &mut WState, ours: &[Ours], now: f64) -> Vec<Ours> {
+    let absent: HashSet<i64> = ours.iter().filter(|o| !o.on_list).map(|o| o.tvdb).collect();
+    st.missing.retain(|t, _| absent.contains(t));
+    let mut due = Vec::new();
+    for o in ours.iter().filter(|o| !o.on_list) {
+        let e = st.missing.entry(o.tvdb).or_insert((now, 0, now));
+        e.1 += 1;
+        e.2 = now;
+        if e.1 >= GRACE_FETCHES && now - e.0 >= GRACE_SECONDS {
+            due.push(o.clone());
         }
+    }
+    due
+}
+
+/// Returns the series ids that stay (from the list, still on the Watchlist), for the
+/// next-season step. Any doubt deletes nothing.
+async fn sonarr_cleanup(
+    app: &AppState,
+    sonarr: &Arr,
+    watch: Option<&[WatchItem]>,
+    series: &[Value],
+    now: f64,
+    quiet: &mut Quiet,
+) -> Vec<i64> {
+    let mut st = match WState::load(app) {
+        Ok(s) => s,
+        Err(t) => {
+            quiet.warn("wl-state", format!("watchlist: the state file is unreadable ({t}), Sonarr cleanup skipped"));
+            return Vec::new();
+        }
+    };
+    let Some(w) = watch.filter(|w| !w.is_empty()) else {
+        quiet.warn("wl-clean", "watchlist: Plex Watchlist unavailable or empty, Sonarr cleanup skipped".into());
         return Vec::new();
     };
-    let mut kept = Vec::new();
-    for (id, title, v) in verdicts {
-        let tvdb = series.iter().find(|s| id_of(s.get("id")) == Some(id)).and_then(|s| id_of(s.get("tvdbId")));
-        match v {
-            Verdict::Keep => {
-                if tvdb.is_some_and(|t| seen.contains(&t)) {
-                    kept.push(id);
-                }
-            }
-            Verdict::Delete if app.dry_run => {
-                log_info!("dry-run: would delete Sonarr series '{title}' ({id}) with its files: no longer on the Plex Watchlist");
-            }
-            Verdict::Delete => match sonarr.delete_series(id).await {
-                Ok(()) => {
-                    log_info!("watchlist: deleted Sonarr series '{title}' ({id}) with its files: no longer on the Plex Watchlist");
-                    if let Some(t) = tvdb {
-                        let (mut s2, d2) = load_state(app);
-                        s2.remove(&t);
-                        save_state(app, &s2, &d2);
-                        seen.remove(&t);
-                    }
-                }
-                Err(e) => log_info!("watchlist: deleting Sonarr series '{title}' ({id}) failed: {e}"),
-            },
+    let tag = match sonarr.tag_id(LIST_TAG).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            quiet.warn("wl-clean", format!("watchlist: Sonarr has no '{LIST_TAG}' tag, Sonarr cleanup skipped"));
+            return Vec::new();
+        }
+        Err(e) => {
+            quiet.warn("wl-clean", format!("watchlist: Sonarr tags failed, Sonarr cleanup skipped: {e}"));
+            return Vec::new();
+        }
+    };
+    let shows: Vec<&WatchItem> = w.iter().filter(|i| i.kind == "show").collect();
+    if shows.iter().all(|s| s.tvdb().is_some()) {
+        let before = st.seen.len();
+        st.seen.extend(shows.iter().filter_map(|s| s.tvdb()));
+        if st.seen.len() != before {
+            st.save(app);
         }
     }
-    kept
+    let ours = match classify(series, w, &st.seen, tag) {
+        Ok(o) => o,
+        Err(r) => {
+            quiet.warn("wl-clean", format!("watchlist: {r}, Sonarr cleanup skipped"));
+            return Vec::new();
+        }
+    };
+    quiet.clear("wl-clean");
+    let due = due_for_delete(&mut st, &ours, now);
+    if due.len() > MAX_DELETES {
+        let names: Vec<&str> = due.iter().map(|o| o.title.as_str()).collect();
+        log_info!("watchlist: {} series would be deleted at once ({}), deleting none", due.len(), names.join(", "));
+        if !st.cap_warned {
+            st.cap_warned = true;
+            let msg = format!(
+                "{} seriale au dispărut deodată din Plex Watchlist; nu am șters nimic din Sonarr. Verifică lista.",
+                due.len()
+            );
+            if app.dry_run {
+                log_info!("dry-run: would notify 'Watchlist': {msg}");
+            } else {
+                let tags = Some(vec!["warning".to_string()]);
+                app.notifier.send("Watchlist", &msg, tags, Some(json!("high")), crate::services::ntfy::TIMEOUT).await;
+            }
+        }
+        st.save(app);
+        return ours.iter().filter(|o| o.on_list).map(|o| o.id).collect();
+    }
+    st.cap_warned = false;
+    for o in &due {
+        if app.dry_run {
+            log_info!("dry-run: would delete Sonarr series '{}' ({}) with its files: no longer on the Plex Watchlist", o.title, o.id);
+            continue;
+        }
+        match sonarr.delete_series(o.id).await {
+            Ok(()) => {
+                log_info!("watchlist: deleted Sonarr series '{}' ({}) with its files: no longer on the Plex Watchlist", o.title, o.id);
+                st.missing.remove(&o.tvdb);
+                st.seen.remove(&o.tvdb);
+            }
+            Err(e) => log_info!("watchlist: deleting Sonarr series '{}' ({}) failed: {e}", o.title, o.id),
+        }
+    }
+    for o in ours.iter().filter(|o| !o.on_list && !due.contains(o)) {
+        let (since, count, _) = st.missing.get(&o.tvdb).copied().unwrap_or((now, 0, now));
+        log_info!(
+            "watchlist: Sonarr series '{}' is off the Plex Watchlist ({count} check(s), first {:.0} s ago), waiting before deleting",
+            o.title,
+            now - since
+        );
+    }
+    st.save(app);
+    ours.iter().filter(|o| o.on_list).map(|o| o.id).collect()
 }
 
 /// The decision for one series: `Some((next season, aired episode ids, needs monitoring,
@@ -421,7 +552,7 @@ pub fn next_season_plan(
     Some((next, ids, !monitored, missing))
 }
 
-async fn next_season(app: &AppState, sonarr: &Arr, plex: &PlexJobs, watch: &[WatchItem], kept: &[i64], quiet: &mut Quiet) {
+async fn next_season(app: &AppState, sonarr: &Arr, plex: &PlexJobs, watch: &[WatchItem], kept: &[i64], now: i64, quiet: &mut Quiet) {
     if kept.is_empty() {
         return;
     }
@@ -436,7 +567,6 @@ async fn next_season(app: &AppState, sonarr: &Arr, plex: &PlexJobs, watch: &[Wat
             return;
         }
     };
-    let now = unix_now() as i64;
     for &id in kept {
         let series = match sonarr.series(id).await {
             Ok(s) => s,
@@ -456,8 +586,11 @@ async fn next_season(app: &AppState, sonarr: &Arr, plex: &PlexJobs, watch: &[Wat
             .collect();
         let Some((season, ep_ids, monitor, search)) = next_season_plan(&series, &eps, &files, &views, now) else { continue };
         let key = format!("{tvdb}:{season}");
-        let (seen, mut done) = load_state(app);
-        if done.contains(&key) {
+        let Ok(mut st) = WState::load(app) else {
+            quiet.warn("wl-state", "watchlist: the state file is unreadable, next season check skipped".into());
+            return;
+        };
+        if st.done.contains(&key) {
             continue;
         }
         let title = series.get("title").and_then(Value::as_str).unwrap_or("").to_string();
@@ -492,8 +625,8 @@ async fn next_season(app: &AppState, sonarr: &Arr, plex: &PlexJobs, watch: &[Wat
             }
         }
         // Remember before notifying, so a crash never repeats the message.
-        done.insert(key);
-        save_state(app, &seen, &done);
+        st.done.insert(key);
+        st.save(app);
         log_info!("watchlist: next season {season} of '{title}' started (monitored: {monitor}, SeasonSearch: {search})");
         if monitor || search {
             let msg = format!("Sezonul {season} din {title} se descarcă");
@@ -514,17 +647,19 @@ mod tests {
     }
 
     fn show(title: &str, tvdb: i64) -> Value {
-        json!({"type": "show", "title": title, "Guid": [{"id": "imdb://tt1"}, {"id": format!("tvdb://{tvdb}")}]})
+        json!({"type": "show", "title": title, "ratingKey": format!("s{tvdb}"),
+               "Guid": [{"id": format!("imdb://tt{tvdb}")}, {"id": format!("tvdb://{tvdb}")}]})
     }
 
     fn movie(title: &str) -> Value {
-        json!({"type": "movie", "title": title, "Guid": [{"id": "tmdb://1"}, {"id": "tvdb://5000"}]})
+        json!({"type": "movie", "title": title, "ratingKey": format!("m{title}"), "Guid": [{"id": "tmdb://1"}, {"id": "tvdb://5000"}]})
     }
 
     /// A world for one test: answers by path; `watchlist` may be swapped.
     struct World {
         watchlist: Mutex<Resp>,
         series: Mutex<Value>,
+        tags: Mutex<Value>,
         radarr_queue: Value,
         sonarr_queue: Value,
         manual: Value,
@@ -537,6 +672,7 @@ mod tests {
         World {
             watchlist: Mutex::new(ok(wl(json!([movie("Dune"), show("Show A", 100)])))),
             series: Mutex::new(json!([])),
+            tags: Mutex::new(json!([{"id": 3, "label": "other"}, {"id": 1, "label": "plex-watchlist"}])),
             radarr_queue: json!({"records": []}),
             sonarr_queue: json!({"records": []}),
             manual: json!([]),
@@ -562,6 +698,9 @@ mod tests {
                 } else {
                     ok(json!([{"id": 7, "name": "Plex Watchlist", "enableAutomaticAdd": true}, {"id": 8, "name": "Off", "enableAutomaticAdd": false}]))
                 };
+            }
+            if p == "/api/v3/tag" {
+                return ok(w.tags.lock().unwrap().clone());
             }
             if p.starts_with("/api/v3/queue") {
                 return ok(if radarr { w.radarr_queue.clone() } else { w.sonarr_queue.clone() });
@@ -591,16 +730,22 @@ mod tests {
         .await
     }
 
+    const T0: f64 = 1_793_000_000.0;
+
     async fn run(w: World, dry: bool) -> (Fake, Arc<AppState>, Arc<World>) {
         let w = Arc::new(w);
         let f = serve(w.clone()).await;
         let (a, _d) = app(&f.base, dry, json!({}));
-        tick(&a, &mut Mem::default()).await;
+        tick(&a, &mut Mem::default(), T0).await;
         (f, a, w)
     }
 
     fn sonarr_series_json(id: i64, title: &str, tvdb: i64) -> Value {
-        json!({"id": id, "title": title, "tvdbId": tvdb, "seasons": [{"seasonNumber": 1, "monitored": true}]})
+        json!({"id": id, "title": title, "tvdbId": tvdb, "tags": [1], "seasons": [{"seasonNumber": 1, "monitored": true}]})
+    }
+
+    fn deleted(f: &Fake) -> Vec<String> {
+        f.find("DELETE", "/api/v3/series").iter().map(|r| r.path.clone()).collect()
     }
 
     #[tokio::test]
@@ -621,68 +766,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sonarr_cleanup_deletes_only_seen_series_gone_from_the_list() {
+    async fn sonarr_cleanup_waits_two_fetches_five_minutes_apart_and_needs_the_tag() {
         let w = world();
+        let mut untagged = sonarr_series_json(4, "Untagged", 200);
+        untagged["tags"] = json!([3]);
         *w.series.lock().unwrap() = json!([
             sonarr_series_json(1, "Show A", 100),
             sonarr_series_json(2, "Show B", 200),
-            sonarr_series_json(3, "Manual", 300)
+            sonarr_series_json(3, "Manual", 300),
+            untagged
         ]);
         let w = Arc::new(w);
         let f = serve(w.clone()).await;
         let (a, _d) = app(&f.base, false, json!({}));
-        // Seen: A and B on the Watchlist.
+        let mut m = Mem::default();
         *w.watchlist.lock().unwrap() = ok(wl(json!([show("Show A", 100), show("Show B", 200)])));
-        tick(&a, &mut Mem::default()).await;
-        assert!(f.find("DELETE", "/api/v3/series").is_empty());
-        // B leaves the Watchlist: only B is deleted (series 3 was never on it).
+        tick(&a, &mut m, T0).await; // seen: A and B
         *w.watchlist.lock().unwrap() = ok(wl(json!([movie("Dune"), show("Show A", 100)])));
-        tick(&a, &mut Mem::default()).await;
-        let del = f.find("DELETE", "/api/v3/series");
-        assert_eq!(del.len(), 1);
-        assert_eq!(del[0].path, "/api/v3/series/2?deleteFiles=true&addImportListExclusion=false");
-        assert_eq!(del[0].header("x-api-key"), Some("sonarr-key"));
-        let st = a.state_file.load();
-        assert_eq!(st["watchlist"]["seen_tvdb"], json!([100]));
+        tick(&a, &mut m, T0 + 180.0).await; // B missing once
+        assert!(deleted(&f).is_empty());
+        tick(&a, &mut m, T0 + 360.0).await; // twice, but only 3 min apart
+        assert!(deleted(&f).is_empty());
+        tick(&a, &mut m, T0 + 540.0).await; // 3 times over 6 min: delete B only
+        assert_eq!(deleted(&f), vec!["/api/v3/series/2?deleteFiles=true&addImportListExclusion=false".to_string()]);
+        assert_eq!(f.find("DELETE", "")[0].header("x-api-key"), Some("sonarr-key"));
+        let st = WState::load(&a).unwrap();
+        assert_eq!(st.seen, BTreeSet::from([100]));
+        assert!(st.missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn seen_again_resets_the_grace() {
+        let w = world();
+        *w.series.lock().unwrap() = json!([sonarr_series_json(1, "Show A", 100), sonarr_series_json(2, "Show B", 200)]);
+        let w = Arc::new(w);
+        let f = serve(w.clone()).await;
+        let (a, _d) = app(&f.base, false, json!({}));
+        let mut m = Mem::default();
+        let both = ok(wl(json!([show("Show A", 100), show("Show B", 200)])));
+        let only_a = ok(wl(json!([show("Show A", 100)])));
+        for (t, list) in [(0.0, &both), (180.0, &only_a), (360.0, &both), (540.0, &only_a), (720.0, &only_a)] {
+            *w.watchlist.lock().unwrap() = list.clone();
+            tick(&a, &mut m, T0 + t).await;
+        }
+        assert!(deleted(&f).is_empty(), "the second absence started over at +540");
+        tick(&a, &mut m, T0 + 900.0).await;
+        assert_eq!(deleted(&f).len(), 1);
+    }
+
+    /// Seen at T0, then `bad` answers for the next ticks: nothing may be deleted.
+    async fn never_deletes(seed: Value, bad: Resp, tags: Value) {
+        let w = world();
+        *w.series.lock().unwrap() = json!([sonarr_series_json(1, "Show A", 100), sonarr_series_json(2, "Show B", 200)]);
+        let w = Arc::new(w);
+        let f = serve(w.clone()).await;
+        let (a, _d) = app(&f.base, false, json!({}));
+        let mut m = Mem::default();
+        *w.watchlist.lock().unwrap() = ok(wl(seed));
+        tick(&a, &mut m, T0).await;
+        *w.watchlist.lock().unwrap() = bad.clone();
+        *w.tags.lock().unwrap() = tags;
+        for t in 1..6 {
+            tick(&a, &mut m, T0 + 400.0 * t as f64).await;
+        }
+        assert!(f.find("DELETE", "").is_empty(), "case {:?} {}", bad.0, bad.1);
+    }
+
+    fn tag() -> Value {
+        json!([{"id": 1, "label": "plex-watchlist"}])
     }
 
     #[tokio::test]
     async fn outage_guard_deletes_nothing() {
-        for outage in [status(500), ok(wl(json!([]))), ok(json!({"nope": 1})), (200, String::new(), vec![])] {
-            let w = world();
-            *w.series.lock().unwrap() = json!([sonarr_series_json(1, "Show A", 100)]);
-            let w = Arc::new(w);
-            let f = serve(w.clone()).await;
-            let (a, _d) = app(&f.base, false, json!({}));
-            tick(&a, &mut Mem::default()).await; // seen
-            *w.watchlist.lock().unwrap() = outage.clone();
-            tick(&a, &mut Mem::default()).await;
-            assert!(f.find("DELETE", "").is_empty(), "outage {:?}", outage.0);
+        let seed = json!([show("Show A", 100), show("Show B", 200)]);
+        for bad in [status(500), ok(wl(json!([]))), ok(json!({"nope": 1})), (200, String::new(), vec![])] {
+            never_deletes(seed.clone(), bad, tag()).await;
         }
+        // totalSize says 5 but the pages end after nothing.
+        never_deletes(seed.clone(), ok(json!({"MediaContainer": {"totalSize": 5, "size": 0, "Metadata": []}})), tag()).await;
     }
 
     #[tokio::test]
-    async fn partial_watchlist_page_is_an_error() {
+    async fn a_show_without_tvdb_aborts_the_cleanup() {
+        let seed = json!([show("Show A", 100), show("Show B", 200)]);
+        let broken = json!({"type": "show", "title": "Odd", "ratingKey": "x", "Guid": [{"id": "tvdb://"}]});
+        never_deletes(seed, ok(wl(json!([show("Show A", 100), broken]))), tag()).await;
+    }
+
+    #[tokio::test]
+    async fn no_list_tag_deletes_nothing() {
+        let seed = json!([show("Show A", 100), show("Show B", 200)]);
+        never_deletes(seed.clone(), ok(wl(json!([show("Show A", 100)]))), json!([{"id": 3, "label": "other"}])).await;
+        never_deletes(seed, ok(wl(json!([show("Show A", 100)]))), json!({"bad": true})).await;
+    }
+
+    #[test]
+    fn still_on_the_list_by_any_id_or_title() {
+        let seen: BTreeSet<i64> = [100, 200, 300, 400].into();
+        let mut s = vec![
+            sonarr_series_json(1, "Show A", 100),
+            sonarr_series_json(2, "The Office (US)", 200),
+            sonarr_series_json(3, "By Imdb", 300),
+            sonarr_series_json(4, "By Tmdb", 400),
+        ];
+        s[2]["imdbId"] = json!("TT777");
+        s[3]["tmdbId"] = json!(55);
+        let w = |title: &str, guids: &[&str]| WatchItem { kind: "show".into(), title: title.into(), guids: guids.iter().map(|g| g.to_string()).collect() };
+        let watch = vec![
+            w("the office", &["tvdb://999"]),
+            w("Something", &["tvdb://998", "imdb://tt777"]),
+            w("Else", &["tvdb://997", "tmdb://55"]),
+        ];
+        let v = classify(&s, &watch, &seen, 1).unwrap();
+        let on: Vec<(i64, bool)> = v.iter().map(|o| (o.id, o.on_list)).collect();
+        assert_eq!(on, vec![(1, false), (2, true), (3, true), (4, true)]);
+        assert_eq!(norm_title("  The Office (US) (2005) "), "the office");
+        assert_eq!(norm_title("Dark"), "dark");
+    }
+
+    #[tokio::test]
+    async fn more_than_two_deletions_delete_none_and_warn_once() {
         let w = world();
-        *w.series.lock().unwrap() = json!([sonarr_series_json(1, "Show A", 100)]);
+        *w.series.lock().unwrap() = json!([
+            sonarr_series_json(1, "A", 100), sonarr_series_json(2, "B", 200),
+            sonarr_series_json(3, "C", 300), sonarr_series_json(4, "D", 400)
+        ]);
         let w = Arc::new(w);
         let f = serve(w.clone()).await;
         let (a, _d) = app(&f.base, false, json!({}));
-        tick(&a, &mut Mem::default()).await;
-        // totalSize says 5 but every page is empty after the first item.
-        *w.watchlist.lock().unwrap() =
-            ok(json!({"MediaContainer": {"totalSize": 5, "size": 0, "Metadata": []}}));
-        tick(&a, &mut Mem::default()).await;
+        let mut m = Mem::default();
+        *w.watchlist.lock().unwrap() = ok(wl(json!([show("A", 100), show("B", 200), show("C", 300), show("D", 400)])));
+        tick(&a, &mut m, T0).await;
+        *w.watchlist.lock().unwrap() = ok(wl(json!([show("A", 100)])));
+        for t in 1..6 {
+            tick(&a, &mut m, T0 + 400.0 * t as f64).await;
+        }
         assert!(f.find("DELETE", "").is_empty());
-    }
-
-    #[tokio::test]
-    async fn title_still_on_the_list_is_kept() {
-        let seen: BTreeSet<i64> = [100].into();
-        let series = [sonarr_series_json(1, "Show A", 100)];
-        let watch = [WatchItem { kind: "show".into(), title: "show a".into(), guids: vec![] }];
-        let v = cleanup_verdicts(&series, Some(&watch), &seen).unwrap();
-        assert_eq!(v[0].2, Verdict::Keep);
+        let warn: Vec<Req> = f.requests().into_iter().filter(|r| r.method == "POST" && r.path == "/").collect();
+        assert_eq!(warn.len(), 1, "one ntfy warning");
+        assert!(warn[0].body.contains("nu am șters nimic"));
+        assert!(WState::load(&a).unwrap().cap_warned);
     }
 
     fn queue_rec(state: &str, msg: &str, id_field: &str) -> Value {
@@ -754,8 +977,8 @@ mod tests {
         let f = serve(w.clone()).await;
         let (a, d) = app(&f.base, true, json!({}));
         // B was seen earlier (state file), now gone from the list.
-        std::fs::write(d.join("state.local.json"), r#"{"watchlist": {"seen_tvdb": [200], "next_season": []}}"#).unwrap();
-        tick(&a, &mut Mem::default()).await;
+        std::fs::write(d.join("state.local.json"), r#"{"watchlist": {"seen_tvdb": [200], "next_season": [], "missing": {"200": {"since": 0.0, "count": 5, "last": 0.0}}}}"#).unwrap();
+        tick(&a, &mut Mem::default(), T0).await;
         assert!(f.mutations().is_empty(), "{:?}", f.mutations());
     }
 
@@ -766,7 +989,7 @@ mod tests {
     }
 
     fn two_seasons(next_monitored: bool) -> Value {
-        json!({"id": 1, "title": "Show A", "tvdbId": 100, "seasons": [
+        json!({"id": 1, "title": "Show A", "tvdbId": 100, "tags": [1], "seasons": [
             {"seasonNumber": 0, "monitored": false},
             {"seasonNumber": 1, "monitored": true},
             {"seasonNumber": 2, "monitored": next_monitored}]})
@@ -822,8 +1045,8 @@ mod tests {
         let w = Arc::new(w);
         let f = serve(w.clone()).await;
         let (a, _d) = app(&f.base, false, json!({}));
-        tick(&a, &mut Mem::default()).await;
-        tick(&a, &mut Mem::default()).await;
+        tick(&a, &mut Mem::default(), T0).await;
+        tick(&a, &mut Mem::default(), T0 + 180.0).await;
         let puts = f.find("PUT", "/api/v3/series/1");
         assert_eq!(puts.len(), 1);
         assert_eq!(puts[0].json()["seasons"][2], json!({"seasonNumber": 2, "monitored": true}));
