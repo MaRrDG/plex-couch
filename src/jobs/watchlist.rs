@@ -511,13 +511,25 @@ pub fn next_season_plan(
         .and_then(Value::as_array)
         .map(|a| a.iter().filter(|s| s.get("seasonNumber").and_then(Value::as_i64).unwrap_or(0) > 0).collect())
         .unwrap_or_default();
-    let cur = seasons
-        .iter()
-        .filter(|s| s.get("monitored").and_then(Value::as_bool).unwrap_or(false))
-        .filter_map(|s| s.get("seasonNumber").and_then(Value::as_i64))
-        .max()?;
-    let next = seasons.iter().filter_map(|s| s.get("seasonNumber").and_then(Value::as_i64)).filter(|n| *n > cur).min()?;
     let season_of = |e: &&Value| e.get("seasonNumber").and_then(Value::as_i64);
+    let ep_monitored = |e: &&Value| e.get("monitored").and_then(Value::as_bool).unwrap_or(false);
+    // The list's "first season" option monitors only the season 1 episodes but leaves every season
+    // flag on, so the current season is the highest one with monitored episodes; the season flags
+    // are only a fallback when Sonarr sent no episode flags at all.
+    let cur = episodes
+        .iter()
+        .filter(ep_monitored)
+        .filter_map(|e| season_of(&e))
+        .filter(|n| *n > 0)
+        .max()
+        .or_else(|| {
+            seasons
+                .iter()
+                .filter(|s| s.get("monitored").and_then(Value::as_bool).unwrap_or(false))
+                .filter_map(|s| s.get("seasonNumber").and_then(Value::as_i64))
+                .max()
+        })?;
+    let next = seasons.iter().filter_map(|s| s.get("seasonNumber").and_then(Value::as_i64)).filter(|n| *n > cur).min()?;
     let mut cur_eps: Vec<&Value> = episodes.iter().filter(|e| season_of(e) == Some(cur)).collect();
     cur_eps.sort_by_key(|e| e.get("episodeNumber").and_then(Value::as_i64).unwrap_or(0));
     if cur_eps.is_empty() {
@@ -546,7 +558,8 @@ pub fn next_season_plan(
         .iter()
         .find(|s| s.get("seasonNumber").and_then(Value::as_i64) == Some(next))
         .and_then(|s| s.get("monitored").and_then(Value::as_bool))
-        .unwrap_or(false);
+        .unwrap_or(false)
+        && aired.iter().all(ep_monitored);
     let missing = aired.iter().any(|e| !e.get("hasFile").and_then(Value::as_bool).unwrap_or(false));
     let ids = next_eps.iter().filter_map(|e| id_of(e.get("id"))).collect();
     Some((next, ids, !monitored, missing))
@@ -1033,6 +1046,23 @@ mod tests {
         assert_eq!(next_season_plan(&s, &have, &files(), &views(&[1, 2, 3]), now), Some((2, vec![21, 22, 23], true, false)));
         // Season 2 monitored: it is the current one and there is nothing after it.
         assert_eq!(next_season_plan(&two_seasons(true), &eps(), &files(), &views(&[1, 2, 3, 4, 5]), now).map(|p| p.0), None);
+    }
+
+    #[test]
+    fn current_season_comes_from_the_monitored_episodes() {
+        // What the Plex list's "first season" option really leaves behind: every season flag on,
+        // only the season 1 episodes monitored.
+        let now = parse_iso_utc("2026-10-26T00:00:00Z").unwrap();
+        let s = json!({"id": 1, "title": "Show A", "tvdbId": 100, "tags": [1], "seasons": [
+            {"seasonNumber": 0, "monitored": false},
+            {"seasonNumber": 1, "monitored": true},
+            {"seasonNumber": 2, "monitored": true},
+            {"seasonNumber": 3, "monitored": true}]});
+        let mut e: Vec<Value> = eps().into_iter().map(|mut x| { x["monitored"] = json!(x["seasonNumber"] == 1); x }).collect();
+        e.push(json!({"id": 31, "seasonNumber": 3, "episodeNumber": 1, "episodeFileId": 0, "airDateUtc": "2022-01-01T00:00:00Z", "hasFile": false, "monitored": false}));
+        // Season 1 is current, so season 2 is next; its flag is on but its episodes are not, so monitor them.
+        assert_eq!(next_season_plan(&s, &e, &files(), &views(&[1, 2, 3]), now), Some((2, vec![21, 22, 23], true, true)));
+        assert_eq!(next_season_plan(&s, &e, &files(), &views(&[1, 2]), now), None);
     }
 
     #[tokio::test]
