@@ -27,7 +27,11 @@
 //! when BOTH hold: H&R satisfied (ledger >= 49 h or ratio >= 1.0) AND watched-or-gone
 //! (Radarr: movie file -> Plex section 1 `viewCount > 0`, or the movie is no longer in
 //! Radarr; Sonarr: every episode of the download watched in Plex section 2, or the series
-//! is no longer in Sonarr). Any unknown mapping or API error keeps the torrent. Dry-run:
+//! is no longer in Sonarr). Fallback for an unmapped torrent (no *arr history at all and no
+//! stored mapping, e.g. the movie was deleted with its history): once H&R is satisfied it
+//! is deleted only if every file of the torrent exists under the downloads root with a
+//! hard-link count of 1 (no library copy shares it). Any other unknown mapping, API error,
+//! missing file, failed link query or link count > 1 keeps the torrent. Dry-run:
 //! the ledger is kept (it is the app's own file), deletions are only logged.
 
 use crate::app::AppState;
@@ -155,6 +159,8 @@ pub enum Watch {
     NotWatched,
     /// The movie / series is no longer in Radarr / Sonarr.
     Gone,
+    /// No Radarr/Sonarr history at all and no stored mapping (the link-count fallback).
+    Unmapped,
     Unknown(String),
 }
 
@@ -165,6 +171,7 @@ impl Watch {
             Watch::Watched => "watched",
             Watch::NotWatched => "unwatched",
             Watch::Gone => "gone",
+            Watch::Unmapped => "unmapped",
             Watch::Unknown(_) => "unknown",
         }
     }
@@ -174,6 +181,58 @@ impl Watch {
 pub fn under_root(path: &str, root: &str) -> bool {
     let (p, r) = (path_key(path), path_key(root));
     !p.is_empty() && !r.is_empty() && p.starts_with(&format!("{r}\\")) && !p.split('\\').any(|c| c == "..")
+}
+
+/// Hard-link count of a file (a trait so tests can fake it).
+pub trait LinkCounter: Send + Sync {
+    fn links(&self, path: &Path) -> Result<u32, String>;
+}
+
+/// `GetFileInformationByHandle(...).nNumberOfLinks`.
+pub struct Win32Links;
+
+impl LinkCounter for Win32Links {
+    #[cfg(windows)]
+    fn links(&self, path: &Path) -> Result<u32, String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        let f = std::fs::File::open(path).map_err(|e| crate::state::io_error_name(&e).to_string())?;
+        // SAFETY: a valid open handle and a zeroed out struct for the call to fill.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) };
+        if ok == 0 {
+            return Err("GetFileInformationByHandle failed".into());
+        }
+        Ok(info.nNumberOfLinks)
+    }
+
+    #[cfg(not(windows))]
+    fn links(&self, path: &Path) -> Result<u32, String> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).map(|m| m.nlink() as u32).map_err(|e| e.to_string())
+    }
+}
+
+/// The fallback check: every file of the torrent (`save_path` + qBittorrent's relative
+/// names) is under `root` and `content_path` and has exactly one link. `Err` says why not.
+pub fn no_library_copy(save_path: &str, content_path: &str, root: &str, names: &[String], links: &dyn LinkCounter) -> Result<(), String> {
+    if names.is_empty() {
+        return Err("qBittorrent lists no files".into());
+    }
+    let content = path_key(content_path);
+    for n in names {
+        let full = format!("{}\\{}", save_path.trim_end_matches(['\\', '/']), n.replace('/', "\\"));
+        let key = path_key(&full);
+        if !under_root(&full, root) || !(key == content || key.starts_with(&format!("{content}\\"))) {
+            return Err(format!("file outside the torrent folder: {n}"));
+        }
+        match links.links(Path::new(&full)) {
+            Ok(1) => {}
+            Ok(c) => return Err(format!("{n} has {c} links (library copy)")),
+            Err(e) => return Err(format!("{n}: {e}")),
+        }
+    }
+    Ok(())
 }
 
 /// Per-tick cache of the upstream lists (each fetched at most once per tick).
@@ -190,6 +249,7 @@ type SeriesEpisodes = (HashMap<i64, Value>, HashMap<i64, String>);
 
 pub struct Keeper {
     pub qbit: QbitJobs,
+    pub links: Box<dyn LinkCounter>,
     filelist: Regex,
     last: HashMap<String, String>,
     quiet: Quiet,
@@ -204,7 +264,7 @@ impl Keeper {
             .unwrap_or_else(|| crate::config::DEFAULT_FILELIST_REGEX.into());
         let filelist = Regex::new(&format!("(?i){pat}"))
             .unwrap_or_else(|_| Regex::new(&format!("(?i){}", crate::config::DEFAULT_FILELIST_REGEX)).expect("regex"));
-        Keeper { qbit: QbitJobs::new(app.services.qbittorrent.c.clone()), filelist, last: HashMap::new(), quiet: Quiet::default() }
+        Keeper { qbit: QbitJobs::new(app.services.qbittorrent.c.clone()), links: Box::new(Win32Links), filelist, last: HashMap::new(), quiet: Quiet::default() }
     }
 
     /// Log a keep/delete reason when its kind changes for this torrent.
@@ -317,10 +377,25 @@ pub async fn tick(app: &AppState, k: &mut Keeper, now: f64) {
                 Watch::Watched => "watched".to_string(),
                 Watch::Gone => format!("no longer in {}", if cat == "radarr" { "Radarr" } else { "Sonarr" }),
                 Watch::NotWatched => "not watched yet".to_string(),
+                Watch::Unmapped => "not in Radarr/Sonarr history".to_string(),
                 Watch::Unknown(r) => format!("unknown ({r})"),
             };
             // A tracker query error is an API error too: keep.
-            let delete = done && trackers.is_ok() && matches!(w, Watch::Watched | Watch::Gone);
+            let mut delete = done && trackers.is_ok() && matches!(w, Watch::Watched | Watch::Gone);
+            let mut why = why;
+            if done && trackers.is_ok() && w == Watch::Unmapped {
+                let check = match k.qbit.files(&hash).await {
+                    Ok(names) => no_library_copy(s(t, "save_path"), s(t, "content_path"), &root, &names, &*k.links),
+                    Err(e) => Err(format!("qBittorrent files: {e}")),
+                };
+                match check {
+                    Ok(()) => {
+                        delete = true;
+                        why = "no library copy (link count 1)".into();
+                    }
+                    Err(r) => why = format!("{why}, kept: {r}"),
+                }
+            }
             let detail = format!("seeded {hours} h, ratio {ratio:.2}, {why}");
             if !delete {
                 let kind = format!("{}|{}", if done { "hr" } else { "pending" }, w.kind());
@@ -393,6 +468,9 @@ async fn watch_state(app: &AppState, cat: &str, hash: &str, entry: &mut Map<Stri
             Err(e) => return Watch::Unknown(format!("{} history: {e}", arr.label())),
         };
         let field = if radarr { "movieId" } else { "seriesId" };
+        if recs.is_empty() {
+            return Watch::Unmapped;
+        }
         let ids: HashSet<i64> = recs.iter().filter_map(|r| id_of(r.get(field))).collect();
         if ids.len() != 1 {
             return Watch::Unknown(format!("{} history has {} item(s) for it", arr.label(), ids.len()));
@@ -529,6 +607,9 @@ mod tests {
             if p.starts_with("/api/v2/torrents/trackers") {
                 let st = *w.tracker_status.lock().unwrap();
                 return ok(json!([{"url": "** [DHT] **", "status": 0}, {"url": "https://reactor.filelist.io/x/announce", "status": st}]));
+            }
+            if p.starts_with("/api/v2/torrents/files") {
+                return ok(json!([{"name": "Dune.2021.2160p/Dune.mkv", "size": 1}, {"name": "Dune.2021.2160p/Sample/s.mkv", "size": 1}]));
             }
             if p.starts_with("/api/v2/torrents/delete") {
                 return ok(json!({}));
@@ -796,6 +877,121 @@ mod tests {
         assert_eq!(login.len(), 1);
         assert_eq!(login[0].body, "username=admin&password=x");
         assert_eq!(login[0].header("referer"), Some(f.base.as_str()));
+    }
+
+    /// Link counts by lower-cased path; a missing path is an open error.
+    struct FakeLinks(HashMap<String, u32>);
+
+    impl LinkCounter for FakeLinks {
+        fn links(&self, path: &Path) -> Result<u32, String> {
+            self.0.get(&path_key(&path.to_string_lossy())).copied().ok_or_else(|| "FileNotFoundError".into())
+        }
+    }
+
+    const MAIN: &str = r"D:\Media\Downloads\radarr\Dune.2021.2160p\Dune.mkv";
+    const SAMPLE: &str = r"D:\Media\Downloads\radarr\Dune.2021.2160p\Sample\s.mkv";
+
+    fn links(main: Option<u32>, sample: Option<u32>) -> Box<FakeLinks> {
+        let mut m = HashMap::new();
+        if let Some(c) = main {
+            m.insert(path_key(MAIN), c);
+        }
+        if let Some(c) = sample {
+            m.insert(path_key(SAMPLE), c);
+        }
+        Box::new(FakeLinks(m))
+    }
+
+    #[test]
+    fn link_count_decision_table() {
+        let names = vec!["Dune.2021.2160p/Dune.mkv".to_string(), "Dune.2021.2160p/Sample/s.mkv".to_string()];
+        let (save, content, root) = (r"D:\Media\Downloads\radarr\\", r"D:\Media\Downloads\radarr\Dune.2021.2160p", r"D:\Media\Downloads");
+        let chk = |l: &FakeLinks, n: &[String]| no_library_copy(save, content, root, n, l);
+        assert_eq!(chk(&links(Some(1), Some(1)), &names), Ok(()));
+        assert!(chk(&links(Some(2), Some(1)), &names).unwrap_err().contains("2 links"));
+        assert!(chk(&links(Some(1), Some(3)), &names).is_err());
+        assert!(chk(&links(Some(1), None), &names).unwrap_err().contains("FileNotFoundError"));
+        assert!(chk(&links(Some(1), Some(1)), &[]).is_err());
+        let outside = vec!["../../Movies/Dune/Dune.mkv".to_string()];
+        assert!(chk(&links(Some(1), Some(1)), &outside).unwrap_err().contains("outside"));
+        let other = vec!["Other/x.mkv".to_string()];
+        assert!(chk(&links(Some(1), Some(1)), &other).unwrap_err().contains("outside"));
+        // A single-file torrent: content_path is the file itself.
+        let single = vec!["Dune.mkv".to_string()];
+        let mut m = HashMap::new();
+        m.insert(path_key(r"D:\Media\Downloads\radarr\Dune.mkv"), 1);
+        assert_eq!(no_library_copy(save, r"D:\Media\Downloads\radarr\Dune.mkv", root, &single, &FakeLinks(m)), Ok(()));
+    }
+
+    #[test]
+    fn win32_link_count_reader() {
+        let d = crate::jobs::testutil::temp_dir("links");
+        let a = d.join("a.mkv");
+        std::fs::write(&a, b"x").unwrap();
+        assert_eq!(Win32Links.links(&a), Ok(1));
+        std::fs::hard_link(&a, d.join("b.mkv")).unwrap();
+        assert_eq!(Win32Links.links(&a), Ok(2));
+        assert_eq!(Win32Links.links(&d.join("b.mkv")), Ok(2));
+        assert!(Win32Links.links(&d.join("missing.mkv")).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    async fn unmapped_tick(dry: bool, l: Box<FakeLinks>, history: Resp) -> (Fake, Arc<AppState>) {
+        let w = world();
+        *w.radarr_history.lock().unwrap() = history;
+        let (f, a, _w, mut k) = setup(w, dry).await;
+        k.links = l;
+        set_entry(&a, json!({"seconds": HR_SECONDS + 1.0, "last_tick": 0.0}));
+        tick(&a, &mut k, 300.0).await;
+        (f, a)
+    }
+
+    #[tokio::test]
+    async fn unmapped_with_no_library_copy_is_deleted() {
+        let (f, a) = unmapped_tick(false, links(Some(1), Some(1)), ok(json!({"records": []}))).await;
+        assert_eq!(deletes(&f).len(), 1);
+        assert_eq!(entry(&a), Value::Null);
+    }
+
+    #[tokio::test]
+    async fn unmapped_with_a_library_link_or_missing_file_is_kept() {
+        for l in [links(Some(2), Some(1)), links(Some(1), None), links(None, None)] {
+            let (f, _a) = unmapped_tick(false, l, ok(json!({"records": []}))).await;
+            assert!(deletes(&f).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn unmapped_but_hr_pending_is_kept() {
+        let w = world();
+        *w.radarr_history.lock().unwrap() = ok(json!({"records": []}));
+        let (f, a, _w, mut k) = setup(w, false).await;
+        k.links = links(Some(1), Some(1));
+        tick(&a, &mut k, 0.0).await;
+        assert!(deletes(&f).is_empty());
+        assert!(f.find("GET", "/api/v2/torrents/files").is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallback_never_applies_to_known_or_errored_mappings() {
+        // Known mapping, unwatched: kept even with link count 1.
+        let (f, _a) = unmapped_tick(false, links(Some(1), Some(1)), ok(json!({"records": [{"movieId": 10}]}))).await;
+        assert!(deletes(&f).is_empty());
+        assert!(f.find("GET", "/api/v2/torrents/files").is_empty());
+        // History error: kept.
+        let (f, _a) = unmapped_tick(false, links(Some(1), Some(1)), status(500)).await;
+        assert!(deletes(&f).is_empty());
+        // History with records but no movie id: kept.
+        let (f, _a) = unmapped_tick(false, links(Some(1), Some(1)), ok(json!({"records": [{"eventType": "grabbed"}]}))).await;
+        assert!(deletes(&f).is_empty());
+    }
+
+    #[tokio::test]
+    async fn unmapped_dry_run_only_logs() {
+        crate::log::start_capture();
+        let (f, _a) = unmapped_tick(true, links(Some(1), Some(1)), ok(json!({"records": []}))).await;
+        assert!(f.mutations().is_empty());
+        assert!(crate::log::captured().iter().any(|l| l.contains("dry-run: would delete torrent 'Dune.2021.2160p'") && l.contains("no library copy (link count 1)")));
     }
 
     #[test]

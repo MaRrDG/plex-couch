@@ -105,6 +105,13 @@ impl QbitJobs {
             .collect())
     }
 
+    /// `GET /api/v2/torrents/files?hash=<h>`: the file names, relative to `save_path`.
+    pub async fn files(&self, hash: &str) -> UpResult<Vec<String>> {
+        let b = self.call(Method::GET, &format!("/api/v2/torrents/files?hash={}", urlencode(hash)), None).await?;
+        let Ok(Value::Array(a)) = serde_json::from_slice::<Value>(&b) else { return Err(UpstreamError::Body) };
+        a.iter().map(|f| f.get("name").and_then(Value::as_str).map(String::from).ok_or(UpstreamError::Body)).collect()
+    }
+
     /// `POST /api/v2/torrents/delete` `hashes=<h>&deleteFiles=true`.
     pub async fn delete_with_files(&self, hash: &str) -> UpResult<()> {
         let form = format!("hashes={}&deleteFiles=true", urlencode(hash));
