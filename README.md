@@ -2,7 +2,12 @@
 
 A tiny self-hosted web app that turns your phone into a couch remote for the Windows PC
 that runs your Plex server. From the sofa you can turn the PC monitors off/on, shut down or
-restart the PC, and see what is playing, downloading, waiting and seeding.
+restart the PC, and see what is playing, downloading, waiting and seeding. In the background
+it keeps the Plex Watchlist, Radarr, Sonarr and qBittorrent in step: it syncs the Watchlist,
+starts the next season of a show you are watching, strips Dolby Vision from files your TV
+cannot play and deletes torrents once they have seeded long enough and you have watched them.
+
+It is a single Rust executable (`plex-couch.exe`) with the web UI built in.
 
 Not affiliated with or endorsed by Plex Inc.
 
@@ -23,7 +28,9 @@ comes next, as a poster grid) and **PC** (seeding, disk, services, notifications
 - **Downloads**: Radarr queue with progress and time left.
 - **FileList seeding**: every FileList torrent in qBittorrent, shown by movie title (matched
   through Radarr's grab history and queue, else parsed from the release name), with a progress
-  bar towards the hit & run rule (ratio 1.0 or 48 h of seeding) and "gata" once safe.
+  bar towards the hit & run rule (ratio 1.0 or 48 h of seeding) and "gata" once safe, or
+  "gata, aștept să-l vezi" while the seed keeper (below) waits for you to watch it. The seeded
+  time comes from the seed keeper's own ledger once it knows the torrent.
 - **Waiting list** ("Urmează"): monitored Radarr movies without a file, with a human status
   (e.g. waiting for the digital release on a given date) or the download progress.
 - **Library**: Radarr movies as posters with size and whether a Romanian subtitle exists (Bazarr).
@@ -33,8 +40,10 @@ comes next, as a poster grid) and **PC** (seeding, disk, services, notifications
   Login required, digits-only ids, the API key and token stay on the PC. A drawn placeholder with
   the title is shown when there is no poster.
 - **Disk space** and uptime.
-- **Power**: shut down or restart after a 60 s countdown (then `shutdown /s /hybrid /t 0` or `/r /t 0`: the same as Start > Shut down, with Fast Startup and no forced close of unsaved apps), confirmed from an action sheet that warns about
-  torrents still owing seed time, then a countdown banner with a cancel button.
+- **Power**: shut down or restart after a 60 s countdown (then `shutdown /s /hybrid /t 0` or
+  `/r /t 0`: the same as Start > Shut down, with Fast Startup and no forced close of unsaved
+  apps), confirmed from an action sheet that warns about torrents still owing seed time, then a
+  countdown banner with a cancel button.
 - **Shut down after the movie**: from the same sheet, while something plays on the TV. When that
   Plex session ends at 90% or later (the credits), the normal 60 s countdown starts and a phone
   notification says so; stop the movie earlier and the PC stays on (it stays armed for the next
@@ -42,54 +51,156 @@ comes next, as a poster grid) and **PC** (seeding, disk, services, notifications
   memory only: restarting Plex Couch disarms it.
 - **Phone notifications** through [ntfy](https://ntfy.sh) (optional): "Film gata" when a new
   movie is downloaded (as soon as Bazarr has the Romanian subtitle, or after 20 minutes without
-  it), "Spațiu puțin" when the Radarr drive drops below 60 GB free, and the after-movie shutdown.
+  it), "Spațiu puțin" when the Radarr drive drops below 60 GB free, the after-movie shutdown,
+  "Sezon nou" when the next season of a show starts downloading, and a "Watchlist" warning
+  when the Sonarr cleanup stops itself because too many shows vanished at once (see below).
 - **Service status** for Plex, Radarr, Prowlarr, Bazarr and qBittorrent. Every service is
   optional; a service that is down only blanks its own section.
 - "Cinema" dark UI built from a small design system (`docs/design-system/`): one accent (Plex
   amber), real posters, self-hosted Figtree font, no external CDNs.
 - **Installable PWA over HTTPS** (Android Chrome): a local, name-constrained certificate
   authority, a service worker that caches the app shell, and a clear "PC-ul nu răspunde"
-  state when the PC is off. Without certificates the app still works over plain HTTP.
+  state when the PC is off. Without certificates the app only serves an error page, unless
+  you start it with `--allow-http`.
+
+### Background jobs
+
+They start with the app (never in `--demo`), each on its own timer, and log what they do to
+`plex-couch.log`. A failure is logged once until it changes, and never stops the loop. With
+`--dry-run` they change nothing in Radarr, Sonarr, Plex, qBittorrent or your media files: every
+delete, import, remux, rescan and notification is only logged (their own ledger and state are
+still kept).
+
+- **Watchlist sync** (every 3 minutes, first run 30 s after start):
+  - Forces an `ImportListSync` for every enabled import list in Radarr and in Sonarr, so a
+    movie or show added to the Plex Watchlist is picked up within minutes instead of on the
+    *arr's own schedule.
+  - **Auto import**: a finished download that Radarr/Sonarr grabbed for the right item but
+    refuses to import because the release name does not match (typically a year mismatch:
+    queue status "matched to movie by ID" / "matched to series by ID", import blocked) is
+    imported automatically with the files that have no other rejection.
+  - **Sonarr cleanup**: a series that came from the Plex Watchlist and is no longer on it is
+    deleted from Sonarr together with its files. It is guarded heavily, and any doubt deletes
+    nothing:
+    - only series that carry the Sonarr tag `plex-watchlist` (set it on the Plex Watchlist
+      import list; no such tag, no cleanup) *and* whose tvdb id was seen on the Watchlist at
+      least once;
+    - a series still counts as on the list when its tvdb, tmdb or imdb id or its title (without
+      a trailing `(year)`) matches a Watchlist show;
+    - nothing is deleted when the Watchlist fetch failed, was partial or shifted while paging,
+      is empty, has a show without a tvdb id, or when Sonarr or the state file cannot be read;
+    - a series is deleted only after it was missing from at least 2 successful fetches at
+      least 5 minutes apart;
+    - if more than 2 series would go in one run, none is deleted and one ntfy warning is sent.
+  - **Next season**: for a show from the Watchlist that is still on it, once every episode but
+    the last 2 of the highest monitored season is watched in Plex and the next season has aired
+    episodes, that season is monitored, searched (`SeasonSearch`, if an aired episode has no
+    file yet) and you get "Sezonul N din <serial> se descarcă", once per season.
+- **Dolby Vision strip** (every 5 minutes, first run 60 s after start): every `.mkv` in the
+  movie and series libraries that has a Dolby Vision layer on top of an HDR10 base is remuxed
+  with ffmpeg (`-c copy -bsf:v dovi_rpu=strip=1`), so TVs without DV play it as plain HDR10
+  instead of transcoding. It keeps the first video stream, every audio stream, text subtitles
+  in English/Romanian/undetermined and the chapters. DV without an HDR10 base is left alone.
+  - The remux goes to a temp folder (it needs 1.1x the file size free); the result is checked
+    (no DV left, same duration within 2 s) and then replaces the original with a single rename,
+    and only if the original has not changed since it was probed. While Plex holds the file it
+    retries every minute for up to an hour. The library file is a hardlink to the torrent, so
+    the seeding copy is not touched.
+  - Afterwards Radarr (`RescanMovie`) or Sonarr (`RescanSeries`) rescans the item and Plex
+    refreshes that folder.
+  - Files already checked are remembered in a "seen" file (path, size, modification time);
+    files whose remux failed are skipped for 24 h; leftover temp files older than 24 h are
+    deleted. ffmpeg runs without a window at below-normal priority, one file at a time, on its
+    own thread, and it has its own log file. It holds the `Global\PlexStripDV` mutex while it
+    works, so it never overlaps an older `strip-dv.ps1` run that may still be scheduled.
+- **Seed keeper** (every 5 minutes, first run 90 s after start): the only thing that deletes
+  torrents; keep qBittorrent's own share limits off.
+  - It keeps a ledger (`seed-ledger.json` next to the config) of the time each completed
+    FileList torrent has really seeded: it starts from qBittorrent's `seeding_time` and then
+    counts only while qBittorrent answers, the torrent is seeding and a FileList tracker reports
+    it as working, on a clock that stops while the PC sleeps. An unreadable ledger skips the
+    run and is never overwritten.
+  - A torrent is deleted (with its download copy; the library hardlink stays) only when **both**
+    hold: the FileList hit & run rule is met (at least 49 h seeded by the ledger, 48 h plus an
+    hour of margin, or ratio 1.0) **and** you are done with it: the movie (Radarr) or every
+    episode of that download (Sonarr) is watched in Plex, or the movie/series is no longer in
+    Radarr/Sonarr.
+  - Only torrents in the qBittorrent categories `radarr` or `sonarr` whose files are under the
+    downloads folder are considered. The Radarr/Sonarr item is found through its download
+    history and remembered with its tmdb/tvdb id, which must still match before "watched" or
+    "gone" is trusted (an item re-added under a new id is kept).
+  - A torrent with no Radarr/Sonarr history at all (and not in their queue) is deleted after the
+    hit & run rule only if every one of its files has a hard-link count of 1, i.e. no library
+    copy shares it.
+  - Any API error, unknown mapping, missing file or failed check keeps the torrent.
+
+The seed keeper and the next-season check read "watched" from Plex library section 1 (movies)
+and section 2 (TV); these are fixed. The DV strip takes the section of each library from the
+config.
 
 ## Requirements
 
 - Windows 10/11 (monitor and power control use Win32 APIs and `shutdown.exe`).
-- Python 3.12+ — **standard library only**, nothing to `pip install`.
-- Optional, all on the same PC: Plex Media Server, Radarr (v3 API), Bazarr, Prowlarr,
-  qBittorrent (Web UI enabled, with "Bypass authentication for clients on localhost"
-  or credentials in the config).
+- To build: [Rust](https://rustup.rs) stable with the `x86_64-pc-windows-msvc` toolchain and the
+  Visual Studio Build Tools ("Desktop development with C++", for the MSVC linker). No other
+  runtime is needed: the exe is self-contained and does not need openssl.
+- Optional, all on the same PC: Plex Media Server, Radarr (v3 API), Sonarr v4 (v3 API, for the
+  watchlist jobs), Bazarr, Prowlarr, qBittorrent (Web UI enabled, with "Bypass authentication for
+  clients on localhost" or credentials in the config).
+- For the Dolby Vision strip: ffmpeg, e.g. `winget install Gyan.FFmpeg` (found automatically in
+  the WinGet packages folder, or set `jobs.strip_dv.ffmpeg_bin`). Without it the job logs once
+  and does nothing.
+- For the watchlist jobs: a Plex token (read from the registry, see below) and the Plex
+  Watchlist import list in Radarr and Sonarr.
 
-API keys are read at runtime from the services' own config files (Radarr `config.xml`, Bazarr
-`config.yaml`) and the Plex token from the registry; they are never stored, logged or
-returned. Paths, URLs and the tracker regex can be overridden in the config
+API keys are read at runtime from the services' own config files (Radarr and Sonarr
+`config.xml`, Bazarr `config.yaml`) and the Plex token from the registry; they are never stored,
+logged or returned. Paths, URLs and the tracker regex can be overridden in the config
 (see `config.example.json`).
+
+## Build
+
+```
+cargo build --release
+```
+
+Copy `target\release\plex-couch.exe` to the folder where it will run, for example the repo root
+next to `config.local.json`. The exe looks for `config.local.json` and writes `plex-couch.log`
+in its own folder, and `make-certs` writes `certs\` there by default, so keep them together.
+Stop the running copy before you replace the exe.
 
 ## Setup
 
-1. Copy `config.example.json` to `config.local.json` next to `app.py` (optional — defaults are
-   used for anything missing) and adjust URLs/paths if yours differ.
-2. Set the PIN, 4 to 6 digits (stored only as a PBKDF2-SHA256 hash; 6-digit PINs auto-submit on the keypad):
+1. Copy `config.example.json` to `config.local.json` next to `plex-couch.exe` (optional —
+   defaults are used for anything missing) and adjust URLs/paths if yours differ.
+2. Set the PIN, 4 to 6 digits (stored only as a PBKDF2-SHA256 hash; 6-digit PINs auto-submit
+   on the keypad):
 
    ```
-   python app.py --set-pin 123456
+   .\plex-couch.exe --set-pin 123456
    ```
 
-3. Try it in the foreground first, without touching the monitors or power:
+3. Try it without touching the monitors, power or your files:
 
    ```
-   python app.py --dry-run --allow-http
+   .\plex-couch.exe --dry-run --allow-http
    ```
 
    Then open `http://<pc-lan-ip>:8765` on your phone. This already works in the browser, but
    only with `--allow-http`: without certificates the app otherwise serves just an error page.
    Set up HTTPS (next section) before you use it for real, then drop `--allow-http`.
 
-4. **Run at logon** with Task Scheduler so it lives in your interactive session (required for the
-   monitor controls) without a console window:
+   The release exe has no console window. Started from a terminal it prints to it, but the
+   shell does not wait for it; stop it from Task Manager, or run a debug build in the
+   foreground with `cargo run -- --dry-run --allow-http` (Ctrl+C stops it).
+
+4. **Run at logon** with Task Scheduler so it lives in your interactive session (required for
+   the monitor controls):
    - Trigger: *At log on* of your user.
-   - Action: `pythonw.exe` with arguments `"C:\path\to\plex-couch\app.py"` and
-     *Start in* set to the project folder.
+   - Action: *Start a program*, program `D:\path\to\plex-couch\plex-couch.exe`, arguments
+     `--host 0.0.0.0 --port 8765 --config D:\path\to\plex-couch\config.local.json`.
    - Run only when the user is logged on; do not use "Run whether user is logged on or not".
+   - Settings: untick "Stop the task if it runs longer than".
 
 5. **Firewall**: allow inbound TCP 8765 (and 8766 for HTTPS) for the *Private* profile only,
    restricted to your LAN, for example (elevated PowerShell):
@@ -98,6 +209,39 @@ returned. Paths, URLs and the tracker regex can be overridden in the config
    New-NetFirewallRule -DisplayName "plex-couch" -Direction Inbound -Protocol TCP -LocalPort 8765,8766 `
      -Profile Private -RemoteAddress LocalSubnet -Action Allow
    ```
+
+### Configuration
+
+Everything is optional; missing keys use the defaults shown in `config.example.json`. Objects
+merge with the defaults key by key, lists replace them. Relative `https` paths are resolved
+against the config file's folder; give the `jobs` paths in full. The app writes `pin_hash`, `secret`, `session_epoch` and
+`notifications.topic` itself.
+
+| Key | What it does |
+| --- | --- |
+| `app_name` | Display name (page title, header, PWA manifest). |
+| `settings.auto_monitors_off` | Turn the monitors off when a session starts on the TV (also a switch in the UI). |
+| `filelist_tracker_regex` | Tracker URLs that count as FileList (case-insensitive). |
+| `disks` | Drive letters shown on the PC tab. |
+| `plex_poll_seconds` | How often Plex sessions are polled for the monitor and after-movie rules (at least 3). |
+| `allowed_hosts` | Extra `Host` names to accept, e.g. `["plexpc.lan"]` (see Security). |
+| `notifications` | `server`, `topic`, `disk_min_gb`, `ready_wait_minutes` (see ntfy below). |
+| `https` | `port`, `cert`, `key`, `ca_cert`. |
+| `services.<name>.url` | Base URL of `plex`, `radarr`, `sonarr`, `bazarr`, `prowlarr`, `qbittorrent`. |
+| `services.plex.token` | Plex token; empty = read `token_registry_value` under `HKCU\<token_registry_key>`. |
+| `services.radarr` / `sonarr` `.api_key` | API key; empty = read `<ApiKey>` from `config_xml`. |
+| `services.bazarr.api_key` | API key; empty = read it from `config_yaml`. |
+| `services.qbittorrent` | `username` / `password`, empty when localhost needs no login. |
+| `jobs.watchlist.discover_url` | Where the Plex Watchlist is read (default `https://discover.provider.plex.tv`). |
+| `jobs.strip_dv.libraries` | `[{"path": ..., "arr": "radarr"/"sonarr", "section": <Plex section>}]` to scan. |
+| `jobs.strip_dv.ffmpeg_bin` | Folder with `ffmpeg.exe` and `ffprobe.exe`; empty = newest `Gyan.FFmpeg*\ffmpeg-*\bin` in `ffmpeg_packages`. |
+| `jobs.strip_dv.ffmpeg_packages` | The WinGet packages folder to search (set it if winget installs elsewhere for you). |
+| `jobs.strip_dv.tmp_dir` | Where remuxes are written before they replace the original. |
+| `jobs.strip_dv.log`, `.seen` | The job's own log file and its list of files already checked. |
+| `jobs.seed_keeper.downloads_root` | Only torrents under this folder can be deleted. |
+
+The `jobs` defaults are the paths of the original setup (`D:\Media\Movies`, `D:\Media\Seriale`,
+`D:\Media\Downloads`, ...); set them to yours.
 
 ### Phone notifications (ntfy)
 
@@ -108,7 +252,7 @@ to a *topic*, and anyone who subscribes to that topic name gets them.
 1. Create a topic (a long random name; re-running keeps it, `--new-topic` replaces it):
 
    ```
-   python app.py --setup-ntfy
+   .\plex-couch.exe --setup-ntfy
    ```
 
    It prints the topic and its subscribe link. Restart Plex Couch afterwards.
@@ -118,7 +262,8 @@ to a *topic*, and anyone who subscribes to that topic name gets them.
 What you get: "Film gata" when Radarr finishes a new movie (right away once Bazarr has the
 Romanian subtitle, otherwise after `ready_wait_minutes`), "Spațiu puțin" once when the drive of
 Radarr's root folder drops below `disk_min_gb` free (again only after it has gone back above
-`disk_min_gb + 10`), and "Oprire după film". Movies already in the library when notifications
+`disk_min_gb + 10`), "Oprire după film", "Sezon nou" from the next-season job and the
+"Watchlist" warning from the Sonarr cleanup. Movies already in the library when notifications
 are first turned on never notify. What was already sent is remembered in `state.local.json` next
 to the config (git-ignored), so a restart does not repeat anything. The `notifications` block in
 the config sets `server` (for a self-hosted ntfy), `disk_min_gb` and `ready_wait_minutes`.
@@ -130,22 +275,22 @@ PC (127.0.0.1/localhost, for testing with a local server).
 
 ### HTTPS and installing the app on Android
 
-Chrome only installs web apps and runs service workers on HTTPS. Plex Couch ships a small
-script that creates your own local certificate authority (CA) and a server certificate signed
-by it; the phone trusts the CA once and then the app is a normal installable PWA.
+Chrome only installs web apps and runs service workers on HTTPS. `plex-couch make-certs`
+creates your own local certificate authority (CA) and a server certificate signed by it; the
+phone trusts the CA once and then the app is a normal installable PWA.
 
-1. Create the certificates (needs the `openssl` binary; the copy that comes with Git for Windows
-   is found automatically, or pass `--openssl <path>`). Use the PC's LAN IP; a fixed IP or a
-   DHCP reservation on the router is recommended:
+1. Create the certificates. Use the PC's LAN IP; a fixed IP or a DHCP reservation on the router
+   is recommended:
 
    ```
-   python tools/make_certs.py --ip 192.168.1.50 --ip 127.0.0.1 --dns localhost
+   .\plex-couch.exe make-certs --ip 192.168.1.50 --ip 127.0.0.1 --dns localhost
    ```
 
-   This writes `certs/ca.key`, `certs/ca.pem`, `certs/ca.crt` (DER, for the phone),
-   `certs/server.key` and `certs/server.pem`. The folder is git-ignored. Private keys are never
-   printed.
-2. Restart the app. When `certs/server.pem` and `certs/server.key` exist it serves the app over
+   This writes `certs\ca.key`, `certs\ca.pem`, `certs\ca.crt` (DER, for the phone),
+   `certs\server.key` and `certs\server.pem` next to the exe (`--out` picks another folder).
+   The folder is git-ignored. Private keys are never printed. Only private IPv4 addresses,
+   `localhost` and `*.local` names are accepted (the CA could not vouch for anything else).
+2. Restart the app. When `certs\server.pem` and `certs\server.key` exist it serves the app over
    HTTPS on port **8766**, and port 8765 only serves an install page, the CA certificate
    (`/ca.crt`) and redirects everything else to HTTPS. When they are missing or cannot be read,
    port 8765 serves only a 503 page saying so (and the log says it too); the app, the API and
@@ -155,10 +300,10 @@ by it; the phone trusts the CA once and then the app is a normal installable PWA
    Encryption & credentials → Install a certificate → CA certificate* (names vary slightly by
    phone), open `https://<pc-lan-ip>:8766`, then Chrome menu → *Install app*.
 
-The server certificate is valid for 397 days. Re-running `make_certs.py` renews only the
-server certificate and keeps the CA, so the phone does not need anything new; restart the app
+The server certificate is valid for 397 days. Re-running `make-certs` renews only the server
+certificate and keeps the CA, so the phone does not need anything new; restart the app
 afterwards. `--force-ca` replaces the CA (the phone then needs the new `ca.crt`). If the PC's IP
-changes, re-run the script with the new `--ip`.
+changes, re-run it with the new `--ip`.
 
 Paths and the port can be changed with `--https-port`, `--cert`, `--key`, `--ca-cert` or the
 `https` block in the config (relative paths are resolved against the config file's folder).
@@ -166,24 +311,27 @@ Paths and the port can be changed with `--https-port`, `--cert`, `--key`, `--ca-
 ### Command line
 
 ```
-app.py [--host 0.0.0.0] [--port 8765] [--https-port 8766] [--cert certs/server.pem]
-       [--key certs/server.key] [--ca-cert certs/ca.crt] [--config config.local.json] [--dry-run]
-       [--allow-http]
-app.py --set-pin <digits> [--config config.local.json]
-app.py --setup-ntfy [--new-topic] [--config config.local.json]
-app.py --demo --host 127.0.0.1 [--port 8765]
-tools/make_certs.py --ip <lan-ip> [--ip ...] [--dns localhost] [--out certs] [--force-ca]
+plex-couch [--host 0.0.0.0] [--port 8765] [--https-port 8766] [--cert certs/server.pem]
+           [--key certs/server.key] [--ca-cert certs/ca.crt] [--config config.local.json]
+           [--dry-run] [--allow-http]
+plex-couch --set-pin <digits> [--config config.local.json]
+plex-couch --setup-ntfy [--new-topic] [--config config.local.json]
+plex-couch --demo --host 127.0.0.1 [--port 8765]
+plex-couch make-certs --ip <lan-ip> [--ip ...] [--dns localhost] [--out certs] [--force-ca]
 ```
 
-`--dry-run` logs monitor and power actions instead of executing them.
+`--config` defaults to `config.local.json` next to the exe. `--dry-run` logs monitor and power
+actions instead of executing them, and makes the background jobs read-only (see above).
 `--allow-http` serves the whole app over plain HTTP when no usable certificate is found (by
-default only a 503 page is served then).
-`--demo` serves the UI with fake data and no login, for screenshots and UI work; it refuses to
-start unless the host is `127.0.0.1` and never executes any action. Open `/#login` to see the
-login keypad in demo mode.
+default only a 503 page is served then). `--demo` serves the UI with fake data and no login, for
+screenshots and UI work; it refuses to start unless the host is `127.0.0.1`, never executes any
+action and runs no background job. Open `/#login` to see the login keypad in demo mode.
+Options can be abbreviated to a unique prefix (`--allow` = `--allow-http`), `-h` prints the
+help, and a usage error exits with code 2.
 
-Logs go to `plex-couch.log` next to `app.py` (rotating, 1 MB x 2). `pythonw.exe` has no console,
-so check that file if something does not work.
+Logs go to `plex-couch.log` next to the exe (rotating, 1 MB x 2). The exe has no console when
+started by Task Scheduler, so check that file if something does not work. The DV strip job also
+writes its own log (`jobs.strip_dv.log`).
 
 ## Security notes
 
@@ -194,16 +342,15 @@ so check that file if something does not work.
   install page, the CA certificate and redirects (no HSTS there). The session cookie gets the
   `Secure` flag over HTTPS. If the certificate or key is missing or unreadable, the app does not
   fall back to plain HTTP: port 8765 answers every request with a 503 page that says to run
-  `tools/make_certs.py`, and the log says the same. Plain HTTP for the whole app only runs with
-  an explicit `--allow-http`.
+  `plex-couch make-certs`, and the log says the same. Plain HTTP for the whole app only runs
+  with an explicit `--allow-http`.
 - **The local CA is name-constrained.** Its certificate carries a critical X.509
   `nameConstraints` extension that permits only private IPv4 ranges (192.168.0.0/16, 10.0.0.0/8,
   172.16.0.0/12), loopback (127.0.0.0/8), `localhost` and `*.local` names. Even if `ca.key` were
   stolen, certificates it signs for public web sites would be rejected by the phone, so
-  installing it does not let anyone intercept your normal browsing. CAs created by
-  `make_certs.py` also permit no e-mail names (`permitted;email:.invalid`) and carry
-  `extendedKeyUsage = serverAuth`, so they are good for TLS server certificates only. Still keep
-  `certs/` private and never commit it.
+  installing it does not let anyone intercept your normal browsing. The CA also permits no
+  e-mail names (`permitted;email:.invalid`) and carries `extendedKeyUsage = serverAuth`, so it is
+  good for TLS server certificates only. Still keep `certs\` private and never commit it.
 - Requests from non-private, non-loopback addresses are rejected with 403.
 - **Host allowlist** (against DNS rebinding): every listener answers only requests whose `Host`
   is an IP address (IPv4 or IPv6), `localhost` or a `*.local` name, or a name you list in the
@@ -235,11 +382,11 @@ so check that file if something does not work.
 - Tracker URLs (which contain your passkey), API keys and tokens are never logged or returned
   by the API.
 - `config.local.json` contains the PIN hash, the cookie secret and the ntfy topic; it is
-  git-ignored, like `state.local.json`.
-- **Keep the secrets readable only by you.** `make_certs.py` restricts `ca.key` and
-  `server.key` itself (on Windows it removes inherited permissions with `icacls`; elsewhere
-  `chmod 600`). Do the same for the config and the rest of the certs folder, for example in
-  PowerShell from the project folder:
+  git-ignored, like `state.local.json` and `seed-ledger.json`.
+- **Keep the secrets readable only by you.** `make-certs` restricts `ca.key` and `server.key`
+  itself (it removes inherited permissions with `icacls` and grants only you and SYSTEM). Do the
+  same for the config and the rest of the certs folder, for example in PowerShell from the
+  folder of the exe:
 
   ```
   icacls config.local.json /inheritance:r /grant:r "${env:USERNAME}:F" "SYSTEM:F"
@@ -247,10 +394,20 @@ so check that file if something does not work.
   ```
 
   (`cmd.exe`: use `"%USERNAME%:F"`.) Run Plex Couch as that same user.
-- Requests to Radarr, Bazarr and Plex that carry an API key or token never follow an HTTP
-  redirect, so a key is never sent to another address.
+- Requests to Radarr, Sonarr, Bazarr and Plex that carry an API key or token never follow an
+  HTTP redirect, so a key is never sent to another address. The Plex token always goes in the
+  `X-Plex-Token` header, never in a URL; besides the local Plex server it is sent only to plex.tv
+  (`jobs.watchlist.discover_url`) to read your Watchlist.
 - Notifications are sent from the PC to the ntfy server as JSON over HTTPS; they carry only
-  movie titles, free disk space and the shutdown notice.
+  movie and show titles, free disk space and the shutdown notice.
+- The background jobs delete things (Sonarr series with their files, torrents with their
+  download copy) only under the rules above; try them with `--dry-run` first and read the log.
+
+## Resource use
+
+One process with a small async runtime (two worker threads, plus a thread for the DV strip job
+and short-lived ones for blocking calls). It typically uses about 8-18 MB of RAM and next to no
+CPU between polls; ffmpeg runs only while a file is remuxed, at below-normal priority.
 
 ## Design system
 
@@ -259,30 +416,38 @@ component with its rules and a reference preview. `static/tokens.css` is generat
 tokens; after changing `tokens.json` run:
 
 ```
-python tools/build_tokens.py           # writes static/tokens.css
-python tools/build_tokens.py --check   # exits 1 if static/tokens.css is out of date
+cargo run --example build_tokens              # writes static/tokens.css
+cargo run --example build_tokens -- --check   # exits 1 if static/tokens.css is out of date
 ```
 
+The static files are embedded in the exe at build time, so rebuild after changing them.
 `static/style.css` uses only those variables for colours, spacing, radii and sizes. The UI font
 is [Figtree](https://github.com/erikdkennedy/figtree) (SIL Open Font License 1.1, see
 `static/fonts/OFL.txt`), self-hosted as two variable woff2 files (latin and latin-ext, weights
 400-700) so the app works offline and Romanian diacritics render in the same face.
 
-## Tests
+## Development
 
 ```
-python -m unittest discover -s tests -v
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo run --example build_tokens -- --check
 ```
 
-The tests cover the pure logic (hit & run rule, tracker matching, IP checks, session tokens,
-PIN hashing, lockouts, Romanian status text, auto-monitor decisions, HTTPS redirects, cookie
-flags, the static whitelist, the CA name constraints, release-name parsing, torrent-to-movie
-matching, the poster routes, the generated tokens.css, the ntfy payload, the movie-ready and
-low-disk notifications and the after-movie shutdown decisions) and need no network or Windows
-APIs. `tests/test_security.py` covers the hardening: parallel login bursts against a local test
-server, the session epoch and renewal, the Host allowlist, the HTTPS-required startup, LAN-only
-TV sessions, cancelling after the shutdown command ran (with `shutdown.exe` replaced by a stub),
-the connection cap, upstream redirects and the certificate tool.
+The unit tests live next to the code and cover the pure logic (hit & run rule, tracker
+matching, IP checks, session tokens, PIN hashing, lockouts, Romanian status text, auto-monitor
+decisions, release-name parsing, torrent-to-movie matching, the ntfy payload, the movie-ready
+and low-disk notifications, the after-movie shutdown decisions, the CA name constraints) and the
+background jobs against fake Radarr/Sonarr/Plex/qBittorrent servers and a fake ffmpeg: the
+watchlist guards, the next-season rule, the DV strip replacement and its failure paths, the
+seed keeper's ledger and every keep/delete case. The tests in `tests/` run the real listeners:
+`security.rs` covers the hardening (parallel login bursts, the session epoch and renewal, the
+Host allowlist, the HTTPS-required startup with the exe in a child process, LAN-only TV
+sessions, cancelling after the shutdown command ran with `shutdown.exe` replaced by a stub, the
+connection cap and timeout, upstream redirects), `web.rs` the routes, poster proxy, static
+files, the generated tokens.css and HTTPS with certificates from `make-certs`, and `cli.rs` the
+flags and `make-certs` validation. No test needs the network, a real service or admin rights;
+the services point at closed local ports.
 
 ## License
 
