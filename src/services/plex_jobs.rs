@@ -6,7 +6,7 @@ use crate::services::arr_jobs::urlencode;
 use crate::services::{Client, UpResult, UpstreamError};
 use reqwest::Method;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 pub const PLEX_TIMEOUT: Duration = Duration::from_secs(20);
@@ -30,7 +30,30 @@ pub struct WatchItem {
 impl WatchItem {
     /// The tvdb id from the `Guid` list (`tvdb://<n>`).
     pub fn tvdb(&self) -> Option<i64> {
-        self.guids.iter().find_map(|g| g.strip_prefix("tvdb://").and_then(|n| n.trim().parse().ok()))
+        self.guid_num("tvdb")
+    }
+
+    pub fn tmdb(&self) -> Option<i64> {
+        self.guid_num("tmdb")
+    }
+
+    /// `imdb://tt0088763` -> `tt0088763` (lower-case).
+    pub fn imdb(&self) -> Option<String> {
+        self.guids.iter().find_map(|g| {
+            let rest = g.trim().strip_prefix("imdb://")?;
+            let id: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+            (id.len() > 2).then(|| id.to_lowercase())
+        })
+    }
+
+    /// `<scheme>://<digits>[anything]` -> the digits (suffixes and queries ignored).
+    fn guid_num(&self, scheme: &str) -> Option<i64> {
+        let pre = format!("{scheme}://");
+        self.guids.iter().find_map(|g| {
+            let rest = g.trim().strip_prefix(&pre)?;
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok().filter(|n: &i64| *n > 0)
+        })
     }
 }
 
@@ -95,6 +118,8 @@ impl PlexJobs {
         }
         let base = discover.trim_end_matches('/');
         let mut items = Vec::new();
+        let mut keys: HashSet<String> = HashSet::new();
+        let mut first_total: Option<usize> = None;
         let mut start = 0usize;
         loop {
             let url = format!(
@@ -103,13 +128,23 @@ impl PlexJobs {
             let v = self.c.http.get_json(&url, &Self::headers(&token), PLEX_TIMEOUT).await?.ok_or(UpstreamError::Body)?;
             let mc = v.get("MediaContainer").ok_or(UpstreamError::Body)?;
             let total = mc.get("totalSize").and_then(Value::as_u64).ok_or(UpstreamError::Body)? as usize;
+            if *first_total.get_or_insert(total) != total {
+                return Err(UpstreamError::Other("watchlist: totalSize changed while paging"));
+            }
             let page: Vec<&Value> = mc.get("Metadata").and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default();
             for m in &page {
-                let guids = m
+                let guids: Vec<String> = m
                     .get("Guid")
                     .and_then(Value::as_array)
                     .map(|a| a.iter().filter_map(|g| g.get("id").and_then(Value::as_str).map(String::from)).collect())
                     .unwrap_or_default();
+                let key = ["ratingKey", "guid"]
+                    .iter()
+                    .find_map(|k| m.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from))
+                    .ok_or(UpstreamError::Other("watchlist: item without ratingKey/guid"))?;
+                if !keys.insert(key) {
+                    continue;
+                }
                 items.push(WatchItem {
                     kind: m.get("type").and_then(Value::as_str).unwrap_or("").to_string(),
                     title: m.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -118,11 +153,68 @@ impl PlexJobs {
             }
             start += page.len();
             if start >= total {
+                // Duplicates across pages (the list shifted while paging) or a short list:
+                // never act on it.
+                if items.len() != total {
+                    return Err(UpstreamError::Other("watchlist: item count does not match totalSize"));
+                }
                 return Ok(items);
             }
             if page.is_empty() || start > 10_000 {
                 return Err(UpstreamError::Other("watchlist: incomplete paging"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::testutil::{app, fake, ok, Req};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    fn item(rk: &str, tvdb: &str) -> Value {
+        json!({"type": "show", "ratingKey": rk, "title": rk, "Guid": [{"id": tvdb}]})
+    }
+
+    #[test]
+    fn guid_parsing() {
+        let w = WatchItem { kind: "show".into(), title: "x".into(), guids: vec!["imdb://tt0088763".into(), "tmdb://105?lang=en".into(), "tvdb://299/extra".into()] };
+        assert_eq!((w.tvdb(), w.tmdb(), w.imdb()), (Some(299), Some(105), Some("tt0088763".to_string())));
+        let bad = WatchItem { kind: "show".into(), title: "x".into(), guids: vec!["tvdb://".into(), "tvdb://abc".into()] };
+        assert_eq!(bad.tvdb(), None);
+    }
+
+    async fn pages(p: Vec<Value>) -> Result<Vec<WatchItem>, UpstreamError> {
+        let p = Arc::new(Mutex::new(p));
+        let f = fake(move |r: &Req| {
+            let start: usize = r.path.split("X-Plex-Container-Start=").nth(1).and_then(|s| s.split('&').next()).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let pages = p.lock().unwrap();
+            ok(pages.iter().find(|pg| pg["start"] == start).cloned().unwrap_or(json!({}))["body"].clone())
+        })
+        .await;
+        let (a, _d) = app(&f.base, false, json!({}));
+        PlexJobs::new(a.services.plex.c.clone()).watchlist(&f.base).await
+    }
+
+    fn page(start: usize, total: usize, items: Vec<Value>) -> Value {
+        json!({"start": start, "body": {"MediaContainer": {"totalSize": total, "size": items.len(), "Metadata": items}}})
+    }
+
+    #[tokio::test]
+    async fn paging_dedupes_and_checks_the_total() {
+        // Two clean pages.
+        let ok2 = pages(vec![page(0, 2, vec![item("1", "tvdb://1")]), page(1, 2, vec![item("2", "tvdb://2")])]).await;
+        assert_eq!(ok2.unwrap().len(), 2);
+        // The list shifted: item 1 repeats on page 2, so only 1 unique of 2.
+        let dup = pages(vec![page(0, 2, vec![item("1", "tvdb://1")]), page(1, 2, vec![item("1", "tvdb://1")])]).await;
+        assert!(dup.is_err());
+        // totalSize changed between pages.
+        let moved = pages(vec![page(0, 3, vec![item("1", "tvdb://1")]), page(1, 2, vec![item("2", "tvdb://2"), item("3", "tvdb://3")])]).await;
+        assert!(moved.is_err());
+        // An item without ratingKey or guid.
+        let anon = pages(vec![page(0, 1, vec![json!({"type": "show"})])]).await;
+        assert!(anon.is_err());
     }
 }
