@@ -11,17 +11,23 @@
 //! (token in the header, plan fix 24). ffmpeg/ffprobe run without a window at below-normal
 //! priority.
 //!
+//! Safety: the verified remux replaces the original with one rename (replace-existing;
+//! across volumes via `<file>.partial` next to it), retried while Plex holds the file,
+//! and only while the original still has the stamp it had before probing. Files whose
+//! remux failed are skipped for 24 h (`strip_dv_failed` in the state file); temp files
+//! older than 24 h are removed each pass.
+//!
 //! Dry-run: files are probed (read-only), nothing is remuxed, the seen file and the
 //! strip-dv log are not written; the would-be actions go to the app log.
 
 use crate::app::AppState;
-use crate::jobs::common::{id_of, job_cfg, job_str};
+use crate::jobs::common::{id_of, job_cfg, job_str, unix_now};
 use crate::jobs::Stop;
 use crate::services::arr_jobs::Arr;
 use crate::services::plex_jobs::{path_key, PlexJobs};
 use crate::{log_info, log_warning};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -35,9 +41,55 @@ pub const FIRST_RUN: Duration = Duration::from_secs(60);
 pub const MUTEX_NAME: &str = "Global\\PlexStripDV";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 const REMUX_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
-/// Deleting the original: 60 tries, 60 s apart (Plex may be playing it).
+/// Replacing the original: 60 tries, 60 s apart (Plex may be playing it).
 const DELETE_TRIES: u32 = 60;
 const DELETE_WAIT: Duration = Duration::from_secs(60);
+/// A file that failed (ffmpeg, verification, locked) is not retried for this long.
+pub const FAILED_RETRY_SECONDS: f64 = 24.0 * 3600.0;
+/// Leftover temp files older than this are deleted.
+pub const ORPHAN_AGE_SECONDS: f64 = 24.0 * 3600.0;
+/// `state.local.json` key: `{"<stamp>": <unix time of the failure>}`.
+pub const FAILED_KEY: &str = "strip_dv_failed";
+
+/// What one file's run came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// No DV (any more) or nothing doable: recorded in the seen file.
+    Fine,
+    /// Try again next pass (missing, no space, changed meanwhile, stopping, dry-run).
+    NotNow,
+    /// ffmpeg, verification or replacement failed: skipped for 24 h.
+    Failed,
+}
+
+/// The failed stamps from the state file (unreadable state: none).
+pub fn load_failed(app: &AppState) -> HashMap<String, f64> {
+    app.state_file
+        .try_load()
+        .ok()
+        .and_then(|m| m.get(FAILED_KEY).and_then(Value::as_object).cloned())
+        .map(|m| m.into_iter().filter_map(|(k, v)| Some((k, v.as_f64()?))).collect())
+        .unwrap_or_default()
+}
+
+/// Save the failed stamps, dropping the ones older than 24 h.
+pub fn save_failed(app: &AppState, failed: &HashMap<String, f64>, now: f64) {
+    let m: serde_json::Map<String, Value> =
+        failed.iter().filter(|(_, t)| now - **t < FAILED_RETRY_SECONDS).map(|(k, t)| (k.clone(), json!(t))).collect();
+    let mut c = serde_json::Map::new();
+    c.insert(FAILED_KEY.into(), Value::Object(m));
+    app.state_file.update(c);
+}
+
+/// Same drive / UNC share (a rename cannot cross volumes).
+pub fn same_volume(a: &Path, b: &Path) -> bool {
+    let root = |p: &Path| match p.components().next() {
+        Some(std::path::Component::Prefix(x)) => Some(x.as_os_str().to_string_lossy().to_lowercase()),
+        _ => None,
+    };
+    root(a).is_some() && root(a) == root(b)
+}
+
 /// .NET `DateTime` ticks at the Unix epoch.
 const TICKS_AT_EPOCH: u128 = 621_355_968_000_000_000;
 
@@ -57,8 +109,10 @@ pub struct DvConfig {
     pub seen: PathBuf,
     pub ffmpeg_bin: String,
     pub ffmpeg_packages: String,
-    /// Waits between delete tries of the original (tests shorten it).
+    /// Waits between replace tries of the original (tests shorten it).
     pub delete_wait: Duration,
+    /// Tests: take the cross-volume path (copy to `<file>.partial`) on one volume.
+    pub force_cross_volume: bool,
 }
 
 impl DvConfig {
@@ -88,6 +142,7 @@ impl DvConfig {
             ffmpeg_bin: s("ffmpeg_bin", ""),
             ffmpeg_packages: s("ffmpeg_packages", "C:\\Users\\dragu\\AppData\\Local\\Microsoft\\WinGet\\Packages"),
             delete_wait: DELETE_WAIT,
+            force_cross_volume: false,
         }
     }
 }
@@ -362,9 +417,13 @@ impl Worker<'_> {
         self.cfg.libraries.iter().find(|l| f.starts_with(&format!("{}\\", path_key(&l.root))))
     }
 
-    /// `-All`: every `.mkv` not in the seen file. Returns the number of files processed.
+    /// `-All`: every `.mkv` not in the seen file and not failed in the last 24 h. Returns
+    /// the number of files looked at.
     pub fn run_all(&self) -> usize {
+        self.clean_orphans();
         let seen = load_seen(&self.cfg.seen);
+        let now = unix_now();
+        let mut failed = load_failed(self.app);
         let mut n = 0;
         for lib in &self.cfg.libraries {
             for f in mkv_files(Path::new(&lib.root)) {
@@ -375,46 +434,79 @@ impl Worker<'_> {
                 if seen.contains(&st) {
                     continue;
                 }
+                if failed.get(&st).is_some_and(|t| now - t < FAILED_RETRY_SECONDS) {
+                    continue;
+                }
                 n += 1;
-                let ok = match self.strip(&f) {
-                    Ok(ok) => ok,
+                let outcome = match self.strip(&f, &st) {
+                    Ok(o) => o,
                     Err(e) => {
                         self.log.line(&format!("EROARE: {}: {e}", f.display()));
-                        false
+                        Outcome::Failed
                     }
                 };
-                if ok && !self.log.dry_run {
-                    match stamp(&f).and_then(|s| append_line(&self.cfg.seen, &s)) {
-                        Ok(()) => {}
-                        Err(e) => log_warning!("strip-dv: cannot write the seen file: {}", crate::state::io_error_name(&e)),
+                match outcome {
+                    Outcome::Fine if !self.log.dry_run => {
+                        if let Err(e) = stamp(&f).and_then(|s| append_line(&self.cfg.seen, &s)) {
+                            log_warning!("strip-dv: cannot write the seen file: {}", crate::state::io_error_name(&e));
+                        }
                     }
+                    Outcome::Failed if !self.log.dry_run => {
+                        failed.insert(st.clone(), unix_now());
+                        save_failed(self.app, &failed, unix_now());
+                        log_info!("strip-dv: {} failed, skipped for 24 h", f.display());
+                    }
+                    _ => {}
                 }
             }
         }
         n
     }
 
-    /// `Invoke-StripDV`: true if the file is fine now (no DV, or nothing doable).
-    pub fn strip(&self, file: &Path) -> Result<bool, String> {
+    /// Delete `*.nodv.mkv` leftovers in the temp dir older than 24 h. A file still open
+    /// (an ffmpeg of the old script) cannot be deleted on Windows and is left alone.
+    pub fn clean_orphans(&self) {
+        let Ok(rd) = fs::read_dir(&self.cfg.tmp_dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            if !name.ends_with(".nodv.mkv") || !p.is_file() {
+                continue;
+            }
+            let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs_f64() > ORPHAN_AGE_SECONDS);
+            if !old {
+                continue;
+            }
+            if self.log.dry_run {
+                self.log.line(&format!("would delete old temp file: {}", p.display()));
+            } else if fs::remove_file(&p).is_ok() {
+                self.log.line(&format!("sters fisier temporar vechi: {}", p.display()));
+            }
+        }
+    }
+
+    /// `Invoke-StripDV`. `before` is the original's stamp taken before probing: the file is
+    /// only replaced while it still matches.
+    pub fn strip(&self, file: &Path, before: &str) -> Result<Outcome, String> {
         let leaf = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if !file.exists() {
             self.log.line(&format!("lipsa: {}", file.display()));
-            return Ok(false);
+            return Ok(Outcome::NotNow);
         }
         let probe = self.tools.probe(file)?;
         if !has_dv(&probe) {
             self.log.line(&format!("fara DV: {leaf}"));
-            return Ok(true);
+            return Ok(Outcome::Fine);
         }
         if !has_hdr10(&probe) {
             self.log.line(&format!("DV fara HDR10 (nu pot scoate DV): {}", file.display()));
-            return Ok(true);
+            return Ok(Outcome::Fine);
         }
         let size = fs::metadata(file).map_err(|e| e.to_string())?.len();
         if let Some(free) = free_bytes(file) {
             if (free as f64) < size as f64 * 1.1 {
                 self.log.line(&format!("EROARE: spatiu insuficient pentru {}", file.display()));
-                return Ok(false);
+                return Ok(Outcome::NotNow);
             }
         }
         let maps = stream_maps(&probe);
@@ -422,7 +514,7 @@ impl Worker<'_> {
         let gb = one_decimal(size as f64 / 1_073_741_824.0);
         if self.log.dry_run {
             self.log.line(&format!("would remux: {leaf} ({gb} GB) -> {} with {}", tmp.display(), maps.join(" ")));
-            return Ok(false);
+            return Ok(Outcome::NotNow);
         }
         fs::create_dir_all(&self.cfg.tmp_dir).map_err(|e| e.to_string())?;
         self.log.line(&format!("remux start: {leaf} ({gb} GB)"));
@@ -433,7 +525,7 @@ impl Worker<'_> {
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
                 self.log.line(&format!("EROARE: ffmpeg a esuat ({e}), originalul ramane"));
-                return Ok(false);
+                return Ok(if self.stopped() { Outcome::NotNow } else { Outcome::Failed });
             }
         };
         for l in &lines {
@@ -442,38 +534,77 @@ impl Worker<'_> {
         if code != 0 || !tmp.exists() {
             self.log.line(&format!("EROARE: ffmpeg a esuat ({code}), originalul ramane"));
             let _ = fs::remove_file(&tmp);
-            return Ok(false);
+            return Ok(Outcome::Failed);
         }
         let out = self.tools.probe(&tmp)?;
         let (din, dout) = (duration(&probe), duration(&out));
         if has_dv(&out) || (din - dout).abs() > 2.0 {
             self.log.line(&format!("EROARE: verificare esuata (DV inca prezent sau durata {dout} vs {din}), originalul ramane"));
             let _ = fs::remove_file(&tmp);
-            return Ok(false);
+            return Ok(Outcome::Failed);
         }
-        // The library file is a hardlink to the torrent: deleting it leaves the seed alone.
-        // Plex may be playing it: retry for up to an hour.
-        for i in 0..DELETE_TRIES {
-            if fs::remove_file(file).is_ok() || !file.exists() {
-                break;
-            }
-            if i + 1 < DELETE_TRIES && self.rt.block_on(self.stop.clone().sleep(self.cfg.delete_wait)) {
-                break;
-            }
-        }
-        if file.exists() {
-            self.log.line(&format!("EROARE: originalul e blocat, noul fisier ramane in {}", tmp.display()));
-            return Ok(false);
-        }
-        if fs::rename(&tmp, file).is_err() {
-            fs::copy(&tmp, file).map_err(|e| e.to_string())?;
-            let _ = fs::remove_file(&tmp);
+        let o = self.install(&tmp, file, before);
+        if o != Outcome::Fine {
+            return Ok(o);
         }
         self.log.line(&format!("gata in {} min: {leaf}", one_decimal(t0.elapsed().as_secs_f64() / 60.0)));
         if let Err(e) = self.update_apps(file) {
             self.log.line(&format!("  atentie: refresh Radarr/Plex esuat: {e}"));
         }
-        Ok(true)
+        Ok(Outcome::Fine)
+    }
+
+    /// Put the verified `tmp` in place of `file` with one rename (replace existing). The
+    /// library file is a hardlink to the torrent, so replacing it leaves the seed alone.
+    /// Across volumes `tmp` is first copied to `<file>.partial` next to it (size checked).
+    /// Plex may hold the file: retry for up to an hour. Before each try the original must
+    /// still match `before`, else nothing is replaced.
+    fn install(&self, tmp: &Path, file: &Path, before: &str) -> Outcome {
+        let cross = self.cfg.force_cross_volume || !same_volume(tmp, file);
+        let src = if cross {
+            let mut name = file.file_name().unwrap_or_default().to_os_string();
+            name.push(".partial");
+            let partial = file.with_file_name(name);
+            let want = fs::metadata(tmp).map(|m| m.len()).ok();
+            let copied = fs::copy(tmp, &partial).ok();
+            if want.is_none() || copied != want || fs::metadata(&partial).map(|m| m.len()).ok() != want {
+                let _ = fs::remove_file(&partial);
+                self.log.line(&format!("EROARE: copierea pe discul bibliotecii a esuat, noul fisier ramane in {}", tmp.display()));
+                return Outcome::Failed;
+            }
+            partial
+        } else {
+            tmp.to_path_buf()
+        };
+        let drop_src = || {
+            if cross {
+                let _ = fs::remove_file(&src);
+            }
+        };
+        for i in 0..DELETE_TRIES {
+            if stamp(file).ok().as_deref() != Some(before) {
+                drop_src();
+                let _ = fs::remove_file(tmp);
+                self.log.line(&format!("originalul s-a schimbat in timpul remux-ului, il reiau data viitoare: {}", file.display()));
+                return Outcome::NotNow;
+            }
+            if fs::rename(&src, file).is_ok() {
+                if cross {
+                    let _ = fs::remove_file(tmp);
+                }
+                return Outcome::Fine;
+            }
+            if i + 1 < DELETE_TRIES && self.rt.block_on(self.stop.clone().sleep(self.cfg.delete_wait)) {
+                break;
+            }
+        }
+        drop_src();
+        self.log.line(&format!("EROARE: originalul e blocat, noul fisier ramane in {}", tmp.display()));
+        if self.stopped() {
+            Outcome::NotNow
+        } else {
+            Outcome::Failed
+        }
     }
 
     /// `Update-Apps`: rescan the owning movie/series, refresh the folder in Plex.
@@ -714,6 +845,8 @@ mod tests {
         ffmpeg_calls: Mutex<Vec<Vec<String>>>,
         exit: i32,
         out_probe: Value,
+        /// ffmpeg also changes the original (an upgrade landing meanwhile).
+        touch_original: bool,
     }
 
     impl Tools for FakeTools {
@@ -734,6 +867,10 @@ mod tests {
 
         fn ffmpeg(&self, args: &[String], _stop: &dyn Fn() -> bool) -> Result<(i32, Vec<String>), String> {
             self.ffmpeg_calls.lock().unwrap().push(args.to_vec());
+            if self.touch_original {
+                let input = &args[args.iter().position(|a| a == "-i").unwrap() + 1];
+                fs::write(input, b"original+upgrade").unwrap();
+            }
             if self.exit == 0 {
                 fs::write(args.last().unwrap(), b"remuxed").unwrap();
             }
@@ -742,7 +879,7 @@ mod tests {
     }
 
     fn tools(exit: i32, out_probe: Value) -> FakeTools {
-        FakeTools { probes: Mutex::new(vec![]), ffmpeg_calls: Mutex::new(vec![]), exit, out_probe }
+        FakeTools { probes: Mutex::new(vec![]), ffmpeg_calls: Mutex::new(vec![]), exit, out_probe, touch_original: false }
     }
 
     struct Setup {
@@ -765,6 +902,7 @@ mod tests {
             ffmpeg_bin: String::new(),
             ffmpeg_packages: String::new(),
             delete_wait: Duration::from_millis(1),
+            force_cross_volume: false,
         };
         Setup { lib, cfg }
     }
@@ -842,5 +980,124 @@ mod tests {
         assert_eq!(fs::read(s.lib.join("Dv (2020)").join("dv.mkv")).unwrap(), b"original");
         assert!(!s.cfg.seen.exists() && !s.cfg.log.exists() && !s.cfg.tmp_dir.exists());
         assert!(f.requests().is_empty());
+    }
+
+    /// Run passes on one app (one state file) with fresh fake tools each time.
+    async fn run_on(a: &Arc<AppState>, t: FakeTools, cfg: &DvConfig) -> Arc<FakeTools> {
+        let t = Arc::new(t);
+        let (t2, cfg, a) = (t.clone(), cfg.clone(), a.clone());
+        let rt = Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let (_h, stop) = crate::jobs::stop_pair();
+            let log = DvLog { path: cfg.log.clone(), dry_run: a.dry_run };
+            let w = Worker { app: &a, rt, cfg, tools: &*t2, log, stop: &stop };
+            w.run_all()
+        })
+        .await
+        .unwrap();
+        t
+    }
+
+    async fn test_app() -> (crate::jobs::testutil::Fake, Arc<AppState>) {
+        let f = fake(|_r: &Req| ok(json!([]))).await;
+        let (a, _d) = app(&f.base, false, json!({}));
+        (f, a)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn original_changed_during_the_remux_is_not_replaced() {
+        let s = setup();
+        let (f, a) = test_app().await;
+        let mut t = tools(0, probe(false, "smpte2084", "100"));
+        t.touch_original = true;
+        run_on(&a, t, &s.cfg).await;
+        let dv = s.lib.join("Dv (2020)").join("dv.mkv");
+        assert_eq!(fs::read(&dv).unwrap(), b"original+upgrade");
+        assert!(!s.cfg.tmp_dir.join("dv.nodv.mkv").exists());
+        assert!(!load_seen(&s.cfg.seen).contains(&stamp(&dv).unwrap()));
+        assert!(load_failed(&a).is_empty(), "a change is not a failure");
+        assert!(fs::read_to_string(&s.cfg.log).unwrap().contains("originalul s-a schimbat"));
+        assert!(f.mutations().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failures_are_skipped_for_a_day() {
+        let s = setup();
+        let (_f, a) = test_app().await;
+        run_on(&a, tools(1, Value::Null), &s.cfg).await;
+        let dv = s.lib.join("Dv (2020)").join("dv.mkv");
+        let st = stamp(&dv).unwrap();
+        assert!(load_failed(&a).contains_key(&st));
+        // Next pass: not retried (the plain file is seen, the DV one failed recently).
+        let t = run_on(&a, tools(0, probe(false, "smpte2084", "100")), &s.cfg).await;
+        assert!(t.ffmpeg_calls.lock().unwrap().is_empty());
+        assert!(t.probes.lock().unwrap().is_empty());
+        // A day later it is tried again (and succeeds); old entries are pruned.
+        let mut old = HashMap::new();
+        old.insert(st.clone(), unix_now() - FAILED_RETRY_SECONDS - 1.0);
+        let mut m = serde_json::Map::new();
+        m.insert(FAILED_KEY.into(), json!(old));
+        a.state_file.update(m);
+        let t = run_on(&a, tools(0, probe(false, "smpte2084", "100")), &s.cfg).await;
+        assert_eq!(t.ffmpeg_calls.lock().unwrap().len(), 1);
+        assert_eq!(fs::read(&dv).unwrap(), b"remuxed");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn locked_original_keeps_tmp_and_records_the_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let s = setup();
+        let (_f, a) = test_app().await;
+        let dv = s.lib.join("Dv (2020)").join("dv.mkv");
+        let st = stamp(&dv).unwrap();
+        // Held open without sharing: like Plex reading it.
+        let lock = fs::OpenOptions::new().read(true).share_mode(0).open(&dv).unwrap();
+        run_on(&a, tools(0, probe(false, "smpte2084", "100")), &s.cfg).await;
+        drop(lock);
+        assert_eq!(fs::read(&dv).unwrap(), b"original");
+        assert!(s.cfg.tmp_dir.join("dv.nodv.mkv").exists(), "the remuxed file stays in tmp");
+        assert!(load_failed(&a).contains_key(&st));
+        assert!(fs::read_to_string(&s.cfg.log).unwrap().contains("EROARE: originalul e blocat"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cross_volume_copies_to_partial_then_renames() {
+        let mut s = setup();
+        s.cfg.force_cross_volume = true;
+        let (_f, a) = test_app().await;
+        run_on(&a, tools(0, probe(false, "smpte2084", "100")), &s.cfg).await;
+        let dir = s.lib.join("Dv (2020)");
+        assert_eq!(fs::read(dir.join("dv.mkv")).unwrap(), b"remuxed");
+        assert!(!dir.join("dv.mkv.partial").exists());
+        assert!(!s.cfg.tmp_dir.join("dv.nodv.mkv").exists());
+        assert!(same_volume(Path::new("D:\\a\\b"), Path::new("d:\\c")));
+        assert!(!same_volume(Path::new("D:\\a"), Path::new("C:\\a")));
+        assert!(!same_volume(Path::new("relative"), Path::new("relative")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn old_orphan_temp_files_are_deleted() {
+        let s = setup();
+        fs::create_dir_all(&s.cfg.tmp_dir).unwrap();
+        let old = s.cfg.tmp_dir.join("old.nodv.mkv");
+        let fresh = s.cfg.tmp_dir.join("fresh.nodv.mkv");
+        let other = s.cfg.tmp_dir.join("keep.txt");
+        for p in [&old, &fresh, &other] {
+            fs::write(p, b"x").unwrap();
+        }
+        let two_days = std::time::SystemTime::now() - Duration::from_secs(48 * 3600);
+        for p in [&old, &other] {
+            fs::OpenOptions::new().write(true).open(p).unwrap().set_modified(two_days).unwrap();
+        }
+        // Dry-run: only logged.
+        let f = fake(|_r: &Req| ok(json!([]))).await;
+        let (dry, _d) = app(&f.base, true, json!({}));
+        run_on(&dry, tools(0, Value::Null), &s.cfg).await;
+        assert!(old.exists());
+        let (_f, a) = test_app().await;
+        run_on(&a, tools(0, probe(false, "smpte2084", "100")), &s.cfg).await;
+        assert!(!old.exists());
+        assert!(fresh.exists() && other.exists());
     }
 }
