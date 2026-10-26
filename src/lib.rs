@@ -13,6 +13,8 @@
 
 pub mod app;
 pub mod auth;
+pub mod certs;
+pub mod cli;
 pub mod config;
 pub mod http;
 pub mod jobs;
