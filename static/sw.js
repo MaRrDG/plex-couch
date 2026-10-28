@@ -3,7 +3,7 @@
 // /api/* is never cached (always network); the page shows "PC-ul nu răspunde" when it fails.
 // Posters (/img/*) are cached first-come in their own small cache, so they show offline too.
 
-const VERSION = 'plex-couch-v4';
+const VERSION = 'plex-couch-v5';
 const IMG_CACHE = 'plex-couch-img-v1';
 const IMG_MAX = 150;
 const SHELL = [

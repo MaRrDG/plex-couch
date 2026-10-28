@@ -6,3 +6,4 @@ certs/
 /target/
 /plex-couch.exe
 /seed-ledger.json
+/convert-ledger.json

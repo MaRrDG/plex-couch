@@ -1,5 +1,6 @@
 //! Helpers shared by the Phase 2b jobs: the optional `jobs` config section, clocks, ISO
-//! dates, quiet error logging.
+//! dates, quiet error logging, and for the ffmpeg jobs (strip_dv, convert) finding ffmpeg,
+//! running it quietly, free space and file identity (hard links).
 //!
 //! Config (all optional; the defaults are the live paths):
 //! ```json
@@ -10,7 +11,8 @@
 //!                   "seen": "D:\\Media\\scripts\\logs\\strip-dv-seen.txt",
 //!                   "libraries": [{"path": "D:\\Media\\Movies", "arr": "radarr", "section": 1},
 //!                                 {"path": "D:\\Media\\Seriale", "arr": "sonarr", "section": 2}]},
-//!   "seed_keeper": {"downloads_root": "D:\\Media\\Downloads"}
+//!   "seed_keeper": {"downloads_root": "D:\\Media\\Downloads"},
+//!   "convert":     {"ffmpeg_bin": "", "tmp_dir": "D:\\Media\\Downloads\\.reencode", "section": 2}
 //! }
 //! ```
 
@@ -18,7 +20,11 @@ use crate::app::AppState;
 use crate::log_warning;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// `jobs.<job>.<key>` from the config, if set (non-null).
 pub fn job_cfg(app: &AppState, job: &str, key: &str) -> Option<Value> {
@@ -108,6 +114,243 @@ pub fn id_of(v: Option<&Value>) -> Option<i64> {
     v.and_then(Value::as_i64).filter(|n| *n != 0)
 }
 
+// -- ffmpeg and files (strip_dv, convert) -------------------------------------------------
+
+/// Where winget unpacks portable packages such as Gyan.FFmpeg for the current user.
+pub fn default_winget_packages() -> String {
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    format!("{base}\\Microsoft\\WinGet\\Packages")
+}
+
+/// The newest `<packages>\Gyan.FFmpeg*\ffmpeg-*\bin` (full path sorted descending).
+pub fn find_ffmpeg_bin(packages: &Path) -> Option<PathBuf> {
+    let starts = |p: &Path, pre: &str| {
+        p.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with(&pre.to_lowercase()))
+    };
+    let mut found = Vec::new();
+    for pkg in fs::read_dir(packages).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir() && starts(p, "Gyan.FFmpeg")) {
+        let Ok(rd) = fs::read_dir(&pkg) else { continue };
+        for d in rd.flatten().map(|e| e.path()).filter(|p| p.is_dir() && starts(p, "ffmpeg-")) {
+            let bin = d.join("bin");
+            if bin.is_dir() {
+                found.push(bin);
+            }
+        }
+    }
+    found.sort_by_key(|p| std::cmp::Reverse(p.to_string_lossy().to_lowercase()));
+    found.into_iter().next()
+}
+
+/// `bin` if set, else the newest winget ffmpeg under `packages`; only a folder that has both
+/// `ffmpeg.exe` and `ffprobe.exe`.
+pub fn ffmpeg_bin(bin: &str, packages: &str) -> Option<PathBuf> {
+    let b = if bin.is_empty() { find_ffmpeg_bin(Path::new(packages)) } else { Some(PathBuf::from(bin)) };
+    b.filter(|b| b.join("ffmpeg.exe").is_file() && b.join("ffprobe.exe").is_file())
+}
+
+/// A command without a console window, at below-normal priority (the user games on this PC).
+#[cfg(windows)]
+pub fn quiet_command(exe: &Path) -> Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    let mut c = Command::new(exe);
+    c.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+    c
+}
+
+#[cfg(not(windows))]
+pub fn quiet_command(exe: &Path) -> Command {
+    Command::new(exe)
+}
+
+fn read_all(r: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(mut s) = r {
+            let _ = s.read_to_end(&mut b);
+        }
+        b
+    })
+}
+
+/// Run to completion (or `timeout` / `stop`), collecting stdout and stderr.
+pub fn run_capture(cmd: Command, timeout: Duration, stop: &dyn Fn() -> bool) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
+    let mut out = Vec::new();
+    let (code, err) = run_lines(cmd, timeout, stop, &mut |l: &str| {
+        out.extend_from_slice(l.as_bytes());
+        out.push(b'\n');
+    })?;
+    Ok((code, out, err))
+}
+
+/// Like [`run_capture`], but stdout goes to `on_line` line by line while the program runs
+/// (ffmpeg `-progress pipe:1`). Returns the exit code and stderr. `stop` or the timeout
+/// kills the program.
+pub fn run_lines(mut cmd: Command, timeout: Duration, stop: &dyn Fn() -> bool, on_line: &mut dyn FnMut(&str)) -> Result<(i32, Vec<u8>), String> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("cannot start: {e}"))?;
+    if !kill_with_app(&child) {
+        log_warning!("cannot tie a child process to the app (it may outlive an exit)");
+    }
+    let so = child.stdout.take();
+    let t_err = read_all(child.stderr.take());
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let t_out = std::thread::spawn(move || {
+        let Some(s) = so else { return };
+        let mut r = BufReader::new(s);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match r.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf).trim_end().to_string();
+                    let _ = tx.send(line); // keep reading even if nobody listens: never block the child
+                }
+            }
+        }
+    });
+    let started = Instant::now();
+    let code = loop {
+        while let Ok(l) = rx.try_recv() {
+            on_line(&l);
+        }
+        match child.try_wait() {
+            Ok(Some(st)) => break st.code().unwrap_or(-1),
+            Ok(None) => {}
+            Err(e) => return Err(format!("wait failed: {e}")),
+        }
+        if stop() || started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = (t_out.join(), t_err.join());
+            return Err(if stop() { "oprit".into() } else { "timeout".into() });
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let _ = t_out.join();
+    while let Ok(l) = rx.try_recv() {
+        on_line(&l);
+    }
+    Ok((code, t_err.join().unwrap_or_default()))
+}
+
+/// The app's Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`): its only handle closes when
+/// the app exits, however it exits, and Windows then kills every process in it.
+#[cfg(windows)]
+fn app_job() -> Option<usize> {
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    static JOB: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *JOB.get_or_init(|| {
+        // SAFETY: plain Win32 calls; the struct is zeroed and then filled; the handle is
+        // kept for the life of the process on purpose (never closed).
+        unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            (ok != 0).then_some(h as usize)
+        }
+    })
+}
+
+/// Put `child` in the app's Job Object, so it dies with the app (ffmpeg must never keep
+/// running, or keep a temp file open, after plex-couch exits). False if that failed.
+#[cfg(windows)]
+pub fn kill_with_app(child: &std::process::Child) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+    let Some(job) = app_job() else { return false };
+    // SAFETY: the job handle lives for the whole process, the child handle while `child` does.
+    unsafe { AssignProcessToJobObject(job as windows_sys::Win32::Foundation::HANDLE, child.as_raw_handle()) != 0 }
+}
+
+#[cfg(not(windows))]
+pub fn kill_with_app(_child: &std::process::Child) -> bool {
+    true
+}
+
+/// Same drive / UNC share (a rename cannot cross volumes).
+pub fn same_volume(a: &Path, b: &Path) -> bool {
+    let root = |p: &Path| match p.components().next() {
+        Some(std::path::Component::Prefix(x)) => Some(x.as_os_str().to_string_lossy().to_lowercase()),
+        _ => None,
+    };
+    root(a).is_some() && root(a) == root(b)
+}
+
+/// Free bytes on the file's drive (`Get-PSDrive <letter>`). None if unknown.
+#[cfg(windows)]
+pub fn free_bytes(file: &Path) -> Option<u64> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let s = file.to_string_lossy();
+    let root = format!("{}:\\", s.chars().next()?);
+    let w: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut free: u64 = 0;
+    // SAFETY: valid NUL-terminated path, out pointers to locals.
+    let ok = unsafe { GetDiskFreeSpaceExW(w.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
+    (ok != 0).then_some(free)
+}
+
+#[cfg(not(windows))]
+pub fn free_bytes(_file: &Path) -> Option<u64> {
+    None
+}
+
+/// Which file on disk a path is: NTFS volume serial + file index (hard links of one file
+/// share both), and its link count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileId {
+    pub volume: u64,
+    pub index: u64,
+    pub links: u32,
+}
+
+impl FileId {
+    /// The same file (another hard link to it counts).
+    pub fn same_file(&self, other: &FileId) -> bool {
+        self.volume == other.volume && self.index == other.index
+    }
+}
+
+/// `GetFileInformationByHandle`: volume serial, file index, `nNumberOfLinks`.
+#[cfg(windows)]
+pub fn file_id(path: &Path) -> std::io::Result<FileId> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let f = fs::File::open(path)?;
+    // SAFETY: a valid open handle and a zeroed out struct for the call to fill.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(FileId {
+        volume: info.dwVolumeSerialNumber as u64,
+        index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        links: info.nNumberOfLinks,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn file_id(path: &Path) -> std::io::Result<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path)?;
+    Ok(FileId { volume: m.dev(), index: m.ino(), links: m.nlink() as u32 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +363,29 @@ mod tests {
         assert_eq!(parse_iso_utc("2026-10-26"), Some(1_792_972_800));
         assert_eq!(parse_iso_utc("nope"), None);
         assert_eq!(parse_iso_utc(""), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn children_join_the_kill_on_close_job() {
+        let mut c = quiet_command(Path::new("cmd.exe"));
+        c.args(["/c", "exit", "0"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = c.spawn().unwrap();
+        let r = kill_with_app(&child);
+        let _ = child.wait();
+        assert!(r, "AssignProcessToJobObject");
+        let (code, out) = run_lines(
+            {
+                let mut c = quiet_command(Path::new("cmd.exe"));
+                c.args(["/c", "echo", "out_time_us=5"]);
+                c
+            },
+            Duration::from_secs(20),
+            &|| false,
+            &mut |_l: &str| {},
+        )
+        .unwrap();
+        assert_eq!((code, out.is_empty()), (0, true));
     }
 
     #[test]

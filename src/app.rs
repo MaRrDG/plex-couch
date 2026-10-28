@@ -72,6 +72,8 @@ pub struct AppState {
     pub notifier: Notifier,
     /// "Shut down after the movie": memory only, a restart disarms it.
     pub after_movie: Mutex<Option<AfterMovie>>,
+    /// The TV conversion: batch status, start/stop requests, the cached series list.
+    pub convert: crate::jobs::convert::Control,
     /// The drive the disk-low check watches (from Radarr's root folders), `D:` until known.
     pub disk_drive: Mutex<String>,
     own_ips: Mutex<Option<(Instant, HashSet<String>)>>,
@@ -109,6 +111,7 @@ impl AppState {
             actions,
             notifier,
             after_movie: Mutex::new(None),
+            convert: crate::jobs::convert::Control::new(),
             disk_drive: Mutex::new("D:".into()),
             own_ips: Mutex::new(None),
             started: Instant::now(),

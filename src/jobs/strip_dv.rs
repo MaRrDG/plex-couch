@@ -21,7 +21,9 @@
 //! strip-dv log are not written; the would-be actions go to the app log.
 
 use crate::app::AppState;
-use crate::jobs::common::{id_of, job_cfg, job_str, unix_now};
+use crate::jobs::common::{
+    default_winget_packages, find_ffmpeg_bin, free_bytes, id_of, job_cfg, job_str, quiet_command, run_capture, same_volume, unix_now,
+};
 use crate::jobs::Stop;
 use crate::services::arr_jobs::Arr;
 use crate::services::plex_jobs::{path_key, PlexJobs};
@@ -29,9 +31,8 @@ use crate::{log_info, log_warning};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::runtime::Handle;
@@ -79,15 +80,6 @@ pub fn save_failed(app: &AppState, failed: &HashMap<String, f64>, now: f64) {
     let mut c = serde_json::Map::new();
     c.insert(FAILED_KEY.into(), Value::Object(m));
     app.state_file.update(c);
-}
-
-/// Same drive / UNC share (a rename cannot cross volumes).
-pub fn same_volume(a: &Path, b: &Path) -> bool {
-    let root = |p: &Path| match p.components().next() {
-        Some(std::path::Component::Prefix(x)) => Some(x.as_os_str().to_string_lossy().to_lowercase()),
-        _ => None,
-    };
-    root(a).is_some() && root(a) == root(b)
 }
 
 /// .NET `DateTime` ticks at the Unix epoch.
@@ -145,12 +137,6 @@ impl DvConfig {
             force_cross_volume: false,
         }
     }
-}
-
-/// Where winget unpacks portable packages such as Gyan.FFmpeg for the current user.
-fn default_winget_packages() -> String {
-    let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    format!("{base}\\Microsoft\\WinGet\\Packages")
 }
 
 // -- probing and decisions (pure) ---------------------------------------------------------
@@ -265,25 +251,6 @@ pub fn mkv_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The newest `<packages>\Gyan.FFmpeg*\ffmpeg-*\bin` (full path sorted descending).
-pub fn find_ffmpeg_bin(packages: &Path) -> Option<PathBuf> {
-    let starts = |p: &Path, pre: &str| {
-        p.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with(&pre.to_lowercase()))
-    };
-    let mut found = Vec::new();
-    for pkg in fs::read_dir(packages).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir() && starts(p, "Gyan.FFmpeg")) {
-        let Ok(rd) = fs::read_dir(&pkg) else { continue };
-        for d in rd.flatten().map(|e| e.path()).filter(|p| p.is_dir() && starts(p, "ffmpeg-")) {
-            let bin = d.join("bin");
-            if bin.is_dir() {
-                found.push(bin);
-            }
-        }
-    }
-    found.sort_by_key(|p| std::cmp::Reverse(p.to_string_lossy().to_lowercase()));
-    found.into_iter().next()
-}
-
 // -- tools --------------------------------------------------------------------------------
 
 /// The external programs, behind a trait so tests can fake ffmpeg/ffprobe.
@@ -295,61 +262,9 @@ pub trait Tools: Send + Sync {
     fn ffmpeg(&self, args: &[String], stop: &dyn Fn() -> bool) -> Result<(i32, Vec<String>), String>;
 }
 
+/// ffmpeg.exe and ffprobe.exe in `bin` (also the encoder of [`crate::jobs::convert`]).
 pub struct Ffmpeg {
     pub bin: PathBuf,
-}
-
-#[cfg(windows)]
-fn quiet_command(exe: &Path) -> Command {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
-    let mut c = Command::new(exe);
-    c.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
-    c
-}
-
-#[cfg(not(windows))]
-fn quiet_command(exe: &Path) -> Command {
-    Command::new(exe)
-}
-
-/// Run to completion (or `timeout` / `stop`), collecting stdout and stderr.
-fn run_capture(mut cmd: Command, timeout: Duration, stop: &dyn Fn() -> bool) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("cannot start: {e}"))?;
-    let mut so = child.stdout.take();
-    let mut se = child.stderr.take();
-    let t_out = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(s) = so.as_mut() {
-            let _ = s.read_to_end(&mut b);
-        }
-        b
-    });
-    let t_err = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(s) = se.as_mut() {
-            let _ = s.read_to_end(&mut b);
-        }
-        b
-    });
-    let started = Instant::now();
-    let code = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st.code().unwrap_or(-1),
-            Ok(None) => {}
-            Err(e) => return Err(format!("wait failed: {e}")),
-        }
-        if stop() || started.elapsed() > timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = (t_out.join(), t_err.join());
-            return Err(if stop() { "oprit (aplicatia se inchide)".into() } else { "timeout".into() });
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    Ok((code, t_out.join().unwrap_or_default(), t_err.join().unwrap_or_default()))
 }
 
 impl Tools for Ffmpeg {
@@ -644,24 +559,6 @@ impl Worker<'_> {
             plex.refresh_path(lib.section, &dir).await.map_err(|e| e.to_string())
         })
     }
-}
-
-/// Free bytes on the file's drive (`Get-PSDrive <letter>`). None if unknown.
-#[cfg(windows)]
-fn free_bytes(file: &Path) -> Option<u64> {
-    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-    let s = file.to_string_lossy();
-    let root = format!("{}:\\", s.chars().next()?);
-    let w: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut free: u64 = 0;
-    // SAFETY: valid NUL-terminated path, out pointers to locals.
-    let ok = unsafe { GetDiskFreeSpaceExW(w.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
-    (ok != 0).then_some(free)
-}
-
-#[cfg(not(windows))]
-fn free_bytes(_file: &Path) -> Option<u64> {
-    None
 }
 
 /// The script's global mutex, held for one run on this thread.

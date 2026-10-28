@@ -68,6 +68,11 @@
     },
     "seed_keeper": {
       "downloads_root": "D:\\Media\\Downloads"
+    },
+    "convert": {
+      "ffmpeg_bin": "",
+      "tmp_dir": "D:\\Media\\Downloads\\.reencode",
+      "section": 2
     }
   }
 }

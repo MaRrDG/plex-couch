@@ -136,6 +136,46 @@ still kept).
     copy shares it.
   - Any API error, unknown mapping, missing file or failed check keeps the torrent.
 
+- **Conversie pentru TV** (PC tab, only when you press it): the Samsung TV's Plex app cannot
+  direct-play 10-bit H.264 (Hi10P), so Plex transcodes and the TV buffers. The PC tab lists the
+  series with unwatched Hi10P episodes (from Sonarr's media info, no scan of the library), how
+  many and the next one. Pick a series and a count (1-20, default 2) and press "Convertește":
+  the next unwatched episodes, in episode order, are re-encoded one at a time to HEVC Main10 on
+  the AMD GPU (`hevc_amf`, BT.709 colour tags, audio/subtitles/fonts copied), at below-normal
+  priority without a window, into `jobs.convert.tmp_dir` (default `D:\Media\Downloads\.reencode`).
+  An episode playing in Plex is passed over. The result is checked (HEVC, same length within
+  1 s, same number of audio and subtitle streams) and then renamed over the library file; that
+  breaks the library hardlink, so the torrent copy stays byte-identical for seeding. Sonarr
+  rescans the series and Plex refreshes the folder. The tab shows the episode, the percent, the
+  queue and the results; "Oprește conversia" kills ffmpeg at once and deletes its temp file
+  (the library file stays as it was). One batch at a time; ntfy says when it is done.
+  - Safety: nothing runs unless Sonarr and qBittorrent answer and the temp folder is a full
+    path that does not overlap a Sonarr/Radarr root folder or a torrent's files. An episode
+    whose library path is itself a file of a torrent (or when that cannot be checked) is skipped.
+    ffmpeg is tied to the app (a Windows Job Object), so it never outlives plex-couch. Only
+    the files the job itself creates are ever cleaned up after a crash (recorded in
+    `state.local.json`, plus `<file>.partial` / `<file>.revert.tmp` next to converted files).
+  - **Back to the original after watching**: `convert-ledger.json` (next to the config) records
+    each converted file and the torrent file it was hardlinked to (found through Sonarr's import
+    history, else qBittorrent's file list, and checked to be the same NTFS file). Every 5
+    minutes, once an episode is watched in Plex and not playing, and the torrent file is still
+    there with its size, still the very same NTFS file (volume serial + file index recorded at
+    conversion) and still part of a torrent in qBittorrent, the library file becomes a hard
+    link to it again (Plex and Sonarr are refreshed). If the torrent is gone or replaced by then
+    (the seed keeper deleted it, or it was downloaded again), the converted file simply stays.
+  - The seed keeper is not affected: for mapped torrents it decides by "watched", and for an
+    unmapped torrent a converted episode just means its file has no library link (link count
+    1), which is true: the library has its own copy.
+
+- **Paced Romanian subtitles** (every 3 minutes, first run 75 s after start): when a whole
+  season arrives at once, Bazarr searches every episode together and the Romanian providers
+  rate-limit it, so most episodes wait for Bazarr's next wanted search (every 6 h). This job asks
+  Bazarr for one `ro` search per run, for the episode you will watch next: the next unwatched
+  episode of each series (by Plex's watched state), the most recently watched series first.
+  Watched episodes are left to Bazarr; movies get a turn when no episode is due. After each
+  search the same episode waits 30 min, then 2 h, then 6 h (kept in `state.local.json` under
+  `subs_search`, dropped once the subtitle is found).
+
 The seed keeper and the next-season check read "watched" from Plex library section 1 (movies)
 and section 2 (TV); these are fixed. The DV strip takes the section of each library from the
 config.
