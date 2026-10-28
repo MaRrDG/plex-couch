@@ -1,26 +1,33 @@
-//! "Conversie pentru TV" (PC tab): episodes the Samsung TV cannot direct-play are re-encoded
-//! to HEVC Main10 on the AMD GPU (`hevc_amf`), on request only. The rule is
-//! [`tv_needs_conversion`]: H.264 with more than 8 bits per sample (Hi10P). Plex would
-//! transcode those to DASH and the TV buffers every ~25 s; HEVC Main10 direct-plays.
+//! "Conversie pentru TV" (Seriale tab and the movie sheet in Filme): episodes and movies the
+//! Samsung TV cannot direct-play are re-encoded to HEVC Main10 on the AMD GPU (`hevc_amf`), on
+//! request only. The rule is [`tv_needs_conversion`]: H.264 with more than 8 bits per sample
+//! (Hi10P). Plex would transcode those to DASH and the TV buffers every ~25 s; HEVC Main10
+//! direct-plays.
 //!
-//! ## The list (`GET /api/convert`)
-//! From Sonarr only (series, episode files with `mediaInfo.videoCodec` / `videoBitDepth`,
-//! episodes), never an ffprobe of the library; "watched" is Plex's `viewCount` per file path
-//! (section 2, every episode); files in the ledger are already converted. Per series: how many
-//! unwatched episodes need it and the next one. Cached 60 s (a failure 15 s) and loaded in the
-//! background, so a slow Sonarr never blocks the page.
+//! ## What needs it
+//! From Sonarr/Radarr only (episode files / the movie file with `mediaInfo.videoCodec` /
+//! `videoBitDepth`), never an ffprobe of the library; "watched" is Plex's `viewCount` per file
+//! path (section 2 for every episode, `jobs.convert.movie_section` (1) for movies); files in
+//! the ledger are already converted. The Seriale grid and the series screen
+//! (`crate::logic::series`) show it; the grid list is cached here ([`Control::listing`]: 60 s,
+//! a failure 15 s, loaded in the background so a slow Sonarr never blocks the page).
+//! `GET /api/convert` is only the batch status (cheap, polled by the Acasă banner).
 //!
-//! ## A batch (`POST /api/convert/start` `{seriesId, count}`, count 1..=20)
+//! ## A batch (`POST /api/convert/start`)
+//! `{seriesId, count}` (1..=20: the next unwatched ones), `{seriesId, episodeIds: [...]}`
+//! (these, 1..=20, each must need it and be unwatched) or `{movieId}` (a Radarr movie).
 //! One batch at a time, on the job's own OS thread, one episode at a time in episode order
 //! (season, episode; specials last), from the first unwatched one. An episode playing in Plex
-//! (a session's file path, or show + season + episode) is passed over for the next one. Per
+//! (a session's file path, or show + season + episode; a movie by path or title) is passed
+//! over for the next one. Per
 //! episode: ffprobe (still Hi10P? else it is skipped), find the torrent file the library file is
 //! hardlinked to (below), ffmpeg with exactly [`ffmpeg_args`] (below-normal priority, no
 //! window) into the temp dir, verify the result (HEVC, duration within 1 s, as many audio and
 //! subtitle streams), then one rename over the library file while it still has the stamp it had
 //! before (across volumes via `<file>.partial`; retried every 30 s for 10 min while locked or
 //! playing; on failure the temp file is deleted and the library file stays). Then the ledger
-//! entry, a Plex refresh of the folder and Sonarr `RescanSeries`. Renaming over the library
+//! entry, a Plex refresh of the folder and Sonarr `RescanSeries` (Radarr `RescanMovie` for a
+//! movie: same command, checks, ledger and revert). Renaming over the library
 //! path breaks its hardlink: the torrent copy stays byte-identical (FileList seeding). ntfy
 //! when the batch ends (also after errors). A failed episode counts towards the count, so a
 //! broken encoder never runs through the whole series.
@@ -29,8 +36,8 @@
 //! library file is untouched and the batch ends.
 //!
 //! ## Finding the torrent file (before converting)
-//! Only when the library file has more than one hard link. Candidates: Sonarr's
-//! `downloadFolderImported` history of the episode (`data.droppedPath`, newest first), then
+//! Only when the library file has more than one hard link. Candidates: Sonarr's (Radarr's for a
+//! movie) `downloadFolderImported` history of the item (`data.droppedPath`, newest first), then
 //! every completed qBittorrent torrent under the downloads root with a file of the same size.
 //! A candidate counts only if it is the same file (NTFS volume serial + file index,
 //! `GetFileInformationByHandle`). None found: the entry has no original (no revert).
@@ -42,7 +49,8 @@
 //! - not watched, or playing now, or Plex/qBittorrent did not answer: keep it for later;
 //! - watched and the original still exists with its size and is still a file of a torrent in
 //!   qBittorrent: hard-link it next to the library file (`<name>.revert.tmp`, same folder),
-//!   rename that over the converted file, Plex refresh + `RescanSeries`, drop the entry;
+//!   rename that over the converted file, Plex refresh + `RescanSeries` / `RescanMovie`, drop
+//!   the entry;
 //! - watched but no original, or the original is gone (the seed keeper deleted the torrent):
 //!   keep the converted file, drop the entry.
 //!
@@ -56,6 +64,7 @@ use crate::jobs::common::{
 use crate::jobs::seed_keeper::under_root;
 use crate::jobs::strip_dv::{duration, stamp, DvConfig, Ffmpeg};
 use crate::jobs::Stop;
+use crate::services::arr_jobs::Arr;
 use crate::services::plex_jobs::{path_key, PlexJobs};
 use crate::services::qbit_jobs::QbitJobs;
 use crate::services::UpstreamError;
@@ -86,8 +95,11 @@ pub const REVERT_SUFFIX: &str = ".revert.tmp";
 pub const LEFTOVERS_KEY: &str = "convert_leftovers";
 /// The converted file may be this much shorter or longer than the source.
 pub const DURATION_TOLERANCE: f64 = 1.0;
-/// Sonarr's `EpisodeHistoryEventType.DownloadFolderImported`.
-const SONARR_IMPORTED: i64 = 3;
+/// Sonarr's `EpisodeHistoryEventType.DownloadFolderImported` (Radarr's movie one is 3 too).
+const ARR_IMPORTED: i64 = 3;
+/// The Plex movie section when neither `jobs.convert.movie_section` nor strip_dv's Radarr
+/// library says otherwise.
+pub const DEFAULT_MOVIE_SECTION: u32 = 1;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 const ENCODE_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
 /// Replacing the library file: 20 tries, 30 s apart (Plex may hold it).
@@ -138,6 +150,8 @@ pub fn probe_needs_conversion(probe: &Value) -> bool {
 
 // -- episodes and candidates (pure) ------------------------------------------------------
 
+/// One file to convert: an episode, or a movie (`movie_id` set, `series_title` is the movie's
+/// title, the episode fields 0).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Episode {
     pub series_id: i64,
@@ -148,11 +162,18 @@ pub struct Episode {
     /// The library file.
     pub path: String,
     pub size: u64,
+    /// A Radarr movie id (0 for an episode).
+    pub movie_id: i64,
 }
 
 impl Episode {
+    /// `S01E04`, or the movie title.
     pub fn label(&self) -> String {
-        label(self.season, self.number)
+        if self.movie_id != 0 {
+            self.series_title.clone()
+        } else {
+            label(self.season, self.number)
+        }
     }
 }
 
@@ -183,6 +204,7 @@ pub fn candidates(series: &Value, episodes: &[Value], files: &[Value], views: &H
             number: e.get("episodeNumber").and_then(Value::as_i64).unwrap_or(0),
             path: path.to_string(),
             size: f.get("size").and_then(Value::as_u64).unwrap_or(0),
+            movie_id: 0,
         });
     }
     out.sort_by_key(|e| (e.season == 0, e.season, e.number, e.episode_id));
@@ -191,11 +213,12 @@ pub fn candidates(series: &Value, episodes: &[Value], files: &[Value], views: &H
     out
 }
 
-/// What Plex is playing right now: file paths and (show, season, episode).
+/// What Plex is playing right now: file paths, (show, season, episode) and movie titles.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Playing {
     pub files: HashSet<String>,
     pub episodes: HashSet<(String, i64, i64)>,
+    pub movies: HashSet<String>,
 }
 
 impl Playing {
@@ -203,13 +226,31 @@ impl Playing {
         self.files.contains(&path_key(path)) || self.episodes.contains(&(show.trim().to_lowercase(), season, number))
     }
 
+    /// A movie: by its file path or its title.
+    pub fn contains_movie(&self, path: &str, title: &str) -> bool {
+        self.files.contains(&path_key(path)) || self.movies.contains(&title.trim().to_lowercase())
+    }
+
     pub fn has(&self, e: &Episode) -> bool {
-        self.contains(&e.path, &e.series_title, e.season, e.number)
+        if e.movie_id != 0 {
+            self.contains_movie(&e.path, &e.series_title)
+        } else {
+            self.contains(&e.path, &e.series_title, e.season, e.number)
+        }
+    }
+
+    /// A ledger entry's library file is playing.
+    pub fn has_entry(&self, e: &Entry) -> bool {
+        if e.movie_id != 0 {
+            self.contains_movie(&e.library, &e.series)
+        } else {
+            self.contains(&e.library, &e.series, e.season, e.episode)
+        }
     }
 }
 
 /// Plex `/status/sessions` JSON -> [`Playing`] (`Media[].Part[].file`; episodes also by
-/// `grandparentTitle` + `parentIndex` + `index`).
+/// `grandparentTitle` + `parentIndex` + `index`, movies by `title`).
 pub fn playing_from_sessions(raw: Option<&Value>) -> Playing {
     let mut p = Playing::default();
     let metas = raw.and_then(|r| r.get("MediaContainer")).and_then(|m| m.get("Metadata")).and_then(Value::as_array);
@@ -226,6 +267,12 @@ pub fn playing_from_sessions(raw: Option<&Value>) -> Playing {
             let (s, e) = (m.get("parentIndex").and_then(Value::as_i64), m.get("index").and_then(Value::as_i64));
             if let (false, Some(s), Some(e)) = (show.is_empty(), s, e) {
                 p.episodes.insert((show, s, e));
+            }
+        }
+        if m.get("type").and_then(Value::as_str) == Some("movie") {
+            let title = m.get("title").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
+            if !title.is_empty() {
+                p.movies.insert(title);
             }
         }
     }
@@ -402,10 +449,13 @@ pub struct Entry {
     pub converted_size: u64,
     pub converted_at: f64,
     pub series_id: i64,
+    /// The series title (the movie title for a movie).
     pub series: String,
     pub episode_id: i64,
     pub season: i64,
     pub episode: i64,
+    /// A Radarr movie id (0 for an episode; entries from before movies were supported).
+    pub movie_id: i64,
 }
 
 impl Entry {
@@ -415,7 +465,7 @@ impl Entry {
             "original_size": self.original_size, "converted_size": self.converted_size, "converted_at": self.converted_at,
             "original_volume": self.original_id.map(|x| x.0), "original_index": self.original_id.map(|x| x.1),
             "series_id": self.series_id, "series": self.series, "episode_id": self.episode_id,
-            "season": self.season, "episode": self.episode,
+            "season": self.season, "episode": self.episode, "movie_id": self.movie_id,
         })
     }
 
@@ -439,11 +489,16 @@ impl Entry {
             episode_id: n("episode_id"),
             season: n("season"),
             episode: n("episode"),
+            movie_id: n("movie_id"),
         })
     }
 
     pub fn label(&self) -> String {
-        label(self.season, self.episode)
+        if self.movie_id != 0 {
+            self.series.clone()
+        } else {
+            label(self.season, self.episode)
+        }
     }
 }
 
@@ -580,36 +635,83 @@ pub fn summary(title: &str, ok: usize, failed: usize, skipped: usize, stopped: b
     }
 }
 
+/// [`summary`] for a movie (one file, no episode count).
+pub fn movie_summary(title: &str, ok: usize, failed: usize, skipped: usize, stopped: bool, dry_run: bool) -> (String, bool) {
+    if dry_run {
+        return (format!("Probă: s-ar fi convertit {title}"), false);
+    }
+    if stopped {
+        return (format!("Conversie oprită ({title})"), false);
+    }
+    match (ok, failed) {
+        (0, 0) if skipped > 0 => (format!("Nicio conversie: {title} a fost sărit"), true),
+        (0, 0) => (format!("Nimic de convertit ({title})"), false),
+        (0, _) => (format!("Conversie eșuată ({title})"), true),
+        _ => (format!("Conversie gata ({title})"), false),
+    }
+}
+
 // -- shared state (routes <-> job) -------------------------------------------------------
 
+/// What to convert: the next `count` unwatched episodes of a series, these `episode_ids` of
+/// it, or one movie (`movie_id`, `series_id` 0).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
     pub series_id: i64,
+    pub movie_id: i64,
+    /// Only these episodes (empty: the next `count` from the first unwatched one).
+    pub episode_ids: Vec<i64>,
+    /// The series or movie title.
     pub title: String,
     pub count: usize,
+}
+
+impl Request {
+    /// The next `count` episodes of a series.
+    pub fn series(series_id: i64, title: &str, count: usize) -> Request {
+        Request { series_id, movie_id: 0, episode_ids: Vec::new(), title: title.into(), count }
+    }
+
+    pub fn is_movie(&self) -> bool {
+        self.movie_id != 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
     pub label: String,
+    /// The Sonarr episode id (0 for a movie).
+    pub episode_id: i64,
     /// `ok`, `failed`, `skipped`, `stopped`, `dry`.
     pub result: &'static str,
     pub note: String,
 }
 
-/// The current (or last) batch, as the PC tab shows it.
+/// The episode (or movie) being converted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Current {
+    pub label: String,
+    pub percent: f64,
+    pub episode_id: i64,
+}
+
+/// The current (or last) batch, as the Seriale tab, the movie sheet and the Acasă banner show it.
 #[derive(Debug, Clone, Default)]
 pub struct Batch {
     pub series_id: i64,
+    pub movie_id: i64,
+    pub episode_ids: Vec<i64>,
     pub title: String,
     pub requested: usize,
     pub running: bool,
     pub stopping: bool,
     pub dry_run: bool,
     /// The episode being converted and its percent.
-    pub current: Option<(String, f64)>,
+    pub current: Option<Current>,
     /// Episodes still to do after the current one.
     pub remaining: usize,
+    /// Their ids, in order.
+    pub queued: Vec<i64>,
     pub items: Vec<Item>,
     pub summary: Option<String>,
     pub started_at: f64,
@@ -619,17 +721,18 @@ pub struct Batch {
 impl Batch {
     pub fn to_json(&self) -> Value {
         json!({
-            "series_id": self.series_id, "title": self.title, "requested": self.requested,
+            "series_id": self.series_id, "movie_id": self.movie_id, "episode_ids": self.episode_ids,
+            "title": self.title, "requested": self.requested,
             "running": self.running, "stopping": self.stopping, "dry_run": self.dry_run,
-            "current": self.current.as_ref().map(|(l, p)| json!({"label": l, "percent": p})),
-            "remaining": self.remaining,
-            "items": self.items.iter().map(|i| json!({"label": i.label, "result": i.result, "note": i.note})).collect::<Vec<_>>(),
+            "current": self.current.as_ref().map(|c| json!({"label": c.label, "percent": c.percent, "episode_id": c.episode_id})),
+            "remaining": self.remaining, "queued": self.queued,
+            "items": self.items.iter().map(|i| json!({"label": i.label, "episode_id": i.episode_id, "result": i.result, "note": i.note})).collect::<Vec<_>>(),
             "summary": self.summary, "started_at": self.started_at, "finished_at": self.finished_at,
         })
     }
 
-    fn push(&mut self, label: String, result: &'static str, note: &str) {
-        self.items.push(Item { label, result, note: note.to_string() });
+    fn push(&mut self, e: &Episode, result: &'static str, note: &str) {
+        self.items.push(Item { label: e.label(), episode_id: e.episode_id, result, note: note.to_string() });
     }
 }
 
@@ -638,8 +741,11 @@ struct ListCache {
     value: Result<Vec<Value>, String>,
 }
 
+/// How long one series screen (`GET /api/series/<id>`) is reused.
+const DETAIL_TTL: Duration = Duration::from_secs(20);
+
 /// Held by `AppState`: the batch status, the start request for the job thread, the stop
-/// flag, the cached series list.
+/// flag, the cached Seriale grid and series screens.
 #[derive(Default)]
 pub struct Control {
     batch: Mutex<Option<Batch>>,
@@ -647,6 +753,7 @@ pub struct Control {
     stop: AtomicBool,
     pub wake: tokio::sync::Notify,
     list: Mutex<Option<ListCache>>,
+    details: Mutex<HashMap<i64, (Instant, Value)>>,
     loading: AtomicBool,
     unavailable: AtomicBool,
 }
@@ -700,6 +807,7 @@ impl Control {
                 b.stopping = false;
                 b.current = None;
                 b.remaining = 0;
+                b.queued.clear();
                 b.summary = Some(text);
                 b.finished_at = Some(unix_now());
             }
@@ -718,6 +826,8 @@ impl Control {
         }
         *b = Some(Batch {
             series_id: r.series_id,
+            movie_id: r.movie_id,
+            episode_ids: r.episode_ids.clone(),
             title: r.title.clone(),
             requested: r.count,
             running: true,
@@ -768,9 +878,21 @@ impl Control {
         lock(&self.batch).as_ref().map(Batch::to_json).unwrap_or(Value::Null)
     }
 
-    /// The next `GET /api/convert` reloads the list.
+    /// The next `GET /api/series` (and `/api/series/<id>`) reloads.
     pub fn invalidate_list(&self) {
         *lock(&self.list) = None;
+        lock(&self.details).clear();
+    }
+
+    /// A series screen loaded in the last 20 s.
+    pub fn cached_detail(&self, id: i64) -> Option<Value> {
+        lock(&self.details).get(&id).filter(|(at, _)| at.elapsed() < DETAIL_TTL).map(|(_, v)| v.clone())
+    }
+
+    pub fn store_detail(&self, id: i64, v: Value) {
+        let mut g = lock(&self.details);
+        g.retain(|_, (at, _)| at.elapsed() < DETAIL_TTL);
+        g.insert(id, (Instant::now(), v));
     }
 
     fn cached_list(&self, fresh_only: bool) -> Option<Result<Vec<Value>, String>> {
@@ -780,8 +902,9 @@ impl Control {
         (!fresh_only || c.at.elapsed() < ttl).then(|| c.value.clone())
     }
 
-    /// `(list, error, loading)`: the cached list; when it is old, reload it in the background
-    /// and wait up to 5 s for it (else the old one, or "loading").
+    /// `(list, error, loading)`: the cached Seriale grid ([`crate::logic::series::grid`]); when
+    /// it is old, reload it in the background and wait up to 5 s for it (else the old one, or
+    /// "loading").
     pub async fn listing(&self, app: &Arc<AppState>) -> (Option<Vec<Value>>, Option<String>, bool) {
         let split = |r: Result<Vec<Value>, String>| match r {
             Ok(v) => (Some(v), None),
@@ -795,7 +918,7 @@ impl Control {
             let a = app.clone();
             let h = tokio::spawn(async move {
                 let _g = Loading(&a.convert.loading);
-                let value = list_series(&a).await;
+                let value = crate::logic::series::grid(&a).await;
                 *lock(&a.convert.list) = Some(ListCache { at: Instant::now(), value });
             });
             let _ = tokio::time::timeout(LIST_WAIT, h).await;
@@ -810,13 +933,17 @@ impl Control {
     }
 }
 
-// -- Sonarr / Plex reads -----------------------------------------------------------------
+// -- Sonarr / Radarr / Plex reads --------------------------------------------------------
 
-/// The settings (`jobs.convert`; the Plex section defaults to strip_dv's Sonarr library).
+/// The settings (`jobs.convert`; the Plex sections default to strip_dv's Sonarr / Radarr
+/// libraries).
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub tmp_dir: PathBuf,
+    /// The Plex TV section (episodes).
     pub section: u32,
+    /// The Plex movie section.
+    pub movie_section: u32,
     pub downloads_root: String,
     pub ffmpeg_bin: String,
     pub ffmpeg_packages: String,
@@ -829,17 +956,20 @@ pub struct Settings {
 impl Settings {
     pub fn from_app(app: &AppState) -> Settings {
         let dv = DvConfig::from_app(app);
-        let section = job_cfg(app, "convert", "section")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as u32)
-            .or_else(|| dv.libraries.iter().find(|l| l.arr == "sonarr").map(|l| l.section))
-            .unwrap_or(2);
+        let section_of = |key: &str, arr: &str, default: u32| {
+            job_cfg(app, "convert", key)
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .or_else(|| dv.libraries.iter().find(|l| l.arr == arr).map(|l| l.section))
+                .unwrap_or(default)
+        };
         Settings {
             tmp_dir: job_str(app, "convert", "tmp_dir", DEFAULT_TMP_DIR).into(),
-            section,
+            section: section_of("section", "sonarr", 2),
+            movie_section: section_of("movie_section", "radarr", DEFAULT_MOVIE_SECTION),
             downloads_root: job_str(app, "seed_keeper", "downloads_root", "D:\\Media\\Downloads"),
             ffmpeg_bin: job_str(app, "convert", "ffmpeg_bin", &dv.ffmpeg_bin),
-            ffmpeg_packages: dv.ffmpeg_packages,
+            ffmpeg_packages: dv.ffmpeg_packages.clone(),
             replace_tries: REPLACE_TRIES,
             replace_wait: REPLACE_WAIT,
             force_cross_volume: false,
@@ -847,57 +977,32 @@ impl Settings {
     }
 }
 
-const SONARR_DOWN: &str = "Sonarr nu răspunde.";
-const QBIT_DOWN: &str = "qBittorrent nu răspunde, nu pot verifica torrentele.";
-const PLEX_DOWN: &str = "Plex nu răspunde, nu știu ce episoade ai văzut.";
+pub const SONARR_DOWN: &str = "Sonarr nu răspunde.";
+pub const RADARR_DOWN: &str = "Radarr nu răspunde.";
+pub const QBIT_DOWN: &str = "qBittorrent nu răspunde, nu pot verifica torrentele.";
+pub const PLEX_DOWN: &str = "Plex nu răspunde, nu știu ce episoade ai văzut.";
+pub const PLEX_DOWN_MOVIE: &str = "Plex nu răspunde, nu știu dacă ai văzut filmul.";
 
-fn ledger_error(t: &str) -> String {
+/// The log line and the page message for an unreadable ledger.
+pub fn ledger_error(t: &str) -> String {
     log_warning!("convert: the ledger is unreadable ({t})");
     format!("Lista conversiilor ({LEDGER_FILE}) nu se poate citi.")
 }
 
-async fn plex_views(app: &AppState, section: u32) -> Result<HashMap<String, i64>, String> {
+/// Plex `viewCount` per episode file (the TV section).
+pub async fn plex_views(app: &AppState, section: u32) -> Result<HashMap<String, i64>, String> {
     PlexJobs::new(app.services.plex.c.clone()).view_counts(section, true).await.map_err(|e| {
         log_warning!("convert: Plex section {section} failed: {}", e.type_name());
         PLEX_DOWN.to_string()
     })
 }
 
-/// Every series with unwatched episodes to convert:
-/// `[{"id", "title", "pending", "next"}]`, by title. `Err`: a friendly message.
-pub async fn list_series(app: &AppState) -> Result<Vec<Value>, String> {
-    let arr = app.services.sonarr.arr();
-    let series = arr.items().await.map_err(|e| {
-        log_warning!("convert: Sonarr series failed: {}", e.type_name());
-        SONARR_DOWN.to_string()
-    })?;
-    let converted = converted_keys(&load_ledger(&ledger_path(app)).map_err(|t| ledger_error(&t))?);
-    let mut flagged = Vec::new();
-    for s in &series {
-        let Some(id) = id_of(s.get("id")) else { continue };
-        let files_n = s.get("statistics").and_then(|x| x.get("episodeFileCount")).and_then(Value::as_i64);
-        if files_n == Some(0) {
-            continue;
-        }
-        let files = arr.episode_files(id).await.map_err(|_| SONARR_DOWN.to_string())?;
-        if files.iter().any(|f| file_needs_conversion(f) && !converted.contains(&path_key(f.get("path").and_then(Value::as_str).unwrap_or("")))) {
-            flagged.push((s, id, files));
-        }
-    }
-    if flagged.is_empty() {
-        return Ok(Vec::new());
-    }
-    let views = plex_views(app, Settings::from_app(app).section).await?;
-    let mut rows = Vec::new();
-    for (s, id, files) in flagged {
-        let eps = arr.episodes(id).await.map_err(|_| SONARR_DOWN.to_string())?;
-        let c = candidates(s, &eps, &files, &views, &converted);
-        if let Some(first) = c.first() {
-            rows.push(json!({"id": id, "title": first.series_title, "pending": c.len(), "next": first.label()}));
-        }
-    }
-    rows.sort_by_key(|r| r["title"].as_str().unwrap_or("").to_lowercase());
-    Ok(rows)
+/// Plex `viewCount` per movie file (the movie section).
+pub async fn plex_movie_views(app: &AppState, section: u32) -> Result<HashMap<String, i64>, String> {
+    PlexJobs::new(app.services.plex.c.clone()).view_counts(section, false).await.map_err(|e| {
+        log_warning!("convert: Plex section {section} failed: {}", e.type_name());
+        PLEX_DOWN_MOVIE.to_string()
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -932,36 +1037,139 @@ pub async fn series_candidates(app: &AppState, series_id: i64) -> Result<(String
     Ok((title, candidates(&series, &eps, &files, &views, &converted)))
 }
 
+/// A Radarr movie's title and, if it needs converting, is not converted and not watched
+/// (a file Plex does not know counts as unwatched), itself as the one candidate.
+pub async fn movie_candidates(app: &AppState, movie_id: i64) -> Result<(String, Vec<Episode>), Lookup> {
+    let arr = Arr::radarr(app.services.radarr.c.clone());
+    let movie = match arr.movie(movie_id).await {
+        Ok(m) => m,
+        Err(UpstreamError::Status(404)) => return Err(Lookup::NotFound),
+        Err(e) => {
+            log_warning!("convert: Radarr movie {movie_id} failed: {}", e.type_name());
+            return Err(Lookup::Down(RADARR_DOWN.into()));
+        }
+    };
+    if id_of(movie.get("id")) != Some(movie_id) {
+        return Err(Lookup::NotFound);
+    }
+    let title = movie.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+    let Some(file) = movie.get("movieFile").filter(|f| f.is_object()) else { return Ok((title, Vec::new())) };
+    let Some(path) = file.get("path").and_then(Value::as_str).filter(|p| !p.trim().is_empty()) else { return Ok((title, Vec::new())) };
+    if !file_needs_conversion(file) {
+        return Ok((title, Vec::new()));
+    }
+    let converted = converted_keys(&load_ledger(&ledger_path(app)).map_err(|t| Lookup::Down(ledger_error(&t)))?);
+    if converted.contains(&path_key(path)) {
+        return Ok((title, Vec::new()));
+    }
+    let views = plex_movie_views(app, Settings::from_app(app).movie_section).await.map_err(Lookup::Down)?;
+    if views.get(&path_key(path)).is_some_and(|n| *n > 0) {
+        return Ok((title, Vec::new()));
+    }
+    let ep = Episode {
+        series_id: 0,
+        series_title: title.clone(),
+        episode_id: 0,
+        season: 0,
+        number: 0,
+        path: path.to_string(),
+        size: file.get("size").and_then(Value::as_u64).unwrap_or(0),
+        movie_id,
+    };
+    Ok((title, vec![ep]))
+}
+
+/// The candidates of a request: the movie, the requested episodes (in episode order), or the
+/// whole series from the first unwatched one.
+pub async fn request_candidates(app: &AppState, req: &Request) -> Result<(String, Vec<Episode>), Lookup> {
+    if req.is_movie() {
+        return movie_candidates(app, req.movie_id).await;
+    }
+    let (title, c) = series_candidates(app, req.series_id).await?;
+    Ok((title, only_ids(c, &req.episode_ids)))
+}
+
+/// `c` limited to `ids` (all of `c` when `ids` is empty), order kept.
+pub fn only_ids(c: Vec<Episode>, ids: &[i64]) -> Vec<Episode> {
+    if ids.is_empty() {
+        return c;
+    }
+    c.into_iter().filter(|e| ids.contains(&e.episode_id)).collect()
+}
+
 // -- routes ------------------------------------------------------------------------------
 
-fn demo_status() -> Value {
-    json!({
-        "series": [
-            {"id": 1, "title": "Demon Slayer", "pending": 3, "next": "S02E09"},
-            {"id": 2, "title": "Frieren: Beyond Journey's End", "pending": 12, "next": "S01E05"},
-        ],
-        "error": null, "loading": false, "job": null, "dry_run": true, "demo": true,
-        "max": MAX_COUNT, "default": DEFAULT_COUNT,
-    })
-}
-
-/// `GET /api/convert`: the list and the batch status.
-pub async fn api_status(app: &Arc<AppState>) -> Value {
-    if app.demo {
-        return demo_status();
+/// The demo batch: Frieren S01E06 converting (the percent runs over 15 minutes), S01E07 next.
+pub fn demo_job(elapsed_s: f64) -> Value {
+    let pct = crate::json::py_round((elapsed_s % 900.0) / 9.0, 1);
+    Batch {
+        series_id: 1,
+        title: "Frieren: Beyond Journey's End".into(),
+        requested: 2,
+        running: true,
+        dry_run: true,
+        current: Some(Current { label: "S01E06".into(), percent: pct, episode_id: crate::logic::series::demo_episode_id(1, 1, 6) }),
+        remaining: 1,
+        queued: vec![crate::logic::series::demo_episode_id(1, 1, 7)],
+        started_at: unix_now() - elapsed_s,
+        ..Default::default()
     }
-    let (series, error, loading) = app.convert.listing(app).await;
-    json!({
-        "series": series, "error": error, "loading": loading, "job": app.convert.status_json(),
-        "dry_run": app.dry_run, "demo": false, "max": MAX_COUNT, "default": DEFAULT_COUNT,
-    })
+    .to_json()
 }
 
-/// `POST /api/convert/start` `{"seriesId": n, "count": 1..=20}` -> `(status, body)`.
+fn status_body(job: Value, dry_run: bool, demo: bool, available: bool) -> Value {
+    json!({"job": job, "dry_run": dry_run, "demo": demo, "available": available, "max": MAX_COUNT, "default": DEFAULT_COUNT})
+}
+
+/// `GET /api/convert`: the batch status only (no upstream call; the Acasă banner polls it).
+pub fn api_status(app: &AppState) -> Value {
+    if app.demo {
+        return status_body(demo_job(app.started.elapsed().as_secs_f64()), true, true, true);
+    }
+    status_body(app.convert.status_json(), app.dry_run, false, app.convert.available())
+}
+
+/// A valid `POST /api/convert/start` body.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Start {
+    /// `{seriesId, count}`: the next `count` (1..=20) unwatched episodes.
+    Next { series_id: i64, count: usize },
+    /// `{seriesId, episodeIds}`: these (1..=20 distinct ids).
+    Episodes { series_id: i64, ids: Vec<i64> },
+    /// `{movieId}`.
+    Movie { movie_id: i64 },
+}
+
+/// The start body, strictly: positive JSON integers only; `movieId` alone, or `seriesId` with
+/// exactly one of `count` / `episodeIds`.
+pub fn parse_start(body: &Map<String, Value>) -> Option<Start> {
+    let pos = |k: &str| match body.get(k) {
+        None => Ok(None),
+        Some(v) => v.as_i64().filter(|n| *n > 0).map(Some).ok_or(()),
+    };
+    let (movie, series, count) = (pos("movieId").ok()?, pos("seriesId").ok()?, body.get("count"));
+    let ids = body.get("episodeIds");
+    if let Some(movie_id) = movie {
+        return (series.is_none() && count.is_none() && ids.is_none()).then_some(Start::Movie { movie_id });
+    }
+    let series_id = series?;
+    match (count, ids) {
+        (Some(c), None) => {
+            let n = c.as_i64().filter(|n| (1..=MAX_COUNT).contains(n))?;
+            Some(Start::Next { series_id, count: n as usize })
+        }
+        (None, Some(Value::Array(a))) => {
+            let ids: Vec<i64> = a.iter().map(|v| v.as_i64().filter(|n| *n > 0)).collect::<Option<_>>()?;
+            let distinct: HashSet<i64> = ids.iter().copied().collect();
+            (!ids.is_empty() && ids.len() <= MAX_COUNT as usize && distinct.len() == ids.len()).then_some(Start::Episodes { series_id, ids })
+        }
+        _ => None,
+    }
+}
+
+/// `POST /api/convert/start` (see [`parse_start`]) -> `(status, body)`.
 pub async fn api_start(app: &Arc<AppState>, body: &Map<String, Value>) -> (u16, Value) {
-    let series_id = body.get("seriesId").and_then(Value::as_i64).filter(|n| *n > 0);
-    let count = body.get("count").and_then(Value::as_i64).filter(|n| (1..=MAX_COUNT).contains(n));
-    let (Some(series_id), Some(count)) = (series_id, count) else {
+    let Some(start) = parse_start(body) else {
         return (400, json!({"error": "Cerere invalidă."}));
     };
     if app.demo {
@@ -975,17 +1183,33 @@ pub async fn api_start(app: &Arc<AppState>, body: &Map<String, Value>) -> (u16, 
     if app.convert.running() {
         return busy();
     }
-    let (title, cands) = match tokio::time::timeout(START_TIMEOUT, series_candidates(app, series_id)).await {
-        Err(_) => return (504, json!({"error": "Sonarr sau Plex răspunde greu. Încearcă din nou."})),
+    let movie = matches!(start, Start::Movie { .. });
+    let mut req = match &start {
+        Start::Next { series_id, count } => Request::series(*series_id, "", *count),
+        Start::Episodes { series_id, ids } => Request { episode_ids: ids.clone(), ..Request::series(*series_id, "", ids.len()) },
+        Start::Movie { movie_id } => Request { movie_id: *movie_id, ..Request::series(0, "", 1) },
+    };
+    let slow = if movie { "Radarr sau Plex răspunde greu. Încearcă din nou." } else { "Sonarr sau Plex răspunde greu. Încearcă din nou." };
+    let (title, cands) = match tokio::time::timeout(START_TIMEOUT, request_candidates(app, &req)).await {
+        Err(_) => return (504, json!({"error": slow})),
+        Ok(Err(Lookup::NotFound)) if movie => return (404, json!({"error": "Filmul nu există în Radarr."})),
         Ok(Err(Lookup::NotFound)) => return (404, json!({"error": "Serialul nu există în Sonarr."})),
         Ok(Err(Lookup::Down(m))) => return (502, json!({"error": m})),
         Ok(Ok(x)) => x,
     };
-    if cands.is_empty() {
-        return (409, json!({"error": "Nu e nimic de convertit la acest serial."}));
+    match &start {
+        Start::Movie { .. } if cands.is_empty() => {
+            return (409, json!({"error": "Filmul nu trebuie convertit: merge direct pe TV, e convertit deja sau l-ai văzut."}));
+        }
+        Start::Episodes { ids, .. } if cands.len() != ids.len() => {
+            return (409, json!({"error": "Episodul nu trebuie convertit: merge direct pe TV, e convertit deja sau l-ai văzut."}));
+        }
+        _ if cands.is_empty() => return (409, json!({"error": "Nu e nimic de convertit la acest serial."})),
+        _ => {}
     }
-    let count = (count as usize).min(cands.len());
-    match app.convert.begin(Request { series_id, title, count }, app.dry_run) {
+    req.title = title;
+    req.count = req.count.min(cands.len());
+    match app.convert.begin(req, app.dry_run) {
         Begin::Started => {}
         Begin::Busy => return busy(),
         Begin::Unavailable => return unavailable(),
@@ -1180,13 +1404,17 @@ impl Job<'_> {
         }
     }
 
-    /// The temp dir is safe to write into (see [`check_tmp_dir`]); also checks that Sonarr and
-    /// qBittorrent answer (both are needed to convert safely).
-    async fn check_tmp(&self) -> Result<(), String> {
-        let mut overlap = self.app.services.sonarr.arr().root_folders().await.map_err(|_| SONARR_DOWN.to_string())?;
-        match crate::services::arr_jobs::Arr::radarr(self.app.services.radarr.c.clone()).root_folders().await {
+    /// The temp dir is safe to write into (see [`check_tmp_dir`]); also checks that the owning
+    /// app (Sonarr, or Radarr for a movie) and qBittorrent answer (needed to convert safely).
+    async fn check_tmp(&self, movie: bool) -> Result<(), String> {
+        let sonarr = self.app.services.sonarr.arr().root_folders().await;
+        let radarr = Arr::radarr(self.app.services.radarr.c.clone()).root_folders().await;
+        let (own, other, down, other_name) =
+            if movie { (radarr, sonarr, RADARR_DOWN, "Sonarr") } else { (sonarr, radarr, SONARR_DOWN, "Radarr") };
+        let mut overlap = own.map_err(|_| down.to_string())?;
+        match other {
             Ok(r) => overlap.extend(r),
-            Err(e) => log_info!("convert: Radarr root folders unknown ({}), not checked", e.type_name()),
+            Err(e) => log_info!("convert: {other_name} root folders unknown ({}), not checked", e.type_name()),
         }
         let qbit = QbitJobs::new(self.app.services.qbittorrent.c.clone());
         let torrents = qbit.torrents().await.map_err(|_| QBIT_DOWN.to_string())?;
@@ -1199,7 +1427,11 @@ impl Job<'_> {
     /// One batch, then the ntfy summary.
     pub fn run_batch(&self, req: &Request, tools: Option<&dyn Tools>) {
         let title = req.title.clone();
-        log_info!("convert: batch of {} for '{}' (series {})", req.count, ascii_log(&title), req.series_id);
+        if req.is_movie() {
+            log_info!("convert: '{}' (movie {})", ascii_log(&title), req.movie_id);
+        } else {
+            log_info!("convert: batch of {} for '{}' (series {})", req.count, ascii_log(&title), req.series_id);
+        }
         let fail = |msg: String| {
             log_warning!("convert: batch for '{}' failed: {}", ascii_log(&title), ascii_log(&msg));
             let text = format!("Conversie eșuată ({title}): {msg}");
@@ -1208,11 +1440,12 @@ impl Job<'_> {
         let Some(tools) = tools else {
             return fail("ffmpeg nu e instalat (winget Gyan.FFmpeg).".into());
         };
-        if let Err(m) = self.rt.block_on(self.check_tmp()) {
+        if let Err(m) = self.rt.block_on(self.check_tmp(req.is_movie())) {
             return fail(m);
         }
-        let cands = match self.rt.block_on(series_candidates(self.app, req.series_id)) {
+        let cands = match self.rt.block_on(request_candidates(self.app, req)) {
             Ok((_, c)) => c,
+            Err(Lookup::NotFound) if req.is_movie() => return fail("filmul nu mai există în Radarr.".into()),
             Err(Lookup::NotFound) => return fail("serialul nu mai există în Sonarr.".into()),
             Err(Lookup::Down(m)) => return fail(m),
         };
@@ -1228,14 +1461,16 @@ impl Job<'_> {
             let (next, skipped) = next_pick(&mut queue, &|e| playing.has(e));
             for s in skipped {
                 log_info!("convert: {} {} is playing, taking the next one", ascii_log(&title), s.label());
-                self.control().update(|b| b.push(s.label(), "skipped", "se redă acum"));
+                self.control().update(|b| b.push(&s, "skipped", "se redă acum"));
                 skipped_n += 1;
             }
             let Some(ep) = next else { break };
             let left = (req.count - attempts - 1).min(queue.len());
+            let queued: Vec<i64> = queue.iter().take(left).map(|e| e.episode_id).collect();
             self.control().update(|b| {
-                b.current = Some((ep.label(), 0.0));
+                b.current = Some(Current { label: ep.label(), percent: 0.0, episode_id: ep.episode_id });
                 b.remaining = left;
+                b.queued = queued;
             });
             let done = match tools.probe(Path::new(&ep.path)) {
                 Ok(src) => self.convert_one(&ep, &src, tools),
@@ -1258,12 +1493,14 @@ impl Job<'_> {
             }
             self.control().update(|b| {
                 b.current = None;
-                b.push(ep.label(), result, &note);
+                b.push(&ep, result, &note);
             });
             match done {
                 Done::Converted | Done::DryRun => {
                     attempts += 1;
                     ok += 1;
+                    // The Seriale grid and screens show it at once.
+                    self.control().invalidate_list();
                 }
                 Done::Failed(_) => {
                     attempts += 1;
@@ -1277,9 +1514,17 @@ impl Job<'_> {
                 }
             }
             let left = (req.count.saturating_sub(attempts)).min(queue.len());
-            self.control().update(|b| b.remaining = left);
+            let queued: Vec<i64> = queue.iter().take(left).map(|e| e.episode_id).collect();
+            self.control().update(|b| {
+                b.remaining = left;
+                b.queued = queued;
+            });
         }
-        let (text, error) = summary(&title, ok, failed, skipped_n, stopped, self.app.dry_run);
+        let (text, error) = if req.is_movie() {
+            movie_summary(&title, ok, failed, skipped_n, stopped, self.app.dry_run)
+        } else {
+            summary(&title, ok, failed, skipped_n, stopped, self.app.dry_run)
+        };
         log_info!("convert: batch done: {ok} converted, {failed} failed{}", if stopped { ", stopped" } else { "" });
         self.finish(text, error);
     }
@@ -1290,6 +1535,7 @@ impl Job<'_> {
             b.running = false;
             b.current = None;
             b.remaining = 0;
+            b.queued.clear();
             b.summary = Some(text.clone());
             b.finished_at = Some(unix_now());
         });
@@ -1342,14 +1588,17 @@ impl Job<'_> {
         log_info!("convert: start {} ({:.1} GB)", file.display(), size as f64 / 1_073_741_824.0);
         let t0 = Instant::now();
         let total = duration(src);
-        let label = ep.label();
         let mut last_pct = -1.0;
         let mut on_line = |l: &str| {
             if let Some(t) = parse_progress(l) {
                 let p = percent(t, total);
                 if p != last_pct {
                     last_pct = p;
-                    self.control().update(|b| b.current = Some((label.clone(), p)));
+                    self.control().update(|b| {
+                        if let Some(c) = b.current.as_mut() {
+                            c.percent = p;
+                        }
+                    });
                 }
             }
         };
@@ -1391,6 +1640,7 @@ impl Job<'_> {
             episode_id: ep.episode_id,
             season: ep.season,
             episode: ep.number,
+            movie_id: ep.movie_id,
         });
         log_info!(
             "convert: done in {:.1} min: {} ({:.2} -> {:.2} GB)",
@@ -1399,7 +1649,7 @@ impl Job<'_> {
             size as f64 / 1_073_741_824.0,
             converted_size as f64 / 1_073_741_824.0
         );
-        self.update_apps(ep.series_id, file);
+        self.update_apps(ep.movie_id, ep.series_id, file);
         Done::Converted
     }
 
@@ -1471,12 +1721,18 @@ impl Job<'_> {
         }
         let same = |p: &str| file_id(Path::new(p)).is_ok_and(|x| x.same_file(&id));
         let size = fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-        let arr = self.app.services.sonarr.arr();
-        match self.rt.block_on(arr.series_history(ep.series_id, SONARR_IMPORTED)) {
+        let movie = ep.movie_id != 0;
+        let history = if movie {
+            self.rt.block_on(Arr::radarr(self.app.services.radarr.c.clone()).movie_history(ep.movie_id, ARR_IMPORTED))
+        } else {
+            self.rt.block_on(self.app.services.sonarr.arr().series_history(ep.series_id, ARR_IMPORTED))
+        };
+        let (id_key, want) = if movie { ("movieId", ep.movie_id) } else { ("episodeId", ep.episode_id) };
+        match history {
             Ok(mut recs) => {
                 recs.retain(|r| {
                     r.get("eventType").and_then(Value::as_str).is_none_or(|t| t.eq_ignore_ascii_case("downloadFolderImported"))
-                        && id_of(r.get("episodeId")) == Some(ep.episode_id)
+                        && id_of(r.get(id_key)) == Some(want)
                 });
                 recs.sort_by_key(|r| std::cmp::Reverse(r.get("date").and_then(Value::as_str).unwrap_or("").to_string()));
                 for r in recs {
@@ -1487,7 +1743,7 @@ impl Job<'_> {
                     }
                 }
             }
-            Err(e) => log_info!("convert: Sonarr history failed ({}), looking in qBittorrent", e.type_name()),
+            Err(e) => log_info!("convert: {} history failed ({}), looking in qBittorrent", if movie { "Radarr" } else { "Sonarr" }, e.type_name()),
         }
         let qbit = QbitJobs::new(self.app.services.qbittorrent.c.clone());
         let torrents = self.rt.block_on(qbit.torrents()).ok()?;
@@ -1543,7 +1799,17 @@ impl Job<'_> {
         if entries.is_empty() {
             return;
         }
-        let Ok(views) = self.rt.block_on(plex_views(self.app, self.cfg.section)) else { return };
+        // "Watched" per kind; a section Plex did not answer for keeps its entries for later.
+        let series_views =
+            if entries.iter().any(|e| e.movie_id == 0) { self.rt.block_on(plex_views(self.app, self.cfg.section)).ok() } else { None };
+        let movie_views = if entries.iter().any(|e| e.movie_id != 0) {
+            self.rt.block_on(plex_movie_views(self.app, self.cfg.movie_section)).ok()
+        } else {
+            None
+        };
+        if series_views.is_none() && movie_views.is_none() {
+            return;
+        }
         let playing = match self.rt.block_on(self.app.services.plex.sessions_raw()) {
             Ok(v) => playing_from_sessions(v.as_ref()),
             Err(_) => return,
@@ -1556,11 +1822,15 @@ impl Job<'_> {
                 keep.push(e);
                 continue;
             }
+            let Some(views) = (if e.movie_id != 0 { movie_views.as_ref() } else { series_views.as_ref() }) else {
+                keep.push(e);
+                continue;
+            };
             let lib = Path::new(&e.library);
             let library_ok = library_state(lib, e.converted_size);
             let lib_stamp = stamp(lib).ok();
             let watched = views.get(&path_key(&e.library)).map(|n| *n > 0);
-            let is_playing = playing.contains(&e.library, &e.series, e.season, e.episode);
+            let is_playing = playing.has_entry(&e);
             let mut original = original_state(&e);
             if let (Original::Present { .. }, Some(o)) = (&original, e.original.as_deref()) {
                 if watched == Some(true) && !is_playing {
@@ -1590,7 +1860,7 @@ impl Job<'_> {
                     match r {
                         Ok(()) => {
                             log_info!("convert: watched, {} is the torrent file again", e.library);
-                            self.update_apps(e.series_id, lib);
+                            self.update_apps(e.movie_id, e.series_id, lib);
                             changed = true;
                         }
                         Err(RevertError::Changed(why)) => {
@@ -1611,18 +1881,24 @@ impl Job<'_> {
         }
     }
 
-    /// Sonarr `RescanSeries` and a Plex refresh of the file's folder. Failures are logged.
-    fn update_apps(&self, series_id: i64, file: &Path) {
+    /// Sonarr `RescanSeries` (Radarr `RescanMovie` for a movie) and a Plex refresh of the
+    /// file's folder in its section. Failures are logged.
+    fn update_apps(&self, movie_id: i64, series_id: i64, file: &Path) {
         let dir = file.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
         let app = self.app;
+        let (arr, cmd, section) = if movie_id != 0 {
+            (Arr::radarr(app.services.radarr.c.clone()), json!({"name": "RescanMovie", "movieId": movie_id}), self.cfg.movie_section)
+        } else {
+            (app.services.sonarr.arr(), json!({"name": "RescanSeries", "seriesId": series_id}), self.cfg.section)
+        };
         self.rt.block_on(async {
-            if let Err(e) = app.services.sonarr.arr().command(&json!({"name": "RescanSeries", "seriesId": series_id})).await {
-                log_warning!("convert: Sonarr rescan of {series_id} failed: {}", e.type_name());
+            if let Err(e) = arr.command(&cmd).await {
+                log_warning!("convert: {} rescan of {} failed: {}", arr.label(), movie_id.max(series_id), e.type_name());
             }
             if app.services.keys.get("plex").is_empty() {
                 return;
             }
-            if let Err(e) = PlexJobs::new(app.services.plex.c.clone()).refresh_path(self.cfg.section, &dir).await {
+            if let Err(e) = PlexJobs::new(app.services.plex.c.clone()).refresh_path(section, &dir).await {
                 log_warning!("convert: Plex refresh failed: {}", e.type_name());
             }
         });
@@ -1800,7 +2076,7 @@ mod tests {
     }
 
     fn episode(n: i64) -> Episode {
-        Episode { series_id: 4, series_title: "Show".into(), episode_id: n, season: 1, number: n, path: format!("D:\\S\\e{n}.mkv"), size: 1 }
+        Episode { series_id: 4, series_title: "Show".into(), episode_id: n, season: 1, number: n, path: format!("D:\\S\\e{n}.mkv"), size: 1, movie_id: 0 }
     }
 
     #[test]
@@ -1823,6 +2099,12 @@ mod tests {
         let p = playing_from_sessions(Some(&raw));
         assert!(p.has(&episode(3)) && p.has(&episode(4)) && !p.has(&episode(1)));
         assert_eq!(playing_from_sessions(None), Playing::default());
+        // A movie: by its file path or its title.
+        let film = Episode { movie_id: 7, series_title: "The Film".into(), path: "D:\\M\\f.mkv".into(), ..episode(9) };
+        assert!(!p.has(&film));
+        let raw = json!({"MediaContainer": {"Metadata": [{"type": "movie", "title": "The film"}]}});
+        assert!(playing_from_sessions(Some(&raw)).has(&film));
+        assert_eq!(film.label(), "The Film");
     }
 
     #[test]
@@ -1887,6 +2169,7 @@ mod tests {
             episode_id: 12,
             season: 1,
             episode: 2,
+            movie_id: 0,
         }
     }
 
@@ -1898,6 +2181,7 @@ mod tests {
         let a = entry("D:\\S\\e2.mkv", Some("D:\\Downloads\\x\\e2.mkv"));
         let mut b = entry("D:\\S\\e3.mkv", None);
         b.torrent = None;
+        b.movie_id = 7;
         save_ledger(&p, &[a.clone(), b.clone()]);
         let mut back = load_ledger(&p).unwrap();
         back.sort_by(|x, y| x.library.cmp(&y.library));
@@ -2018,6 +2302,43 @@ mod tests {
         assert_eq!(summary("X", 0, 0, 2, false, false), ("Nicio conversie: 2 episoade sărite (X)".into(), true));
         assert_eq!(summary("X", 0, 0, 0, false, false).0, "Nimic de convertit (X)");
         assert!(summary("X", 2, 0, 0, false, true).0.starts_with("Probă"));
+        assert_eq!(movie_summary("Dune", 1, 0, 0, false, false), ("Conversie gata (Dune)".into(), false));
+        assert_eq!(movie_summary("Dune", 0, 1, 0, false, false), ("Conversie eșuată (Dune)".into(), true));
+        assert_eq!(movie_summary("Dune", 0, 0, 0, true, false).0, "Conversie oprită (Dune)");
+        assert!(movie_summary("Dune", 0, 0, 1, false, false).1);
+    }
+
+    #[test]
+    fn start_bodies() {
+        let p = |v: Value| parse_start(v.as_object().unwrap());
+        assert_eq!(p(json!({"seriesId": 4, "count": 3})), Some(Start::Next { series_id: 4, count: 3 }));
+        assert_eq!(p(json!({"seriesId": 4, "episodeIds": [12, 11]})), Some(Start::Episodes { series_id: 4, ids: vec![12, 11] }));
+        assert_eq!(p(json!({"movieId": 7})), Some(Start::Movie { movie_id: 7 }));
+        for bad in [
+            json!({}),
+            json!({"seriesId": 4}),
+            json!({"seriesId": 4, "count": 2, "episodeIds": [1]}),
+            json!({"seriesId": 4, "episodeIds": []}),
+            json!({"seriesId": 4, "episodeIds": [1, 1]}),
+            json!({"seriesId": 4, "episodeIds": [1, "2"]}),
+            json!({"seriesId": 4, "episodeIds": [0]}),
+            json!({"seriesId": 4, "episodeIds": 5}),
+            json!({"seriesId": 4, "episodeIds": (1..=21).collect::<Vec<i64>>()}),
+            json!({"movieId": 0}),
+            json!({"movieId": "7"}),
+            json!({"movieId": 7, "seriesId": 4}),
+            json!({"movieId": 7, "count": 1}),
+            json!({"seriesId": 0, "count": 1}),
+        ] {
+            assert_eq!(p(bad.clone()), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn demo_status_has_a_running_batch() {
+        let v = demo_job(450.0);
+        assert_eq!((v["running"].clone(), v["series_id"].clone(), v["current"]["percent"].clone()), (json!(true), json!(1), json!(50.0)));
+        assert_eq!(v["current"]["label"], json!("S01E06"));
     }
 
     // -- the job against fake services and a fake ffmpeg ----------------------------------
@@ -2063,13 +2384,16 @@ mod tests {
     }
 
     const HASH: &str = "abcdef0123456789abcdef0123456789abcdef01";
+    const MOVIE_HASH: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
     /// A library of 4 episodes; E1, E2, E4 are hard links to the torrent files, E3 a copy.
+    /// Plus one movie (Radarr 7), a hard link to its torrent file.
     struct World {
         root: PathBuf,
         lib: PathBuf,
         downloads: PathBuf,
         views: StdMutex<Vec<(String, i64)>>,
+        movie_views: StdMutex<Vec<(String, i64)>>,
         sessions: StdMutex<Value>,
         qbit_up: StdMutex<bool>,
         lib_is_torrent: StdMutex<bool>,
@@ -2093,11 +2417,17 @@ mod tests {
                     fs::hard_link(&t, &l).unwrap();
                 }
             }
+            let (mlib, mtor) = (root.join("Movies").join("Film (2020)"), downloads.join("radarr").join("Film.2020"));
+            fs::create_dir_all(&mlib).unwrap();
+            fs::create_dir_all(&mtor).unwrap();
+            fs::write(mtor.join("Film.2020.mkv"), b"movie-original").unwrap();
+            fs::hard_link(mtor.join("Film.2020.mkv"), mlib.join("Film (2020).mkv")).unwrap();
             Arc::new(World {
                 root,
                 lib,
                 downloads,
                 views: StdMutex::new(vec![]),
+                movie_views: StdMutex::new(vec![]),
                 sessions: StdMutex::new(json!({"MediaContainer": {"size": 0}})),
                 qbit_up: StdMutex::new(true),
                 lib_is_torrent: StdMutex::new(false),
@@ -2116,6 +2446,18 @@ mod tests {
             self.views.lock().unwrap().push((self.lib_file(n).display().to_string(), 1));
         }
 
+        fn movie_file(&self) -> PathBuf {
+            self.root.join("Movies").join("Film (2020)").join("Film (2020).mkv")
+        }
+
+        fn movie_torrent(&self) -> PathBuf {
+            self.downloads.join("radarr").join("Film.2020").join("Film.2020.mkv")
+        }
+
+        fn watch_movie(&self) {
+            self.movie_views.lock().unwrap().push((self.movie_file().display().to_string(), 1));
+        }
+
         fn play(&self, v: Value) {
             *self.sessions.lock().unwrap() = v;
         }
@@ -2130,6 +2472,30 @@ mod tests {
             }
             if p == "/api/v3/series/5" {
                 return status(404);
+            }
+            if p == "/api/v3/movie/7" {
+                return ok(json!({"id": 7, "title": "Film", "year": 2020, "hasFile": true,
+                                 "movieFile": {"id": 70, "path": w.movie_file().display().to_string(), "size": 14,
+                                               "mediaInfo": {"videoCodec": "x264", "videoBitDepth": 10}}}));
+            }
+            if p == "/api/v3/movie/8" {
+                return ok(json!({"id": 8, "title": "Hevc", "hasFile": true,
+                                 "movieFile": {"path": "D:\\M\\h.mkv", "mediaInfo": {"videoCodec": "x265", "videoBitDepth": 10}}}));
+            }
+            if p == "/api/v3/movie/9" {
+                return status(404);
+            }
+            if p.starts_with("/api/v3/history/movie?movieId=7") {
+                return ok(json!([{"eventType": "downloadFolderImported", "movieId": 7, "downloadId": MOVIE_HASH.to_uppercase(),
+                                  "date": "2026-10-01T00:00:00Z", "data": {"droppedPath": w.movie_torrent().display().to_string()}}]));
+            }
+            if p.starts_with("/library/sections/1/all") {
+                let meta: Vec<Value> =
+                    w.movie_views.lock().unwrap().iter().map(|(f, v)| json!({"viewCount": v, "Media": [{"Part": [{"file": f}]}]})).collect();
+                return ok(json!({"MediaContainer": {"Metadata": meta}}));
+            }
+            if p.starts_with("/library/sections/1/refresh") {
+                return ok(json!({}));
             }
             if p == "/api/v3/series" {
                 return ok(json!([show(), {"id": 5, "title": "Empty", "statistics": {"episodeFileCount": 0}}]));
@@ -2169,8 +2535,12 @@ mod tests {
                 return ok(json!([{"path": w.root.join("Seriale").display().to_string()}]));
             }
             if p == "/api/v2/torrents/info" {
-                let mut t = vec![json!({"hash": HASH, "progress": 1.0, "save_path": w.downloads.join("sonarr").display().to_string(),
-                                        "content_path": w.downloads.join("sonarr").join("Show.S01").display().to_string()})];
+                let mut t = vec![
+                    json!({"hash": HASH, "progress": 1.0, "save_path": w.downloads.join("sonarr").display().to_string(),
+                           "content_path": w.downloads.join("sonarr").join("Show.S01").display().to_string()}),
+                    json!({"hash": MOVIE_HASH, "progress": 1.0, "save_path": w.downloads.join("radarr").display().to_string(),
+                           "content_path": w.downloads.join("radarr").join("Film.2020").display().to_string()}),
+                ];
                 if *w.lib_is_torrent.lock().unwrap() {
                     // A torrent saved straight into the library season folder.
                     t.push(json!({"hash": "libtorrent", "progress": 1.0, "save_path": w.lib.display().to_string(),
@@ -2180,6 +2550,9 @@ mod tests {
             }
             if p.starts_with("/api/v2/torrents/files?hash=libtorrent") {
                 return ok(json!([{"name": "Show - S01E01.mkv", "size": 10}]));
+            }
+            if p.starts_with(&format!("/api/v2/torrents/files?hash={MOVIE_HASH}")) {
+                return ok(json!([{"name": "Film.2020/Film.2020.mkv", "size": 14}]));
             }
             if p.starts_with("/api/v2/torrents/files") {
                 return ok(json!((1..=4).map(|n| json!({"name": format!("Show.S01/Show.S01E0{n}.mkv"), "size": 10})).collect::<Vec<_>>()));
@@ -2249,7 +2622,7 @@ mod tests {
     }
 
     fn req(count: usize) -> Request {
-        Request { series_id: 4, title: "Show".into(), count }
+        Request::series(4, "Show", count)
     }
 
     /// `begin` + `take_request`, as the route and the job thread do.
@@ -2304,8 +2677,11 @@ mod tests {
         assert_eq!(ntfy.len(), 1);
         assert_eq!(ntfy[0]["message"], json!("Conversie gata: 2 episoade (Show)"));
         // Converted files are not offered again: only E4 is left.
-        let list = list_series(&r.a).await.unwrap();
-        assert_eq!(list, vec![json!({"id": 4, "title": "Show", "pending": 1, "next": "S01E04"})]);
+        let (_, left) = series_candidates(&r.a, 4).await.unwrap();
+        assert_eq!(left.iter().map(Episode::label).collect::<Vec<_>>(), ["S01E04"]);
+        let grid = crate::logic::series::grid(&r.a).await.unwrap();
+        assert_eq!((grid[0]["convert"].clone(), grid[0]["unwatched"].clone()), (json!(1), json!(3)));
+        assert_eq!(b.items.iter().map(|i| i.episode_id).collect::<Vec<_>>(), [102, 103]);
 
         // Nothing watched yet: kept.
         revert(&r).await;
@@ -2554,39 +2930,126 @@ mod tests {
         assert_eq!((code, out["job"]["stopping"].clone()), (200, json!(true)));
         assert!(r.a.convert.stop_requested());
         assert!(r.f.mutations().is_empty(), "the route converts nothing itself");
-        let v = api_status(&r.a).await;
-        assert_eq!(v["job"]["running"], json!(true));
-        assert_eq!(v["series"][0]["pending"], json!(4));
+        let v = api_status(&r.a);
+        assert_eq!((v["job"]["running"].clone(), v["available"].clone(), v["max"].clone()), (json!(true), json!(true), json!(20)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_episode_ids_converts_only_those() {
+        let r = rig(false).await;
+        r.w.watch(1);
+        // E1 is watched: refused, nothing starts.
+        let body = json!({"seriesId": 4, "episodeIds": [101]});
+        let (code, out) = api_start(&r.a, body.as_object().unwrap()).await;
+        assert_eq!(code, 409, "{out}");
+        assert!(!r.a.convert.running());
+        let body = json!({"seriesId": 4, "episodeIds": [104, 102]});
+        let (code, out) = api_start(&r.a, body.as_object().unwrap()).await;
+        assert_eq!(code, 200, "{out}");
+        assert_eq!((out["job"]["requested"].clone(), out["job"]["episode_ids"].clone()), (json!(2), json!([104, 102])));
+        let rq = r.a.convert.take_request().unwrap();
+        assert_eq!((rq.episode_ids.clone(), rq.count), (vec![104, 102], 2));
+        let t = Arc::new(tools(0));
+        run(&r, rq, t.clone()).await;
+        // In episode order, E3 is left alone.
+        assert_eq!(fs::read(r.w.lib_file(2)).unwrap(), b"encoded");
+        assert_eq!(fs::read(r.w.lib_file(3)).unwrap(), b"original-3");
+        assert_eq!(fs::read(r.w.lib_file(4)).unwrap(), b"encoded");
+        let b = r.a.convert.batch().unwrap();
+        assert_eq!(b.items.iter().map(|i| (i.label.as_str(), i.result)).collect::<Vec<_>>(), [("S01E02", "ok"), ("S01E04", "ok")]);
+        assert!(b.queued.is_empty() && b.current.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_movie_converts_and_reverts_like_an_episode() {
+        let r = rig(false).await;
+        // Validation and the rule: unknown, HEVC.
+        let start = |id: i64| json!({"movieId": id});
+        assert_eq!(api_start(&r.a, start(9).as_object().unwrap()).await, (404, json!({"error": "Filmul nu există în Radarr."})));
+        assert_eq!(api_start(&r.a, start(8).as_object().unwrap()).await.0, 409);
+        let (code, out) = api_start(&r.a, start(7).as_object().unwrap()).await;
+        assert_eq!(code, 200, "{out}");
+        assert_eq!((out["job"]["movie_id"].clone(), out["job"]["title"].clone(), out["job"]["series_id"].clone()), (json!(7), json!("Film"), json!(0)));
+        let rq = r.a.convert.take_request().unwrap();
+        let t = Arc::new(tools(0));
+        run(&r, rq, t.clone()).await;
+        assert_eq!(t.calls.lock().unwrap().len(), 1);
+        assert_eq!(fs::read(r.w.movie_file()).unwrap(), b"encoded");
+        assert_eq!(fs::read(r.w.movie_torrent()).unwrap(), b"movie-original", "the torrent copy is untouched");
+        assert!(tmp_is_empty(&r));
+        let b = r.a.convert.batch().unwrap();
+        assert_eq!(b.items.iter().map(|i| (i.label.as_str(), i.result)).collect::<Vec<_>>(), [("Film", "ok")]);
+        assert_eq!(b.summary.as_deref(), Some("Conversie gata (Film)"));
+        let l = ledger(&r);
+        assert_eq!(l.len(), 1);
+        assert_eq!((l[0].movie_id, l[0].original.as_deref(), l[0].torrent.as_deref()), (7, Some(r.w.movie_torrent().display().to_string().as_str()), Some(MOVIE_HASH)));
+        let cmds: Vec<Value> = r.f.find("POST", "/api/v3/command").iter().map(Req::json).collect();
+        assert_eq!(cmds, vec![json!({"name": "RescanMovie", "movieId": 7})]);
+        assert_eq!(r.f.find("GET", "/library/sections/1/refresh").len(), 1);
+        // Converted: not offered again.
+        assert_eq!(api_start(&r.a, start(7).as_object().unwrap()).await.0, 409);
+        // Not watched yet: kept; playing (by title): kept; watched: the torrent file again.
+        revert(&r).await;
+        assert_eq!(ledger(&r).len(), 1);
+        r.w.watch_movie();
+        r.w.play(json!({"MediaContainer": {"Metadata": [{"type": "movie", "title": "Film"}]}}));
+        revert(&r).await;
+        assert_eq!(fs::read(r.w.movie_file()).unwrap(), b"encoded");
+        r.w.play(json!({"MediaContainer": {"size": 0}}));
+        revert(&r).await;
+        assert!(ledger(&r).is_empty());
+        assert_eq!(fs::read(r.w.movie_file()).unwrap(), b"movie-original");
+        let (x, y) = (file_id(&r.w.movie_file()).unwrap(), file_id(&r.w.movie_torrent()).unwrap());
+        assert!(x.same_file(&y) && x.links == 2, "a hard link again");
+        assert_eq!(r.f.find("POST", "/api/v3/command").len(), 2);
+        // The series section was never needed for a movie-only ledger.
+        assert!(r.f.find("GET", "/library/sections/2/all").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_watched_movie_is_not_converted() {
+        let r = rig(false).await;
+        r.w.watch_movie();
+        let (code, out) = api_start(&r.a, json!({"movieId": 7}).as_object().unwrap()).await;
+        assert_eq!(code, 409, "{out}");
+        assert!(out["error"].as_str().unwrap().contains("l-ai văzut"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn services_down_give_a_message() {
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let (a, _d) = app(&format!("http://127.0.0.1:{port}"), false, json!({}));
-        let v = api_status(&a).await;
-        assert_eq!((v["series"].clone(), v["error"].clone(), v["loading"].clone()), (Value::Null, json!("Sonarr nu răspunde."), json!(false)));
+        let v = api_status(&a);
+        assert_eq!((v["job"].clone(), v["demo"].clone()), (Value::Null, json!(false)));
         let (code, out) = api_start(&a, json!({"seriesId": 4, "count": 2}).as_object().unwrap()).await;
         assert_eq!((code, out), (502, json!({"error": "Sonarr nu răspunde."})));
-        // Plex down: the list says so.
+        let (code, out) = api_start(&a, json!({"movieId": 7}).as_object().unwrap()).await;
+        assert_eq!((code, out), (502, json!({"error": "Radarr nu răspunde."})));
+        // Plex down: the start says so.
         let w = World::new();
         let f = fake(move |r: &Req| {
-            if r.path == "/api/v3/series" {
-                ok(json!([show()]))
+            if r.path == "/api/v3/series/4" {
+                ok(show())
             } else if r.path.starts_with("/api/v3/episodefile") {
                 ok(json!([file(1, &w.lib_file(1).display().to_string(), "x264", 10)]))
+            } else if r.path.starts_with("/api/v3/episode?") {
+                ok(json!([ep(101, 1, 1, 1)]))
             } else {
                 status(500)
             }
         })
         .await;
         let (a, _d) = app(&f.base, false, json!({}));
-        assert_eq!(list_series(&a).await, Err(PLEX_DOWN.to_string()));
+        let (code, out) = api_start(&a, json!({"seriesId": 4, "count": 2}).as_object().unwrap()).await;
+        assert_eq!((code, out), (502, json!({"error": PLEX_DOWN})));
     }
 
     #[test]
     fn demo_has_data() {
-        let v = demo_status();
-        assert_eq!(v["series"].as_array().unwrap().len(), 2);
-        assert_eq!(v["demo"], json!(true));
+        let (a, _d) = app("http://127.0.0.1:9", false, json!({}));
+        assert_eq!(api_status(&a)["job"], Value::Null);
+        let demo = AppState::new(a.config.clone(), crate::app::AppOptions { demo: true, ..Default::default() }).unwrap();
+        let v = api_status(&demo);
+        assert_eq!((v["demo"].clone(), v["job"]["running"].clone()), (json!(true), json!(true)));
     }
 }

@@ -188,6 +188,17 @@ impl Arr {
         as_array(self.get(&format!("/history/series?seriesId={series_id}&eventType={event_type}")).await?)
     }
 
+    /// Radarr `GET /movie/<id>` (with its `movieFile`).
+    pub async fn movie(&self, id: i64) -> UpResult<Value> {
+        self.get(&format!("/movie/{id}")).await?.ok_or(UpstreamError::Body)
+    }
+
+    /// Radarr `GET /history/movie?movieId=<id>&eventType=<n>`: every record of one movie
+    /// (not paged). `3` is `downloadFolderImported` (`data.droppedPath` is the download copy).
+    pub async fn movie_history(&self, movie_id: i64, event_type: i64) -> UpResult<Vec<Value>> {
+        as_array(self.get(&format!("/history/movie?movieId={movie_id}&eventType={event_type}")).await?)
+    }
+
     /// Sonarr `PUT /episode/monitor` `{"episodeIds": [...], "monitored": true}`.
     pub async fn monitor_episodes(&self, ids: &[i64]) -> UpResult<()> {
         self.send(Method::PUT, "/episode/monitor", Some(&json!({"episodeIds": ids, "monitored": true}))).await?;

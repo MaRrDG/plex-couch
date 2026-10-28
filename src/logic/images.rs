@@ -3,19 +3,20 @@
 //! Path parsing and URL building here, the route in `http::routes`. [`poster`] fetches
 //! through `services` (Radarr `mediacover/<id>/poster-500.jpg` then `poster.jpg`,
 //! `fanart-360.jpg` then `fanart.jpg`; the Plex photo transcoder 240x360 `thumb` / 720x405
-//! `art`), or draws the demo SVG posters when `app.demo`.
+//! `art`; Sonarr `mediacover/<series id>/poster-500.jpg` / `fanart-360.jpg` for the Seriale
+//! tab), or draws the demo SVG posters when `app.demo`.
 
 use crate::app::AppState;
 use std::sync::Arc;
 
-/// movie: Radarr poster, plex: Plex poster, plex-art / movie-art: backdrops.
-pub const IMG_KINDS: [&str; 4] = ["movie", "plex", "plex-art", "movie-art"];
+/// movie: Radarr poster, plex: Plex poster, series: Sonarr poster; the `-art` kinds: backdrops.
+pub const IMG_KINDS: [&str; 6] = ["movie", "plex", "plex-art", "movie-art", "series", "series-art"];
 
 fn ascii_id(s: &str) -> bool {
     (1..=10).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// `^/img/(movie|plex|plex-art|movie-art)/([0-9]{1,10})$`, full match.
+/// `^/img/(movie|plex|plex-art|movie-art|series|series-art)/([0-9]{1,10})$`, full match.
 pub fn parse_img_path(path: Option<&str>) -> Option<(&'static str, String)> {
     let rest = path?.strip_prefix("/img/")?;
     let (kind, ident) = rest.split_once('/')?;
@@ -39,6 +40,8 @@ pub async fn poster(app: &Arc<AppState>, kind: &str, ident: &str) -> Option<(Vec
         "plex" => s.plex.poster(ident).await,
         "movie-art" => s.radarr.fanart(ident).await,
         "plex-art" => s.plex.art(ident).await,
+        "series" => s.sonarr.poster(ident).await,
+        "series-art" => s.sonarr.fanart(ident).await,
         _ => None,
     }
 }
@@ -54,7 +57,9 @@ mod tests {
         assert_eq!(parse_img_path(Some("/img/plex/1")), Some(("plex", "1".into())));
         assert_eq!(parse_img_path(Some("/img/plex-art/1")), Some(("plex-art", "1".into())));
         assert_eq!(parse_img_path(Some("/img/movie-art/22")), Some(("movie-art", "22".into())));
-        for p in ["/img/plex-art/x", "/img/movie-art/", "/img/art/1", "/img/plex-art/1/2"] {
+        assert_eq!(parse_img_path(Some("/img/series/4")), Some(("series", "4".into())));
+        assert_eq!(parse_img_path(Some("/img/series-art/4")), Some(("series-art", "4".into())));
+        for p in ["/img/plex-art/x", "/img/movie-art/", "/img/art/1", "/img/plex-art/1/2", "/img/series/x", "/img/serie/1"] {
             assert_eq!(parse_img_path(Some(p)), None, "{p}");
         }
         for p in ["/img/movie/abc", "/img/movie/", "/img/movie/1a", "/img/movie/-1", "/img/movie/1/",
@@ -147,5 +152,25 @@ mod tests {
         assert!(svg.starts_with(b"<svg"));
         assert!(poster(&app, "movie-art", "6").await.is_some());
         assert!(poster(&app, "movie", "9").await.is_none());
+        assert!(poster(&app, "series", "1").await.is_some());
+        assert!(String::from_utf8(poster(&app, "series-art", "1").await.unwrap().0).unwrap().contains("viewBox=\"0 0 160 90\""));
+        assert!(poster(&app, "series", "99").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn series_covers_from_sonarr() {
+        let sonarr = serve(Arc::new(|h: &Hit| match h.path.as_str() {
+            "/api/v3/mediacover/4/poster-500.jpg" => img("image/jpeg", b"SP"),
+            "/api/v3/mediacover/4/fanart-360.jpg" => status_answer(404),
+            "/api/v3/mediacover/4/fanart.jpg" => img("image/jpeg", b"SF"),
+            _ => status_answer(404),
+        }))
+        .await;
+        let cfg = testutil::config(json!({"services": {"sonarr": {"url": sonarr.url, "api_key": "sonarr-test-key"}}}));
+        let app = testutil::app(cfg);
+        assert_eq!(poster(&app, "series", "4").await.map(|x| x.0), Some(b"SP".to_vec()));
+        assert_eq!(poster(&app, "series-art", "4").await.map(|x| x.0), Some(b"SF".to_vec()));
+        assert_eq!(poster(&app, "series", "5").await, None);
+        assert!(sonarr.hits().iter().all(|h| h.header("X-Api-Key") == Some("sonarr-test-key")));
     }
 }

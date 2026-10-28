@@ -7,6 +7,7 @@ pub mod movies;
 pub mod notify;
 pub mod plex;
 pub mod power;
+pub mod series;
 pub mod status;
 #[cfg(test)]
 pub mod testutil;

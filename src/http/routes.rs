@@ -160,7 +160,18 @@ async fn app_get(r: &Req, ctx: &ConnCtx, rc: &mut ReqCtx) -> Response<Body> {
             return json(rc, 200, &status, &[]);
         }
         if path == "/api/convert" {
-            return json(rc, 200, &crate::jobs::convert::api_status(app).await, &[]);
+            return json(rc, 200, &crate::jobs::convert::api_status(app), &[]);
+        }
+        if path == "/api/series" {
+            return json(rc, 200, &crate::logic::series::api_list(app).await, &[]);
+        }
+        if let Some(id) = path_id(path, "/api/series/") {
+            let (code, out) = crate::logic::series::api_detail(app, id).await;
+            return json(rc, code, &out, &[]);
+        }
+        if let Some(id) = path_id(path, "/api/movies/") {
+            let (code, out) = crate::logic::series::api_movie(app, id).await;
+            return json(rc, code, &out, &[]);
         }
         return unknown(rc);
     }
@@ -170,6 +181,12 @@ async fn app_get(r: &Req, ctx: &ConnCtx, rc: &mut ReqCtx) -> Response<Body> {
     let Some(f) = static_files::lookup(path) else { return not_found(rc) };
     let body = static_files::render(f, &app.config.app_name());
     send(rc, 200, body, f.content_type, static_files::static_headers(path))
+}
+
+/// `<prefix><id>` with an id of 1-10 ASCII digits, not 0 (`/api/series/12`).
+pub fn path_id(path: &str, prefix: &str) -> Option<i64> {
+    let s = path.strip_prefix(prefix)?;
+    ((1..=10).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse::<i64>().ok()).flatten().filter(|n| *n > 0)
 }
 
 /// Poster proxy: same login and LAN checks as /api, no cookie renewal (cached responses).
@@ -317,9 +334,9 @@ async fn app_post(r: &mut Req, ctx: &ConnCtx, rc: &mut ReqCtx) -> Option<Respons
             json(rc, code, &out, &[])
         }
         "/api/convert/start" => {
-            let sid = body.get("seriesId").and_then(Value::as_i64).unwrap_or(0);
-            let n = body.get("count").and_then(Value::as_i64).unwrap_or(0);
-            log_info!("action convert/start series {sid} x{n} from {ip}");
+            let num = |k: &str| body.get(k).and_then(Value::as_i64).unwrap_or(0);
+            let ids = body.get("episodeIds").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+            log_info!("action convert/start series {} x{} episodes {ids} movie {} from {ip}", num("seriesId"), num("count"), num("movieId"));
             let (code, out) = crate::jobs::convert::api_start(app, &body).await;
             json(rc, code, &out, &[])
         }
