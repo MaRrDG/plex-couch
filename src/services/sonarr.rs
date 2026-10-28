@@ -30,4 +30,28 @@ impl Sonarr {
     pub fn arr(&self) -> Arr {
         Arr::sonarr(self.c.clone())
     }
+
+    async fn cover(&self, series_id: &str, names: [&str; 2]) -> Option<(Vec<u8>, String)> {
+        if series_id.is_empty() || !series_id.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let key = self.key();
+        for name in names {
+            let url = self.api_url(&format!("/mediacover/{series_id}/{name}"));
+            if let Some(img) = self.c.http.get_image(&url, &[("X-Api-Key", key.as_str())]).await {
+                return Some(img);
+            }
+        }
+        None
+    }
+
+    /// `mediacover/<id>/poster-500.jpg`, then `poster.jpg` (the Seriale grid).
+    pub async fn poster(&self, series_id: &str) -> Option<(Vec<u8>, String)> {
+        self.cover(series_id, ["poster-500.jpg", "poster.jpg"]).await
+    }
+
+    /// `mediacover/<id>/fanart-360.jpg`, then `fanart.jpg` (the series header).
+    pub async fn fanart(&self, series_id: &str) -> Option<(Vec<u8>, String)> {
+        self.cover(series_id, ["fanart-360.jpg", "fanart.jpg"]).await
+    }
 }

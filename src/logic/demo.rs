@@ -18,6 +18,19 @@ pub const MOVIES: [(u32, &str, i64, &str, &str, &str, bool); 6] = [
 /// Plex rating key -> radarr id (the movie playing on the TV).
 pub const PLEX_KEYS: [(&str, u32); 1] = [("101", 2)];
 
+/// sonarr id -> (title, year, top colour, bottom colour, ink colour, serif): the Seriale tab.
+pub const SERIES: [(u32, &str, i64, &str, &str, &str, bool); 5] = [
+    (1, "Frieren: Beyond Journey's End", 2023, "#1F1B3A", "#6F6AA8", "#EEEAFB", true),
+    (2, "Demon Slayer", 2019, "#4A1F2C", "#C98A7A", "#FBEDE6", false),
+    (3, "Severance", 2022, "#0D2233", "#5E7F86", "#EAF1F2", false),
+    (4, "Shōgun", 2024, "#0B0A09", "#3A2A1A", "#E8DCC4", true),
+    (5, "The Bear", 2022, "#2E4A66", "#B9C6D2", "#0F1B27", true),
+];
+
+pub fn series(sid: u32) -> Option<&'static (u32, &'static str, i64, &'static str, &'static str, &'static str, bool)> {
+    SERIES.iter().find(|s| s.0 == sid)
+}
+
 fn movie(rid: u32) -> Option<&'static (u32, &'static str, i64, &'static str, &'static str, &'static str, bool)> {
     MOVIES.iter().find(|m| m.0 == rid)
 }
@@ -89,13 +102,19 @@ pub fn backdrop_svg(top: &str, bottom: &str, ink: &str) -> Vec<u8> {
 
 /// `(bytes, content type)` for a demo `/img/<kind>/<ident>`, or None.
 pub fn poster(kind: &str, ident: &str) -> Option<(Vec<u8>, String)> {
+    let art = kind.ends_with("-art");
+    if kind.starts_with("series") {
+        let &(_, title, _, top, bottom, ink, serif) = series(ident.parse::<u32>().ok()?)?;
+        let svg = if art { backdrop_svg(top, bottom, ink) } else { poster_svg(title, top, bottom, ink, serif) };
+        return Some((svg, "image/svg+xml".into()));
+    }
     let rid = if kind.starts_with("plex") {
         PLEX_KEYS.iter().find(|(k, _)| *k == ident).map(|(_, r)| *r)
     } else {
         ident.parse::<u32>().ok()
     }?;
     let &(_, title, _, top, bottom, ink, serif) = movie(rid)?;
-    let svg = if kind.ends_with("-art") { backdrop_svg(top, bottom, ink) } else { poster_svg(title, top, bottom, ink, serif) };
+    let svg = if art { backdrop_svg(top, bottom, ink) } else { poster_svg(title, top, bottom, ink, serif) };
     Some((svg, "image/svg+xml".into()))
 }
 

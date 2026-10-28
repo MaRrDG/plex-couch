@@ -257,31 +257,80 @@ fn convert_routes() {
         let r = srv.req("POST", "/api/convert/start").cookie(&tok).json(body).send();
         assert_eq!((r.status, r.json()), (400, json!({"error": "Cerere invalidă."})));
     }
-    // Sonarr down: a message, never a crash
+    for body in [json!({"seriesId": 4, "episodeIds": []}), json!({"seriesId": 4, "episodeIds": [1, 1]}), json!({"movieId": "7"}),
+                 json!({"movieId": 7, "seriesId": 4}), json!({"seriesId": 4, "count": 2, "episodeIds": [3]})] {
+        let r = srv.req("POST", "/api/convert/start").cookie(&tok).json(body.clone()).send();
+        assert_eq!((r.status, r.json()), (400, json!({"error": "Cerere invalidă."})), "{body}");
+    }
+    // Sonarr / Radarr down: a message, never a crash
     let r = srv.req("POST", "/api/convert/start").cookie(&tok).json(start).send();
     assert_eq!((r.status, r.json()), (502, json!({"error": "Sonarr nu răspunde."})));
+    let r = srv.req("POST", "/api/convert/start").cookie(&tok).json(json!({"seriesId": 4, "episodeIds": [11]})).send();
+    assert_eq!(r.status, 502);
+    let r = srv.req("POST", "/api/convert/start").cookie(&tok).json(json!({"movieId": 7})).send();
+    assert_eq!((r.status, r.json()), (502, json!({"error": "Radarr nu răspunde."})));
     let r = srv.req("GET", "/api/convert").cookie(&tok).send();
     assert_eq!(r.status, 200);
     let v = r.json();
-    assert_eq!((v["error"].clone(), v["series"].clone(), v["job"].clone()), (json!("Sonarr nu răspunde."), Value::Null, Value::Null));
+    assert_eq!((v["job"].clone(), v["available"].clone()), (Value::Null, json!(true)));
     assert_eq!((v["max"].clone(), v["default"].clone()), (json!(20), json!(2)));
     let r = srv.req("POST", "/api/convert/stop").cookie(&tok).send();
     assert_eq!((r.status, r.json()), (409, json!({"error": "Nicio conversie nu rulează."})));
-    // the page has the section
+    // the page has the Seriale tab, the PC tab no longer has the conversion section
     let html = srv.req("GET", "/").send().text();
-    assert!(html.contains("id=\"h-convert\""));
+    assert!(html.contains("data-tab=\"seriale\"") && html.contains("id=\"view-seriale\""));
+    assert!(!html.contains("id=\"h-convert\""));
+}
+
+#[test]
+fn series_routes() {
+    let srv = closed_services_server(false);
+    // login like every other route
+    for path in ["/api/series", "/api/series/4", "/api/movies/7", "/img/series/4", "/img/series-art/4"] {
+        assert_eq!(srv.req("GET", path).send().status, 401, "{path}");
+    }
+    let tok = srv.app.new_session(None);
+    // ids: 1-10 ASCII digits, never 0
+    for path in ["/api/series/", "/api/series/x", "/api/series/0", "/api/series/4/", "/api/series/12345678901", "/api/series/-1",
+                 "/api/movies/abc", "/api/movies/1.5", "/api/series/%34"] {
+        let r = srv.req("GET", path).cookie(&tok).send();
+        assert_eq!((r.status, r.json()), (404, json!({"error": "Necunoscut."})), "{path}");
+    }
+    // Sonarr / Radarr down: a message
+    let v = srv.req("GET", "/api/series").cookie(&tok).send().json();
+    assert_eq!((v["series"].clone(), v["error"].clone(), v["demo"].clone()), (Value::Null, json!("Sonarr nu răspunde."), json!(false)));
+    let r = srv.req("GET", "/api/series/4").cookie(&tok).send();
+    assert_eq!((r.status, r.json()), (502, json!({"error": "Sonarr nu răspunde."})));
+    let r = srv.req("GET", "/api/movies/7").cookie(&tok).send();
+    assert_eq!((r.status, r.json()), (502, json!({"error": "Radarr nu răspunde."})));
+    // a GET never starts anything
+    assert!(!srv.app.convert.running());
 }
 
 #[test]
 fn convert_in_demo() {
     let demo = closed_services_server(true);
     let v = demo.req("GET", "/api/convert").send().json();
-    assert_eq!(v["demo"], json!(true));
-    assert!(!v["series"].as_array().unwrap().is_empty());
+    assert_eq!((v["demo"].clone(), v["job"]["running"].clone()), (json!(true), json!(true)));
     let r = demo.req("POST", "/api/convert/start").json(json!({"seriesId": 1, "count": 2})).send();
     assert_eq!((r.status, r.json()["demo"].clone()), (200, json!(true)));
+    let r = demo.req("POST", "/api/convert/start").json(json!({"movieId": 1})).send();
+    assert_eq!((r.status, r.json()["demo"].clone()), (200, json!(true)));
+    let r = demo.req("POST", "/api/convert/start").json(json!({"seriesId": 1, "episodeIds": [10107]})).send();
+    assert_eq!(r.status, 200);
     assert!(!demo.app.convert.running());
     assert_eq!(demo.req("POST", "/api/convert/stop").send().status, 200);
+    // the Seriale grid, a series screen with the running batch, a movie sheet
+    let g = demo.req("GET", "/api/series").send().json();
+    assert_eq!(g["series"].as_array().unwrap().len(), 5);
+    let d = demo.req("GET", "/api/series/1").send().json();
+    assert_eq!((d["title"].clone(), d["job"]["series_id"].clone()), (json!("Frieren: Beyond Journey's End"), json!(1)));
+    assert!(d["seasons"][0]["episodes"][5]["converting"]["percent"].is_number());
+    assert_eq!(demo.req("GET", "/api/series/77").send().status, 404);
+    let m = demo.req("GET", "/api/movies/1").send().json();
+    assert_eq!(m["can_convert"], json!(true));
+    let r = demo.req("GET", "/img/series/1").send();
+    assert_eq!((r.status, r.header("Content-Type")), (200, Some("image/svg+xml")));
 }
 
 #[test]

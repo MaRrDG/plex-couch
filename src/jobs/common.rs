@@ -12,7 +12,8 @@
 //!                   "libraries": [{"path": "D:\\Media\\Movies", "arr": "radarr", "section": 1},
 //!                                 {"path": "D:\\Media\\Seriale", "arr": "sonarr", "section": 2}]},
 //!   "seed_keeper": {"downloads_root": "D:\\Media\\Downloads"},
-//!   "convert":     {"ffmpeg_bin": "", "tmp_dir": "D:\\Media\\Downloads\\.reencode", "section": 2},
+//!   "convert":     {"ffmpeg_bin": "", "tmp_dir": "D:\\Media\\Downloads\\.reencode", "section": 2,
+//!                   "movie_section": 1},
 //!   "subs":        {"section": 2, "movie_section": 1, "translate": true, "translate_per_day": 40,
 //!                   "translate_notify": true}
 //! }
