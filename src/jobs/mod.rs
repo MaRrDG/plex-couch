@@ -6,7 +6,9 @@
 //!   (Phase 2b; plan "New behaviour").
 //! - [`convert`]: the TV conversion, batches on request from the PC tab, its revert pass
 //!   every 5 min.
-//! - [`subs`]: one paced Bazarr RO subtitle search every 3 min, next episode first.
+//! - [`subs`]: one paced Bazarr RO subtitle search every 3 min, next episode first; with
+//!   [`subs_translate`], a Gemini translation (via Bazarr) from English when the search
+//!   finds nothing.
 //!
 //! Rules for every job: honour `app.dry_run` (never delete, import, remux or rescan in
 //! dry-run; only log what would happen), use the service URLs from the config (tests run
@@ -17,6 +19,7 @@ pub mod convert;
 pub mod seed_keeper;
 pub mod strip_dv;
 pub mod subs;
+pub mod subs_translate;
 pub mod watchlist;
 #[cfg(test)]
 pub mod testutil;

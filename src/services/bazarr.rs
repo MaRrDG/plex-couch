@@ -69,8 +69,16 @@ impl Bazarr {
         }
     }
 
-    /// Job call: `PATCH {bazarr.url}<path_and_query>` (a subtitle search; Bazarr answers when
-    /// the search is over).
+    /// Job call: `GET {bazarr.url}<path_and_query>` -> the whole JSON body (uncached; e.g.
+    /// `/api/system/settings`). An empty body is an error.
+    pub async fn get(&self, path_and_query: &str, timeout: Duration) -> UpResult<Value> {
+        let key = self.key();
+        let url = self.c.url("bazarr", path_and_query);
+        self.c.http.get_json(&url, &[("X-API-KEY", key.as_str())], timeout).await?.ok_or(UpstreamError::Body)
+    }
+
+    /// Job call: `PATCH {bazarr.url}<path_and_query>` (a subtitle search, a disk scan, a
+    /// translation; Bazarr answers when the search or scan is over).
     pub async fn patch(&self, path_and_query: &str, timeout: Duration) -> UpResult<()> {
         let key = self.key();
         let url = self.c.url("bazarr", path_and_query);
