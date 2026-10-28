@@ -73,6 +73,11 @@
       "ffmpeg_bin": "",
       "tmp_dir": "D:\\Media\\Downloads\\.reencode",
       "section": 2
+    },
+    "subs": {
+      "translate": true,
+      "translate_per_day": 40,
+      "translate_notify": true
     }
   }
 }
