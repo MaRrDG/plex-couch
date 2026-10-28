@@ -16,8 +16,9 @@ Not affiliated with or endorsed by Plex Inc.
 
 ## Features
 
-Three tabs: **Acasă** (what is on the TV and the four controls), **Filme** (library and what
-comes next, as a poster grid) and **PC** (seeding, disk, services, notifications, shut down).
+Four tabs: **Acasă** (what is on the TV and the four controls), **Filme** (library and what
+comes next, as a poster grid), **Seriale** (the series library, episodes, RO subtitles and the
+TV conversion) and **PC** (seeding, disk, services, notifications, shut down).
 
 - **Now playing on the TV** (Plex sessions): poster, title, device, progress, Direct Play /
   Direct Stream / Transcode.
@@ -36,7 +37,8 @@ comes next, as a poster grid) and **PC** (seeding, disk, services, notifications
 - **Library**: Radarr movies as posters with size and whether a Romanian subtitle exists (Bazarr).
 - **Posters and backdrop**: proxied from Radarr's local media covers and Plex's photo transcoder
   through `/img/movie/<id>`, `/img/plex/<id>` and, for the blurred backdrop behind the
-  now-playing card, `/img/plex-art/<id>` (falling back to Radarr's fanart, `/img/movie-art/<id>`).
+  now-playing card, `/img/plex-art/<id>` (falling back to Radarr's fanart, `/img/movie-art/<id>`);
+  series posters and the series header art from Sonarr, `/img/series/<id>` and `/img/series-art/<id>`.
   Login required, digits-only ids, the API key and token stay on the PC. A drawn placeholder with
   the title is shown when there is no poster.
 - **Disk space** and uptime.
@@ -136,29 +138,47 @@ still kept).
     copy shares it.
   - Any API error, unknown mapping, missing file or failed check keeps the torrent.
 
-- **Conversie pentru TV** (PC tab, only when you press it): the Samsung TV's Plex app cannot
-  direct-play 10-bit H.264 (Hi10P), so Plex transcodes and the TV buffers. The PC tab lists the
-  series with unwatched Hi10P episodes (from Sonarr's media info, no scan of the library), how
-  many and the next one. Pick a series and a count (1-20, default 2) and press "Convertește":
-  the next unwatched episodes, in episode order, are re-encoded one at a time to HEVC Main10 on
+- **Seriale tab**: every Sonarr series with files as a poster grid (Sonarr's media covers through
+  `/img/series/<id>`), with "N nevăzute" (Plex's watched state) and an amber marker with the
+  number of unwatched episodes the TV cannot direct-play. Tap a series (`#seriale/<id>`, the
+  phone's back button returns to the grid): its seasons as chips (the season of the next
+  unwatched episode first, specials last) and one row per episode with ✓ when watched and two
+  pills: the video ("Merge direct", "Trebuie convertit", "În coadă", "Se convertește 45%",
+  "Convertit") and the Romanian subtitle from Bazarr ("RO ✓", "fără RO", or "RO se traduce"
+  while a Bazarr translation job works on that episode's `.en.srt`). Tapping an episode opens a
+  sheet with the file name, size, codec, subtitle and watched state. Endpoints:
+  `GET /api/series` (cached 60 s, loaded in the background), `GET /api/series/<id>` (cached
+  20 s), `GET /api/movies/<id>` (the Filme sheet).
+- **Conversie pentru TV** (only when you press it): the Samsung TV's Plex app cannot
+  direct-play 10-bit H.264 (Hi10P), so Plex transcodes and the TV buffers. Which files need it
+  comes from Sonarr's / Radarr's media info (no scan of the library). On a series screen the
+  sticky bar "Convertește următoarele [− 2 +]" (1-20, at most what is left) converts the next
+  unwatched episodes in episode order; an episode's sheet has "Convertește doar acest episod".
+  In Filme, tapping a movie opens its sheet, which shows "Convertește pentru TV" only for a
+  Hi10P movie that is not watched yet. Each file is re-encoded one at a time to HEVC Main10 on
   the AMD GPU (`hevc_amf`, BT.709 colour tags, audio/subtitles/fonts copied), at below-normal
   priority without a window, into `jobs.convert.tmp_dir` (default `D:\Media\Downloads\.reencode`).
-  An episode playing in Plex is passed over. The result is checked (HEVC, same length within
-  1 s, same number of audio and subtitle streams) and then renamed over the library file; that
-  breaks the library hardlink, so the torrent copy stays byte-identical for seeding. Sonarr
-  rescans the series and Plex refreshes the folder. The tab shows the episode, the percent, the
-  queue and the results; "Oprește conversia" kills ffmpeg at once and deletes its temp file
-  (the library file stays as it was). One batch at a time; ntfy says when it is done.
-  - Safety: nothing runs unless Sonarr and qBittorrent answer and the temp folder is a full
-    path that does not overlap a Sonarr/Radarr root folder or a torrent's files. An episode
-    whose library path is itself a file of a torrent (or when that cannot be checked) is skipped.
+  An episode or movie playing in Plex is passed over. The result is checked (HEVC, same length
+  within 1 s, same number of audio and subtitle streams) and then renamed over the library file;
+  that breaks the library hardlink, so the torrent copy stays byte-identical for seeding. Sonarr
+  rescans the series (Radarr `RescanMovie` for a movie) and Plex refreshes the folder (section 2,
+  or `jobs.convert.movie_section`, default the Radarr library of the DV strip, else 1). While a
+  batch runs, the series bar, the episode sheet and a banner on Acasă show the episode and the
+  percent, with "Oprește": it kills ffmpeg at once and deletes its temp file (the library file
+  stays as it was). One batch at a time; ntfy says when it is done. API:
+  `POST /api/convert/start` with `{seriesId, count}`, `{seriesId, episodeIds: [...]}` or
+  `{movieId}`, `POST /api/convert/stop`, `GET /api/convert` (the batch status only).
+  - Safety: nothing runs unless Sonarr (Radarr for a movie) and qBittorrent answer and the temp
+    folder is a full path that does not overlap a Sonarr/Radarr root folder or a torrent's files.
+    A file whose library path is itself a file of a torrent (or when that cannot be checked) is
+    skipped.
     ffmpeg is tied to the app (a Windows Job Object), so it never outlives plex-couch. Only
     the files the job itself creates are ever cleaned up after a crash (recorded in
     `state.local.json`, plus `<file>.partial` / `<file>.revert.tmp` next to converted files).
   - **Back to the original after watching**: `convert-ledger.json` (next to the config) records
-    each converted file and the torrent file it was hardlinked to (found through Sonarr's import
-    history, else qBittorrent's file list, and checked to be the same NTFS file). Every 5
-    minutes, once an episode is watched in Plex and not playing, and the torrent file is still
+    each converted file and the torrent file it was hardlinked to (found through Sonarr's or
+    Radarr's import history, else qBittorrent's file list, and checked to be the same NTFS file).
+    Every 5 minutes, once an episode or movie is watched in Plex and not playing, and the torrent file is still
     there with its size, still the very same NTFS file (volume serial + file index recorded at
     conversion) and still part of a torrent in qBittorrent, the library file becomes a hard
     link to it again (Plex and Sonarr are refreshed). If the torrent is gone or replaced by then

@@ -306,11 +306,145 @@ a { color: inherit; }
 .li-btn:not(:disabled):active { color: var(--muted); }
 .foot { display: grid; gap: var(--space-1); justify-items: start; }
 
-/* ---------- Conversie pentru TV: pickable ListGroup rows, a Stepper, the batch rows ---------- */
-.conv-row { display: grid; gap: 2px; padding: 12px 0; }
-.conv-row .li-head .data { color: var(--muted); }
-.conv-row[aria-pressed="true"] .tile-label { color: var(--accent); }
-.conv-pick { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--space-3); align-items: center; }
+/* ---------- Seriale: poster links, the series header, season chips, episode rows, pills ---------- */
+.pcard-tap {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  text-decoration: none;
+  font: inherit;
+  border-radius: var(--radius-sm);
+}
+.pcard-tap:not(:disabled):active .poster { filter: brightness(0.85); }
+.poster-flag {
+  position: absolute;
+  right: 5px;
+  top: 5px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px 2px 4px;
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  color: var(--accent);
+  line-height: 14px;
+}
+.poster-flag .ic { width: 12px; height: 12px; }
+.back { display: inline-flex; align-items: center; gap: 2px; margin-left: calc(-1 * var(--space-3)); }
+.back .ic { width: 22px; height: 22px; }
+.title-screen:focus { outline: none; }
+.series-head .np-body { gap: 4px; }
+.accent { color: var(--accent); }
+.season-chips {
+  display: flex;
+  gap: var(--space-2);
+  overflow-x: auto;
+  scrollbar-width: none;
+  margin: 0 calc(-1 * var(--space-4));
+  padding: 2px var(--space-4);
+  scroll-padding: 0 var(--space-4);
+}
+.season-chips::-webkit-scrollbar { display: none; }
+.season-chip {
+  flex: none;
+  min-width: var(--size-tap);
+  min-height: var(--size-tap);
+  padding: 0 16px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 600;
+}
+.season-chip[aria-selected="true"] { background: var(--surface-2); color: var(--ink); }
+.ep-row { display: grid; gap: 6px; padding: 12px 0; }
+.ep-head { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.ep-num { flex: none; min-width: 2ch; color: var(--muted); text-align: right; }
+.ep-title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ep-seen { flex: none; color: var(--ok); font-size: 14px; font-weight: 700; }
+.pills { display: flex; flex-wrap: wrap; gap: 6px; padding-left: calc(2ch + 10px); }
+.pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.pill-warn { color: var(--accent); }
+.pill-ok { color: var(--ok); }
+.pill-live { background: var(--accent); color: var(--on-accent); }
+.sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------- Seriale: the sticky action bar above the tab bar ---------- */
+.actionbar {
+  position: fixed;
+  z-index: 19;
+  left: 0;
+  right: 0;
+  bottom: calc(var(--tabbar-h) + var(--safe-bottom));
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+  padding: 10px calc(var(--space-4) + var(--safe-right)) 10px calc(var(--space-4) + var(--safe-left));
+}
+.actionbar-inner {
+  max-width: var(--size-content);
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-3);
+  align-items: center;
+}
+.bar-status { display: grid; gap: 4px; min-width: 0; }
+.bar-status .tile-label { overflow-wrap: anywhere; }
+.btn-fit { width: auto; padding: 12px 18px; }
+.has-bar .screen {
+  padding-bottom: calc(var(--tabbar-h) + var(--safe-bottom) + var(--bar-h, 66px) + var(--space-6));
+}
+.has-bar .app:not([hidden]) ~ .toast-wrap {
+  bottom: calc(var(--tabbar-h) + var(--safe-bottom) + var(--bar-h, 66px) + var(--space-3));
+}
+
+/* ---------- Details sheet (episode, movie): facts as ListGroup rows ---------- */
+.info-head { display: grid; gap: 2px; }
+.sheet-body { display: grid; gap: var(--space-3); }
+.facts { margin: 0; background: var(--surface-2); border-radius: var(--radius-lg); padding: 2px var(--space-4); }
+.fact {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+.fact:last-child { border-bottom: 0; }
+.fact dt { flex: none; }
+.fact dd { margin: 0; min-width: 0; color: var(--ink); text-align: right; overflow-wrap: anywhere; }
+.banner-lines { display: grid; gap: 2px; }
+.banner .btn-text { justify-self: start; display: inline-flex; align-items: center; }
+
+/* ---------- Stepper (the Seriale action bar) ---------- */
 .stepper {
   display: inline-flex;
   align-items: center;
@@ -331,10 +465,6 @@ a { color: inherit; }
 .step:disabled { opacity: 0.45; }
 .step:not(:disabled):active { background: var(--surface-2); }
 .stepper-value { min-width: 2.5ch; text-align: center; color: var(--ink); }
-.conv-item { padding: 8px 0; }
-.conv-item .li-head .data { white-space: normal; text-align: right; }
-.conv-item .li-head .data:first-child { color: var(--ink); flex: none; }
-.li-head .data.bad { color: var(--danger); }
 
 /* ---------- Banners (offline, CountdownBanner) ---------- */
 .banner {
@@ -363,7 +493,7 @@ a { color: inherit; }
   max-width: var(--size-content);
   margin: 0 auto;
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
 }
 .tabbar a {
   display: grid;
@@ -499,7 +629,7 @@ a { color: inherit; }
 }
 
 /* Offline or busy: every control is disabled, the cached screen stays. */
-.is-offline .pcard, .is-offline .np, .is-offline .group { opacity: 0.8; }
+.is-offline .pcard, .is-offline .np, .is-offline .group, .is-offline .actionbar { opacity: 0.8; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }

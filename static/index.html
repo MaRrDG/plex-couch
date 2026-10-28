@@ -75,6 +75,8 @@
       <section class="view" id="view-acasa" data-view="acasa" aria-labelledby="t-acasa">
         <h1 class="title-screen" id="t-acasa">Acasă</h1>
 
+        <section class="banner" id="convert-banner" role="status" aria-label="Conversie pentru TV" hidden></section>
+
         <section class="sec" aria-labelledby="h-playing">
           <div class="sec-head">
             <h2 class="body-strong" id="h-playing">Acum pe TV</h2>
@@ -118,6 +120,15 @@
         <div role="tabpanel" id="panel-next" aria-labelledby="seg-next" hidden></div>
       </section>
 
+      <!-- Seriale: the poster grid, or one series (#seriale/<id>) -->
+      <section class="view" id="view-seriale" data-view="seriale" aria-labelledby="t-seriale" hidden>
+        <div class="view" id="series-list">
+          <h1 class="title-screen" id="t-seriale">Seriale</h1>
+          <div id="series-grid"></div>
+        </div>
+        <div class="view" id="series-detail" hidden></div>
+      </section>
+
       <!-- PC -->
       <section class="view" id="view-pc" data-view="pc" aria-labelledby="t-pc" hidden>
         <h1 class="title-screen" id="t-pc">PC</h1>
@@ -128,14 +139,6 @@
             <span class="meta muted">ratio 1 sau 48 h</span>
           </div>
           <div class="sec-body" id="seed"></div>
-        </section>
-
-        <section class="sec" aria-labelledby="h-convert">
-          <div class="sec-head">
-            <h2 class="body-strong" id="h-convert">Conversie pentru TV</h2>
-            <span class="meta muted" id="convert-meta">pentru redare directă</span>
-          </div>
-          <div class="sec-body" id="convert"></div>
         </section>
 
         <section class="sec" aria-labelledby="h-disk">
@@ -183,10 +186,16 @@
       </section>
     </main>
 
+    <!-- Seriale: the sticky conversion bar of one series -->
+    <div class="actionbar" id="series-bar" role="region" aria-label="Conversie pentru TV" hidden>
+      <div class="actionbar-inner" id="series-bar-inner"></div>
+    </div>
+
     <nav class="tabbar" aria-label="Navigare">
       <div class="tabbar-inner">
         <a href="#acasa" data-tab="acasa" data-icon="home"><span class="tab">Acasă</span></a>
         <a href="#filme" data-tab="filme" data-icon="film"><span class="tab">Filme</span></a>
+        <a href="#seriale" data-tab="seriale" data-icon="tv"><span class="tab">Seriale</span></a>
         <a href="#pc" data-tab="pc" data-icon="pc"><span class="tab">PC</span></a>
       </div>
     </nav>
@@ -209,6 +218,17 @@
       <p class="meta muted" id="sheet-after-meta"></p>
     </div>
     <button type="button" class="btn btn-plain btn-on-surface" id="sheet-cancel">Anulează</button>
+  </div>
+
+  <!-- Details sheet: an episode (Seriale) or a movie (Filme) -->
+  <div class="sheet" id="info-sheet" role="dialog" aria-modal="true" aria-labelledby="info-title" hidden>
+    <span class="grab" aria-hidden="true"></span>
+    <div class="info-head">
+      <h2 class="title-card" id="info-title" tabindex="-1"></h2>
+      <p class="meta muted" id="info-sub"></p>
+    </div>
+    <div class="sheet-body" id="info-body"></div>
+    <button type="button" class="btn btn-plain btn-on-surface" id="info-close">Închide</button>
   </div>
 
   <div class="toast-wrap" aria-live="polite">

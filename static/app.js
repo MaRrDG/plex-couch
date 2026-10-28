@@ -7,7 +7,7 @@
   const PIN_MIN = 4;
   const CSRF = { 'X-Requested-With': 'plex-couch' };
   const STORE_KEY = 'plex-couch-last';
-  const TABS = ['acasa', 'filme', 'pc'];
+  const TABS = ['acasa', 'filme', 'seriale', 'pc'];
   const SERVICES = [
     ['plex', 'Plex'], ['radarr', 'Radarr'], ['prowlarr', 'Prowlarr'],
     ['bazarr', 'Bazarr'], ['qbittorrent', 'qBittorrent'],
@@ -60,6 +60,17 @@
     return e;
   }
   const fill = (node, ...nodes) => node.replaceChildren(...nodes.filter(Boolean));
+  // Re-render `node` without losing the focused control (matched by data-key).
+  function keepFocus(node, render) {
+    const a = document.activeElement;
+    const key = a && node.contains(a) ? a.dataset.key : null;
+    render();
+    if (key) {
+      const again = node.querySelector(`[data-key="${CSS.escape(key)}"]`);
+      if (again && !again.disabled) again.focus({ preventScroll: true });
+    }
+  }
+  const sr = (text) => h('span', 'sr', text); // read by screen readers only
   function bar(percent, tone) {
     const v = Math.max(0, Math.min(100, Number(percent) || 0));
     const b = h('div', 'bar' + (tone ? ' bar-' + tone : ''));
@@ -78,7 +89,10 @@
   const ICONS = {
     home: '<path d="M4 10.5 12 4l8 6.5V20h-5.5v-5.5h-5V20H4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>',
     film: '<rect x="4" y="5" width="16" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8 5v14M16 5v14M4 9.5h4M4 14.5h4M16 9.5h4M16 14.5h4" stroke="currentColor" stroke-width="1.8"/>',
+    tv: '<rect x="3.5" y="7.5" width="17" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8.5 3.5 12 7.5l3.5-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
     pc: '<rect x="3.5" y="4.5" width="17" height="11.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 20h6M12 16v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+    back: '<path d="M14.5 5.5 8 12l6.5 6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
+    conv: '<path d="M5.5 12a6.5 6.5 0 0 1 11.3-4.4M18.5 12a6.5 6.5 0 0 1-11.3 4.4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M17.5 4v3.8h-3.8M6.5 20v-3.8h3.8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
     moff: '<rect x="3.5" y="4.5" width="17" height="11.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 20h6M12 16v4M4 4l16 13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
     mon: '<rect x="3.5" y="4.5" width="17" height="11.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 20h6M12 16v4M12 7.5v1.2M12 12.6v1.2M8.6 10.3h1.2M14.2 10.3h1.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
     auto: '<path d="M8 6.5v11l9-5.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M3.5 12a8.5 8.5 0 0 1 2.2-5.7M20.5 12a8.5 8.5 0 0 1-2.2 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/>',
@@ -149,7 +163,7 @@
   // One <img> per URL, reused across renders so a poll never reloads or flickers a poster.
   const images = new Map();
   function posterImg(url) {
-    if (!url || !/^\/img\/(movie|plex|movie-art|plex-art)\/\d+$/.test(url)) return null;
+    if (!url || !/^\/img\/(movie|plex|series|movie-art|plex-art|series-art)\/\d+$/.test(url)) return null;
     let img = images.get(url);
     if (!img) {
       img = new Image();
@@ -161,12 +175,13 @@
     }
     return img.dataset.failed ? null : img;
   }
-  function poster(url, title, size, badge) {
+  function poster(url, title, size, badge, flag) {
     const p = h('span', 'poster poster-' + size);
     p.appendChild(drawnPoster(title));
     const img = posterImg(url);
     if (img) p.appendChild(img);
     if (badge) p.appendChild(badge);
+    if (flag) p.appendChild(flag);
     return p;
   }
 
@@ -189,9 +204,9 @@
 
   // ---------- network ----------
   // err.offline = the PC did not answer (network error or timeout).
-  async function api(path, body) {
+  async function api(path, body, timeoutMs) {
     const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+    const to = setTimeout(() => ctrl.abort(), timeoutMs || TIMEOUT_MS);
     const opts = { credentials: 'same-origin', cache: 'no-store', headers: {}, signal: ctrl.signal };
     if (body !== undefined) {
       opts.method = 'POST';
@@ -238,7 +253,8 @@
     for (const id of ['tile-shutdown', 'btn-shutdown', 'btn-restart']) $(id).disabled = off || !!pendingPower;
     $('sheet-confirm').disabled = off;
     $('sheet-after').disabled = off;
-    for (const b of $('convert').querySelectorAll('button')) b.disabled = off || convertBusy || b.dataset.off === '1';
+    // Conversion controls (Seriale, the sheets, the Acasă banner) carry data-net.
+    for (const b of document.querySelectorAll('button[data-net]')) b.disabled = off || convertBusy || b.dataset.off === '1';
   }
   function setOffline(on) {
     if (offline === on) return;
@@ -360,24 +376,50 @@
     refresh();
   }
 
-  // ---------- tabs (hash routes) ----------
-  function currentTab() {
-    const t = location.hash.slice(1);
-    return TABS.includes(t) ? t : 'acasa';
+  // ---------- tabs (hash routes: #acasa, #filme, #seriale, #seriale/<id>, #pc) ----------
+  function parseHash() {
+    const [t, sub] = location.hash.slice(1).split('/');
+    const tab = TABS.includes(t) ? t : 'acasa';
+    const id = tab === 'seriale' && /^[1-9]\d{0,9}$/.test(sub || '') ? Number(sub) : null;
+    return { tab, id };
   }
+  function currentTab() { return parseHash().tab; }
   function route() {
-    const tab = currentTab();
-    for (const v of document.querySelectorAll('.view')) v.hidden = v.dataset.view !== tab;
+    const { tab, id } = parseHash();
+    for (const v of document.querySelectorAll('.view[data-view]')) v.hidden = v.dataset.view !== tab;
     for (const a of document.querySelectorAll('.tabbar a')) {
       if (a.dataset.tab === tab) a.setAttribute('aria-current', 'page');
       else a.removeAttribute('aria-current');
     }
+    $('series-list').hidden = id != null;
+    $('series-detail').hidden = id == null;
+    $('view-seriale').setAttribute('aria-labelledby', id != null ? 't-series' : 't-seriale');
+    if (id !== detailId) {
+      detailId = id;
+      detail = null;
+      detailError = null;
+      season = null;
+      stepCount = null;
+    }
+    renderSeriesTab();
   }
+  let lastRoute = parseHash();
   window.addEventListener('hashchange', () => {
     if (location.hash === '#login') return showLogin();
+    const prev = lastRoute;
+    const now = parseHash();
+    lastRoute = now;
+    if (prev.tab === 'seriale' && prev.id == null && now.id != null) gridScroll = window.scrollY;
+    if (now.id == null) cameFromGrid = false;
+    closeSheet(true);
     route();
-    window.scrollTo(0, 0);
-    loadConvert(true);
+    // Back to the grid: where it was; anything else starts at the top.
+    window.scrollTo(0, prev.id != null && now.tab === 'seriale' && now.id == null ? gridScroll : 0);
+    if (now.id != null) {
+      loadDetail(true);
+      const head = $('t-series');
+      if (head) head.focus({ preventScroll: true });
+    } else if (now.tab === 'seriale') loadSeries();
   });
 
   // SegmentedControl: Bibliotecă / Urmează
@@ -415,6 +457,7 @@
       render(s);
       saveLast(s);
       loadConvert();
+      if (currentTab() === 'seriale') { if (detailId != null) loadDetail(); else loadSeries(); }
     } catch (e) {
       if (e.message === 'auth') return;
       if (e.offline) {
@@ -464,6 +507,7 @@
     $('sec-download').hidden = true;
     fill($('panel-lib'), none());
     fill($('panel-next'), none());
+    if (!seriesList) fill($('series-grid'), none());
     fill($('seed'), none());
     fill($('disk'), none());
     $('disk-meta').textContent = '';
@@ -529,11 +573,19 @@
       more);
   }
 
-  function posterCard(m, sub, badge) {
-    return h('div', 'pcard',
-      poster(m.poster, m.title, 'grid', badge),
+  // A PosterCard; with `opts.href` a link (Seriale), with `opts.onClick` a button (Filme sheet).
+  function posterCard(m, sub, badge, opts) {
+    const o = opts || {};
+    const tag = o.href ? 'a' : o.onClick ? 'button' : 'div';
+    const c = h(tag, 'pcard' + (tag !== 'div' ? ' pcard-tap' : ''),
+      poster(m.poster, m.title, 'grid', badge, o.flag),
       h('span', 'data pcard-title', m.title),
       h('span', 'data pcard-sub', sub));
+    if (o.href) c.href = o.href;
+    if (o.onClick) { c.type = 'button'; c.addEventListener('click', o.onClick); }
+    if (o.label) c.setAttribute('aria-label', o.label);
+    if (o.key) c.dataset.key = o.key;
+    return c;
   }
   function renderLibrary(list, svc) {
     const panel = $('panel-lib');
@@ -543,11 +595,16 @@
       let badge = null;
       if (m.ro_subs === true) badge = h('span', 'badge poster-badge', 'RO');
       else if (m.ro_subs === false) badge = h('span', 'badge poster-badge missing', 'fără RO');
-      return posterCard(m, `${n1.format(m.size_gb || 0)} GB`, badge);
+      const size = `${n1.format(m.size_gb || 0)} GB`;
+      const ro = m.ro_subs === true ? ', subtitrare RO' : m.ro_subs === false ? ', fără subtitrare RO' : '';
+      return posterCard(m, size, badge, m.radarr_id == null ? null : {
+        onClick: () => openMovie(m), key: 'movie-' + m.radarr_id,
+        label: `${m.title}${m.year ? ', ' + m.year : ''}, ${size}${ro}. Detalii`,
+      });
     }));
     const note = svc.bazarr ? null
       : h('p', 'meta muted panel-note', 'Bazarr nu răspunde, așa că nu știu ce subtitrări există.');
-    fill(panel, grid, note);
+    keepFocus(panel, () => fill(panel, grid, note));
   }
   function renderNext(list, downloads) {
     const panel = $('panel-next');
@@ -587,111 +644,54 @@
     fill(box, h('div', 'group', ...list.map(seedRow)));
   }
 
-  // ---------- Conversie pentru TV (own endpoint, polled only on the PC tab) ----------
-  // Every 5 s while a batch runs or the list is loading, else every 30 s.
-  const CONVERT_IDLE_MS = 30000;
-  const RESULT_TEXT = { ok: 'gata', failed: 'eșuat', skipped: 'sărit', stopped: 'oprit', dry: 'probă' };
-  let convert = null;
-  let convertAt = 0;
+  // ---------- Conversie pentru TV: the batch status (GET /api/convert, cheap, every poll) ----------
+  // It feeds the Acasă banner, the Seriale action bar, the episode pills and the open sheet.
+  let job = null;
+  let convertInfo = { max: 20, default: 2, dry_run: false, demo: false };
   let convertLoading = false;
-  let convertSel = null;
-  let convertCount = null;
-  const epText = (n) => (n === 1 ? '1 episod' : n >= 20 ? `${n} de episoade` : `${n} episoade`);
+  const epText = (n) => (n === 1 ? '1 episod' : n % 100 >= 20 || (n && n % 100 === 0) ? `${n} de episoade` : `${n} episoade`);
+  const seasonText = (n) => (n === 1 ? '1 sezon' : n % 100 >= 20 ? `${n} de sezoane` : `${n} sezoane`);
+  const gb = (bytes) => `${n1.format((bytes || 0) / 1073741824)} GB`;
+  const pct = (p) => `${n0.format(Math.floor(p || 0))}%`;
 
-  async function loadConvert(force) {
-    if (currentTab() !== 'pc' || convertLoading || $('app').hidden) return;
-    const fast = convert && ((convert.job && convert.job.running) || convert.loading);
-    if (!force && !fast && Date.now() - convertAt < CONVERT_IDLE_MS) return;
+  async function loadConvert() {
+    if (convertLoading || $('app').hidden) return;
     convertLoading = true;
     try {
-      convert = await api('/api/convert');
-      convertAt = Date.now();
-      renderConvert();
+      const c = await api('/api/convert');
+      const before = job;
+      job = c.job || null;
+      convertInfo = c;
+      const ended = before && before.running && !(job && job.running);
+      const itemsGrew = job && before && (job.items || []).length > (before.items || []).length;
+      if (ended && job && job.summary && !c.demo) toast(job.summary);
+      if (ended || itemsGrew) { seriesAt = 0; if (detailId != null) loadDetail(true); }
+      renderConvertStatus();
     } catch (e) {
-      if (e.message !== 'auth' && !e.offline && !convert) fill($('convert'), card(e.message, true));
+      /* the banner keeps its last state; offline is shown by setOffline */
     } finally {
       convertLoading = false;
     }
   }
-
-  function renderConvert() {
-    const c = convert;
-    if (!c) return;
-    const job = c.job;
-    const running = !!(job && job.running);
-    $('convert-meta').textContent = c.dry_run && !c.demo ? 'mod de probă' : 'pentru redare directă';
-    fill($('convert'), job && (running || job.summary) ? convertJob(job) : null, running ? null : convertList(c));
-    applyDisabled();
+  function renderConvertStatus() {
+    renderBanner();
+    if (currentTab() === 'seriale' && detailId != null) renderDetail();
+    refreshInfo();
   }
+  const running = () => !!(job && job.running);
+  // This batch belongs to series `id`.
+  const jobOf = (id) => !!(job && !job.movie_id && job.series_id === id);
 
-  function convertJob(job) {
-    const cur = job.current;
-    let state = '';
-    if (job.running) state = cur ? `${cur.label}, ${n0.format(cur.percent || 0)}%` : 'pornește';
-    let line;
-    if (!job.running) line = job.summary || '';
-    else if (job.stopping) line = 'Se oprește.';
-    else line = job.remaining ? `Încă ${epText(job.remaining)} în coadă.` : 'Ultimul episod.';
-    const rows = [h('div', 'li',
-      h('div', 'li-head', h('span', 'tile-label', job.title || ''), h('span', 'data', state)),
-      job.running ? bar(cur ? cur.percent : 0) : null,
-      h('span', job.running ? 'meta muted' : 'meta', line))];
-    for (const it of job.items || []) {
-      const word = RESULT_TEXT[it.result] || it.result;
-      const tone = it.result === 'ok' ? ' ok' : it.result === 'failed' ? ' bad' : '';
-      rows.push(h('div', 'li conv-item', h('div', 'li-head',
-        h('span', 'data', it.label),
-        h('span', 'data' + tone, it.note && it.result !== 'ok' ? `${word}: ${it.note}` : word))));
-    }
-    let stop = null;
-    if (job.running && !job.stopping) {
-      stop = h('button', 'btn btn-danger', 'Oprește conversia');
-      stop.type = 'button';
-      stop.addEventListener('click', stopConvert);
-    }
-    return h('div', 'sec-body', h('div', 'group', ...rows), stop);
-  }
-
-  function stepButton(text, label, delta, off) {
-    const b = h('button', 'step', text);
+  // A conversion button (disabled while offline or while a start/stop request runs).
+  function netButton(cls, text, onClick, key, off) {
+    const b = h('button', cls, text);
     b.type = 'button';
-    b.setAttribute('aria-label', label);
+    b.dataset.net = '1';
     b.dataset.off = off ? '1' : '';
-    b.addEventListener('click', () => { convertCount += delta; renderConvert(); });
+    if (key) b.dataset.key = key;
+    b.disabled = offline || convertBusy || !!off;
+    b.addEventListener('click', onClick);
     return b;
-  }
-
-  function convertList(c) {
-    if (c.error) return card(c.error, true);
-    if (c.series == null) return card('Se încarcă lista.');
-    if (!c.series.length) return card('Nimic de convertit: episoadele nevăzute merg direct pe TV.');
-    if (!c.series.some((s) => s.id === convertSel)) convertSel = c.series[0].id;
-    const sel = c.series.find((s) => s.id === convertSel);
-    const max = Math.max(1, Math.min(c.max || 20, sel.pending));
-    if (convertCount == null) convertCount = c.default || 2;
-    convertCount = Math.max(1, Math.min(convertCount, max));
-    const rows = c.series.map((s) => {
-      const b = h('button', 'li li-btn conv-row',
-        h('span', 'li-head', h('span', 'tile-label', s.title), h('span', 'data', epText(s.pending))),
-        h('span', 'meta muted', `Următorul: ${s.next}`));
-      b.type = 'button';
-      b.setAttribute('aria-pressed', String(s.id === convertSel));
-      b.addEventListener('click', () => { convertSel = s.id; renderConvert(); });
-      return b;
-    });
-    const value = h('span', 'data stepper-value', String(convertCount));
-    value.setAttribute('aria-live', 'polite');
-    const go = h('button', 'btn btn-primary', `Convertește ${epText(convertCount)}`);
-    go.type = 'button';
-    go.addEventListener('click', startConvert);
-    return h('div', 'sec-body',
-      h('div', 'group', ...rows),
-      h('div', 'conv-pick',
-        h('div', 'stepper', stepButton('−', 'Mai puține', -1, convertCount <= 1), value,
-          stepButton('+', 'Mai multe', 1, convertCount >= max)),
-        go),
-      h('p', 'meta muted', 'Pornesc de la primul episod nevăzut, în ordine. După ce îl vezi, '
-        + 'pun la loc fișierul din torrent.'));
   }
 
   async function convertAction(path, body, okText) {
@@ -701,21 +701,442 @@
     try {
       const r = await api(path, body);
       toast(r.demo ? 'Mod demo: nu se convertește nimic.' : okText);
-      if (r.job && convert) { convert.job = r.job; renderConvert(); }
+      if (r.job) { job = r.job; seriesAt = 0; renderConvertStatus(); }
     } catch (e) {
       if (e.message !== 'auth') toast(e.message, true);
     } finally {
       convertBusy = false;
       applyDisabled();
-      loadConvert(true);
+      loadConvert();
     }
   }
-  function startConvert() {
-    if (convertSel == null) return;
-    convertAction('/api/convert/start', { seriesId: convertSel, count: convertCount }, 'Conversia a pornit.');
+  const stopConvert = () => convertAction('/api/convert/stop', {}, 'Conversia se oprește.');
+
+  // The running batch as text: ["Se convertește S01E04 · 45%", "Frieren · încă 1 episod"].
+  function jobLines(j) {
+    const cur = j.current;
+    let head;
+    if (j.stopping) head = 'Se oprește conversia.';
+    else if (cur) head = `Se convertește ${cur.label} · ${pct(cur.percent)}`;
+    else head = 'Pornește conversia.';
+    const sub = [];
+    if (!j.movie_id || !cur) sub.push(j.title || '');
+    if (j.remaining) sub.push(`încă ${epText(j.remaining)}`);
+    if (j.dry_run && !convertInfo.demo) sub.push('mod de probă');
+    return [head, sub.filter(Boolean).join(' · ')];
   }
-  function stopConvert() {
-    convertAction('/api/convert/stop', {}, 'Conversia se oprește.');
+  function jobBar(j) {
+    const b = bar(j.current ? j.current.percent : 0);
+    b.setAttribute('aria-label', 'Progresul conversiei');
+    return b;
+  }
+
+  // ---------- Acasă: the banner while a conversion runs ----------
+  function renderBanner() {
+    const box = $('convert-banner');
+    box.hidden = !running();
+    if (!running()) return fill(box);
+    const [head, sub] = jobLines(job);
+    const open = !job.movie_id && job.series_id
+      ? h('a', 'btn-text body-strong', 'Vezi serialul') : null;
+    if (open) open.href = '#seriale/' + job.series_id;
+    keepFocus(box, () => fill(box,
+      h('div', 'banner-lines', h('p', 'body-strong', head), sub ? h('p', 'meta muted', sub) : null),
+      jobBar(job),
+      job.stopping ? null : netButton('btn btn-danger', 'Oprește conversia', stopConvert, 'banner-stop'),
+      open));
+  }
+
+  // ---------- Seriale: the poster grid (GET /api/series) ----------
+  const SERIES_IDLE_MS = 60000;
+  let seriesList = null;
+  let seriesAt = 0;
+  let seriesLoading = false;
+  let gridScroll = 0;
+  let cameFromGrid = false;
+
+  async function loadSeries(force) {
+    if (seriesLoading || $('app').hidden) return;
+    const fast = seriesList && seriesList.loading;
+    if (!force && !fast && seriesList && Date.now() - seriesAt < SERIES_IDLE_MS) return;
+    seriesLoading = true;
+    try {
+      seriesList = await api('/api/series');
+      seriesAt = Date.now();
+      renderGrid();
+    } catch (e) {
+      if (e.message !== 'auth' && !e.offline && !seriesList) fill($('series-grid'), card(e.message, true));
+    } finally {
+      seriesLoading = false;
+    }
+  }
+
+  function seriesCard(s) {
+    const unwatched = s.unwatched;
+    const badge = unwatched ? h('span', 'badge poster-badge', `${unwatched} ${unwatched === 1 ? 'nevăzut' : 'nevăzute'}`) : null;
+    const flag = s.convert ? h('span', 'badge poster-flag', icon('conv'), String(s.convert)) : null;
+    const parts = [s.title];
+    if (unwatched != null) parts.push(unwatched ? `${unwatched} ${unwatched === 1 ? 'episod nevăzut' : 'episoade nevăzute'}` : 'totul văzut');
+    if (s.convert) parts.push(`${epText(s.convert)} de convertit pentru TV`);
+    return posterCard(s, epText(s.files || 0), badge, {
+      href: '#seriale/' + s.id, flag, label: parts.join(', '), key: 'series-' + s.id,
+    });
+  }
+  function renderGrid() {
+    const box = $('series-grid');
+    const c = seriesList;
+    if (!c) return fill(box, card('Se încarcă serialele.'));
+    if (c.error) return fill(box, card(c.error, true));
+    if (c.series == null) return fill(box, card('Se încarcă serialele.'));
+    if (!c.series.length) return fill(box, card('Niciun serial încă. Serialele din Watchlist-ul Plex apar aici după descărcare.'));
+    const grid = h('div', 'grid', ...c.series.map(seriesCard));
+    for (const a of grid.querySelectorAll('a.pcard')) a.addEventListener('click', () => { cameFromGrid = true; });
+    const plexDown = c.series.some((s) => s.unwatched == null);
+    const note = plexDown ? h('p', 'meta muted panel-note', 'Plex nu răspunde, nu știu ce episoade ai văzut.') : null;
+    keepFocus(box, () => fill(box, grid, note));
+  }
+  function renderSeriesTab() {
+    if (detailId != null) renderDetail();
+    else { renderGrid(); renderBar(); }
+  }
+
+  // ---------- Seriale: one series (GET /api/series/<id>), its seasons and episodes ----------
+  const DETAIL_IDLE_MS = 30000;
+  const DETAIL_TIMEOUT_MS = 20000;
+  let detail = null;
+  let detailId = null;
+  let detailError = null;
+  let detailAt = 0;
+  let detailLoading = false;
+  let season = null;
+  let stepCount = null;
+
+  async function loadDetail(force) {
+    const id = detailId;
+    if (id == null || detailLoading || $('app').hidden) return;
+    if (!force && detail && detail.id === id && Date.now() - detailAt < DETAIL_IDLE_MS) return;
+    detailLoading = true;
+    try {
+      const d = await api('/api/series/' + id, undefined, DETAIL_TIMEOUT_MS);
+      if (id !== detailId) return;
+      detail = d;
+      detailError = null;
+      detailAt = Date.now();
+      if (d.job !== undefined && !convertLoading) job = d.job;
+      if (season == null || !d.seasons.some((s) => s.number === season)) season = d.default_season;
+    } catch (e) {
+      if (e.message === 'auth' || id !== detailId) return;
+      if (!detail) detailError = e.offline ? OFFLINE_TEXT : e.message;
+    } finally {
+      detailLoading = false;
+    }
+    if (currentTab() === 'seriale' && id === detailId) { renderDetail(); refreshInfo(); }
+  }
+
+  // The live state of an episode: the screen's data plus the batch from the last poll.
+  function epState(e) {
+    const mine = jobOf(detail.id);
+    const ok = mine && (job.items || []).some((i) => i.result === 'ok' && i.episode_id === e.id);
+    const converting = mine && job.running && job.current && job.current.episode_id === e.id;
+    return {
+      converting: converting ? job.current.percent : null,
+      queued: mine && job.running && (job.queued || []).includes(e.id),
+      converted: e.converted || ok,
+      canConvert: e.can_convert && !ok && !converting,
+      needs: e.needs_conversion && !ok,
+    };
+  }
+  // [text, tone] of the video pill, or null (a watched episode that plays as it is).
+  function videoPill(e, st) {
+    if (st.converting != null) return [`Se convertește ${pct(st.converting)}`, 'live'];
+    if (st.converted) return ['Convertit', 'ok'];
+    if (st.queued) return ['În coadă', 'warn'];
+    if (st.needs && e.watched !== true) return ['Trebuie convertit', 'warn'];
+    if (st.needs) return null;
+    return ['Merge direct', ''];
+  }
+  const RO_PILL = { ro: ['RO ✓', ''], missing: ['fără RO', 'warn'], translating: ['RO se traduce', ''] };
+  const pill = (p) => (p ? h('span', 'pill' + (p[1] ? ' pill-' + p[1] : ''), p[0]) : null);
+
+  function episodeRow(e) {
+    const st = epState(e);
+    const seen = e.watched === true;
+    const b = h('button', 'li li-btn ep-row',
+      h('span', 'ep-head',
+        h('span', 'data ep-num', String(e.episode)),
+        h('span', 'tile-label ep-title', e.title || e.label),
+        seen ? h('span', 'ep-seen', h('span', '', '✓'), sr(' văzut')) : null),
+      h('span', 'pills', pill(videoPill(e, st)), pill(RO_PILL[e.ro_sub])));
+    b.type = 'button';
+    b.dataset.key = 'ep-' + e.id;
+    b.setAttribute('aria-haspopup', 'dialog');
+    b.addEventListener('click', () => openEpisode(e.id));
+    return b;
+  }
+
+  function seasonChips(seasons) {
+    const list = h('div', 'season-chips');
+    list.setAttribute('role', 'tablist');
+    list.setAttribute('aria-label', 'Sezoane');
+    for (const s of seasons) {
+      const on = s.number === season;
+      const b = h('button', 'season-chip', s.label);
+      b.type = 'button';
+      b.id = 'season-' + s.number;
+      b.dataset.key = 'season-' + s.number;
+      b.setAttribute('role', 'tab');
+      b.setAttribute('aria-selected', String(on));
+      b.setAttribute('aria-controls', 'season-panel');
+      b.tabIndex = on ? 0 : -1;
+      b.addEventListener('click', () => { season = s.number; renderDetail(); });
+      list.appendChild(b);
+    }
+    list.addEventListener('keydown', (ev) => {
+      if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+      ev.preventDefault();
+      const i = seasons.findIndex((s) => s.number === season);
+      const next = seasons[(i + (ev.key === 'ArrowRight' ? 1 : seasons.length - 1)) % seasons.length];
+      season = next.number;
+      renderDetail();
+      const chip = $('season-' + season);
+      if (chip) { chip.focus(); chip.scrollIntoView({ block: 'nearest', inline: 'nearest' }); }
+    });
+    return list;
+  }
+
+  function backButton() {
+    const b = h('button', 'btn-text body-strong back', icon('back'), 'Seriale');
+    b.type = 'button';
+    b.dataset.key = 'back';
+    b.addEventListener('click', () => {
+      if (cameFromGrid) history.back();
+      else location.replace('#seriale');
+    });
+    return b;
+  }
+
+  function renderDetail() {
+    const box = $('series-detail');
+    const d = detail && detail.id === detailId ? detail : null;
+    if (!d) {
+      const title = h('h1', 'title-screen', 'Serial');
+      title.id = 't-series';
+      title.tabIndex = -1;
+      fill(box, backButton(), title, card(detailError || 'Se încarcă serialul.', !!detailError));
+      return renderBar();
+    }
+    const title = h('h1', 'title-screen', d.title);
+    title.id = 't-series';
+    title.tabIndex = -1;
+    const facts = [];
+    if (d.year) facts.push(String(d.year));
+    facts.push(seasonText(d.seasons.filter((s) => s.number !== 0).length || d.seasons.length));
+    if (d.unwatched != null) facts.push(d.unwatched ? `${d.unwatched} ${d.unwatched === 1 ? 'nevăzut' : 'nevăzute'}` : 'totul văzut');
+    let tvLine;
+    const pending = pendingOf(d);
+    if (pending == null) tvLine = h('span', 'meta muted', 'Plex nu răspunde, nu știu ce episoade ai văzut.');
+    else if (pending > 0) tvLine = h('span', 'meta accent', `${epText(pending)} de convertit pentru TV, de la ${d.next}.`);
+    else tvLine = h('span', 'meta muted', 'Toate episoadele nevăzute merg direct pe TV.');
+    const art = posterImg(d.backdrop);
+    const head = h('div', 'np series-head',
+      art ? h('div', 'np-backdrop', art) : null,
+      poster(d.poster, d.title, 'hero'),
+      h('div', 'np-body', h('span', 'meta', facts.join(' · ')), tvLine));
+    const cur = d.seasons.find((s) => s.number === season) || d.seasons[0];
+    let list;
+    if (!cur) list = card('Niciun episod descărcat încă.');
+    else {
+      list = h('div', 'group', ...cur.episodes.map(episodeRow));
+      list.id = 'season-panel';
+      list.setAttribute('role', 'tabpanel');
+      list.setAttribute('aria-labelledby', 'season-' + cur.number);
+    }
+    const notes = [];
+    if (!d.bazarr) notes.push(h('p', 'meta muted', 'Bazarr nu răspunde, așa că nu știu ce subtitrări există.'));
+    if (d.seasons.some((s) => s.episodes.some((e) => e.needs_conversion))) {
+      notes.push(h('p', 'meta muted', 'Televizorul nu poate reda direct H.264 pe 10 biți. Îl convertesc în HEVC pe placa '
+        + 'video, de la primul episod nevăzut, în ordine. După ce îl vezi, pun la loc fișierul din torrent.'));
+    }
+    // The chip row keeps its horizontal scroll across polls; the first time, the chosen season shows.
+    const oldRow = box.querySelector('.season-chips');
+    const keepLeft = oldRow ? oldRow.scrollLeft : null;
+    keepFocus(box, () => fill(box, backButton(), title, head,
+      d.seasons.length > 1 ? seasonChips(d.seasons) : null, list, ...notes));
+    const row = box.querySelector('.season-chips');
+    if (row && keepLeft != null) row.scrollLeft = keepLeft;
+    else if (row) {
+      const chip = $('season-' + season);
+      if (chip) row.scrollLeft = Math.max(0, chip.offsetLeft - row.offsetLeft - row.clientWidth / 2 + chip.offsetWidth / 2);
+    }
+    renderBar();
+  }
+  // Episodes still to convert: the screen's count minus what this batch did since.
+  function pendingOf(d) {
+    if (d.pending == null) return null;
+    let n = d.pending;
+    for (const s of d.seasons) for (const e of s.episodes) if (e.can_convert && epState(e).converted) n -= 1;
+    return Math.max(0, n);
+  }
+
+  // ---------- Seriale: the sticky action bar ----------
+  function stepButton(text, label, delta, off) {
+    const b = netButton('step', text, () => { stepCount += delta; renderBar(); }, 'step' + delta, off);
+    b.setAttribute('aria-label', label);
+    return b;
+  }
+  function renderBar() {
+    const barEl = $('series-bar');
+    const d = detail && detail.id === detailId ? detail : null;
+    const show = currentTab() === 'seriale' && detailId != null && d && !$('app').hidden;
+    let content = null;
+    if (show && running()) {
+      const [head, sub] = jobLines(job);
+      const other = !jobOf(d.id);
+      content = [h('div', 'bar-status',
+        h('span', 'tile-label', other ? `${job.title}: ${head.charAt(0).toLowerCase()}${head.slice(1)}` : head),
+        sub && !other ? h('span', 'meta muted', sub) : null,
+        jobBar(job)),
+      job.stopping ? null : netButton('btn btn-danger btn-fit', 'Oprește', stopConvert, 'bar-stop')];
+    } else if (show && pendingOf(d) > 0) {
+      const max = Math.max(1, Math.min(convertInfo.max || 20, pendingOf(d)));
+      if (stepCount == null) stepCount = convertInfo.default || 2;
+      stepCount = Math.max(1, Math.min(stepCount, max));
+      const value = h('span', 'data stepper-value', String(stepCount));
+      value.setAttribute('aria-live', 'polite');
+      value.setAttribute('aria-label', epText(stepCount));
+      const go = netButton('btn btn-primary', 'Convertește următoarele',
+        () => convertAction('/api/convert/start', { seriesId: d.id, count: stepCount }, 'Conversia a pornit.'), 'bar-go');
+      go.setAttribute('aria-label', `Convertește următoarele ${epText(stepCount)}, de la ${d.next}`);
+      const stepper = h('div', 'stepper', stepButton('−', 'Mai puține', -1, stepCount <= 1), value,
+        stepButton('+', 'Mai multe', 1, stepCount >= max));
+      stepper.setAttribute('role', 'group');
+      stepper.setAttribute('aria-label', 'Câte episoade');
+      content = [go, stepper];
+    }
+    barEl.hidden = !content;
+    document.body.classList.toggle('has-bar', !!content);
+    if (!content) return fill($('series-bar-inner'));
+    keepFocus(barEl, () => fill($('series-bar-inner'), ...content));
+    document.documentElement.style.setProperty('--bar-h', barEl.offsetHeight + 'px');
+  }
+
+  // ---------- details sheet: an episode or a movie ----------
+  let infoRender = null; // re-renders the open sheet from the latest data (or null)
+
+  function fact(label, value) {
+    return h('div', 'fact', h('dt', 'meta muted', label), h('dd', 'data', value));
+  }
+  function roText(ro) {
+    return { ro: 'există', missing: 'lipsește', translating: 'se traduce acum' }[ro] || 'necunoscută';
+  }
+  const seenText = (w) => (w === true ? 'da' : w === false ? 'nu' : 'necunoscut');
+  function fillInfo(title, sub, ...nodes) {
+    $('info-title').textContent = title;
+    $('info-sub').textContent = sub || '';
+    $('info-sub').hidden = !sub;
+    keepFocus($('info-body'), () => fill($('info-body'), ...nodes));
+  }
+  function refreshInfo() {
+    if (infoRender && !$('info-sheet').hidden) infoRender();
+  }
+  function openInfo(render) {
+    infoRender = render;
+    render();
+    showSheet($('info-sheet'), $('info-title'));
+  }
+
+  function findEpisode(id) {
+    for (const s of (detail && detail.seasons) || []) for (const e of s.episodes) if (e.id === id) return e;
+    return null;
+  }
+  function openEpisode(id) {
+    openInfo(() => {
+      const e = findEpisode(id);
+      if (!e) return closeSheet();
+      const st = epState(e);
+      const vp = videoPill(e, st);
+      const facts = h('dl', 'facts',
+        fact('Fișier', e.file || ''),
+        fact('Mărime', gb(e.size)),
+        fact('Video', [e.codec || 'necunoscut', vp ? vp[0].toLocaleLowerCase('ro-RO') : 'merge direct'].join(', ')),
+        fact('Subtitrare RO', roText(e.ro_sub)),
+        fact('Văzut', seenText(e.watched)));
+      const actions = [];
+      let note = null;
+      if (st.converting != null) {
+        actions.push(jobBar(job));
+        if (!job.stopping) actions.push(netButton('btn btn-danger', 'Oprește conversia', stopConvert, 'info-stop'));
+      } else if (st.canConvert) {
+        const busyNow = running();
+        actions.push(netButton('btn btn-primary', 'Convertește doar acest episod',
+          () => { closeSheet(); convertAction('/api/convert/start', { seriesId: detail.id, episodeIds: [e.id] }, 'Conversia a pornit.'); },
+          'info-go', busyNow));
+        if (busyNow) note = 'O conversie rulează deja. Așteaptă să se termine sau oprește-o.';
+      } else if (st.needs && e.watched === true) {
+        note = 'L-ai văzut deja, așa că nu-l mai convertesc.';
+      } else if (st.converted) {
+        note = 'Convertit pentru TV. După ce îl vezi, pun la loc fișierul din torrent.';
+      }
+      fillInfo(`${e.label} · ${e.title || ''}`.replace(/ · $/, ''), detail.title, facts,
+        note ? h('p', 'meta muted', note) : null, ...actions);
+    });
+  }
+
+  // Filme: the movie sheet (GET /api/movies/<radarr id>, loaded when it opens).
+  let movieInfo = null;
+  async function openMovie(m) {
+    const id = m.radarr_id;
+    movieInfo = { id, data: null, error: null };
+    openInfo(() => renderMovie(m));
+    try {
+      const d = await api('/api/movies/' + id, undefined, DETAIL_TIMEOUT_MS);
+      if (!movieInfo || movieInfo.id !== id) return;
+      movieInfo.data = d;
+      if (d.job !== undefined && !convertLoading) job = d.job;
+    } catch (e) {
+      if (e.message === 'auth' || !movieInfo || movieInfo.id !== id) return;
+      movieInfo.error = e.offline ? OFFLINE_TEXT : e.message;
+    }
+    refreshInfo();
+  }
+  function renderMovie(m) {
+    const mi = movieInfo && movieInfo.id === m.radarr_id ? movieInfo : null;
+    const sub = m.year ? String(m.year) : '';
+    if (!mi || !mi.data) return fillInfo(m.title, sub, card(mi && mi.error ? mi.error : 'Se încarcă detaliile.', !!(mi && mi.error)));
+    const d = mi.data;
+    const live = job && job.movie_id === d.id;
+    const converting = live && job.running && job.current ? job.current.percent : null;
+    const converted = d.converted || (live && (job.items || []).some((i) => i.result === 'ok'));
+    let video = d.codec || 'necunoscut';
+    if (converting != null) video += `, se convertește ${pct(converting)}`;
+    else if (converted) video += ', convertit';
+    else if (d.needs_conversion) video += ', nu merge direct pe TV';
+    const facts = h('dl', 'facts',
+      d.file ? fact('Fișier', d.file) : null,
+      fact('Mărime', gb(d.size)),
+      fact('Video', video),
+      fact('Subtitrare RO', roText(d.ro_sub)),
+      fact('Văzut', seenText(d.watched)));
+    const actions = [];
+    let note = null;
+    if (converting != null) {
+      actions.push(jobBar(job));
+      if (!job.stopping) actions.push(netButton('btn btn-danger', 'Oprește conversia', stopConvert, 'info-stop'));
+    } else if (d.can_convert && !converted) {
+      const busyNow = running();
+      note = 'Televizorul nu poate reda direct H.264 pe 10 biți. Îl convertesc în HEVC pe placa video; după ce îl vezi, '
+        + 'pun la loc fișierul din torrent.';
+      if (busyNow) note = 'O conversie rulează deja. Așteaptă să se termine sau oprește-o.';
+      actions.push(netButton('btn btn-primary', 'Convertește pentru TV',
+        () => { closeSheet(); convertAction('/api/convert/start', { movieId: d.id }, 'Conversia a pornit.'); }, 'info-go', busyNow));
+    } else if (converted) {
+      note = 'Convertit pentru TV. După ce îl vezi, pun la loc fișierul din torrent.';
+    } else if (d.needs_conversion && d.watched === true) {
+      note = 'L-ai văzut deja, așa că nu-l mai convertesc.';
+    } else if (d.needs_conversion && !d.plex) {
+      note = 'Plex nu răspunde, nu știu dacă ai văzut filmul.';
+    }
+    fillInfo(d.title || m.title, d.year ? String(d.year) : sub, facts, note ? h('p', 'meta muted', note) : null, ...actions);
   }
 
   function renderDisk(pc) {
@@ -868,13 +1289,33 @@
     }
   });
 
-  // ---------- ActionSheet ----------
+  // ---------- ActionSheet (power) and the details sheet: one open at a time, over one scrim ----------
   let lastFocus = null;
   let sheetKind = null;
   let sheetTimer = null;
+  let openEl = null;
+  function showSheet(el, focusEl) {
+    if (openEl && openEl !== el) closeSheet(true);
+    clearTimeout(sheetTimer);
+    if (!openEl) lastFocus = document.activeElement;
+    openEl = el;
+    $('app').inert = true;
+    $('scrim').hidden = false;
+    el.hidden = false;
+    if (reducedMotion.matches) {
+      $('scrim').classList.add('open');
+      el.classList.add('open');
+    } else {
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        if (openEl !== el) return;
+        $('scrim').classList.add('open');
+        el.classList.add('open');
+      }));
+    }
+    focusEl.focus({ preventScroll: true });
+  }
   function openSheet(kind) {
     if (pendingPower || offline) return;
-    clearTimeout(sheetTimer);
     sheetKind = kind;
     const restart = kind === 'restart';
     $('sheet-title').textContent = restart ? 'Repornești PC-ul?' : 'Oprești PC-ul?';
@@ -897,47 +1338,39 @@
       `${lead} Ai voie să închizi, dar în 7 zile trebuie să ajungă la ratio 1 sau 48${NBSP}h.`;
     fill($('sheet-warn-list'), ...warns.map((w) => h('li', '',
       h('span', 'tile-label', w.title || ''), ' ',
-      h('span', 'meta', (w.remaining || '').replace(/ (?=h)|(?<=ratio) /g, NBSP)))));
-    lastFocus = document.activeElement;
-    $('app').inert = true;
-    $('scrim').hidden = false;
-    $('sheet').hidden = false;
-    if (reducedMotion.matches) {
-      $('scrim').classList.add('open');
-      $('sheet').classList.add('open');
-    } else {
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        $('scrim').classList.add('open');
-        $('sheet').classList.add('open');
-      }));
-    }
-    $('sheet-title').focus({ preventScroll: true });
+      h('span', 'meta', (w.remaining || '').replace(/ (?=h)|(?<=ratio) /g, NBSP)))));
+    showSheet($('sheet'), $('sheet-title'));
   }
   function closeSheet(instant) {
-    if ($('sheet').hidden) return;
+    const el = openEl;
+    if (!el) return;
+    openEl = null;
+    if (el === $('info-sheet')) { infoRender = null; movieInfo = null; }
     $('app').inert = false;
     $('scrim').classList.remove('open');
-    $('sheet').classList.remove('open');
-    const done = () => { $('scrim').hidden = true; $('sheet').hidden = true; };
+    el.classList.remove('open');
+    const done = () => { if (!openEl) $('scrim').hidden = true; el.hidden = true; };
     clearTimeout(sheetTimer);
     if (instant || reducedMotion.matches) done();
     else sheetTimer = setTimeout(done, 240);
-    if (lastFocus && lastFocus.focus && !lastFocus.disabled) lastFocus.focus({ preventScroll: true });
+    if (lastFocus && lastFocus.focus && !lastFocus.disabled && document.contains(lastFocus)) lastFocus.focus({ preventScroll: true });
     lastFocus = null;
   }
   $('tile-shutdown').addEventListener('click', () => openSheet('shutdown'));
   $('btn-shutdown').addEventListener('click', () => openSheet('shutdown'));
   $('btn-restart').addEventListener('click', () => openSheet('restart'));
   $('sheet-cancel').addEventListener('click', () => closeSheet());
+  $('info-close').addEventListener('click', () => closeSheet());
   $('scrim').addEventListener('click', () => closeSheet());
   $('sheet-confirm').addEventListener('click', () => power(sheetKind));
   $('sheet-after').addEventListener('click', () => armAfterMovie());
   document.addEventListener('keydown', (e) => {
-    if ($('sheet').hidden) return;
+    if (!openEl) return;
     if (e.key === 'Escape') { e.preventDefault(); closeSheet(); return; }
     if (e.key === 'Tab') { // keep focus inside the sheet
-      const items = [$('sheet-confirm'), $('sheet-after'), $('sheet-cancel')]
+      const items = [...openEl.querySelectorAll('button, a[href]')]
         .filter((b) => !b.disabled && !b.closest('[hidden]'));
+      if (!items.length) return;
       const i = items.indexOf(document.activeElement);
       e.preventDefault();
       const next = i < 0 ? (e.shiftKey ? items.length - 1 : 0) : (i + (e.shiftKey ? items.length - 1 : 1)) % items.length;

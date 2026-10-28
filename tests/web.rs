@@ -276,6 +276,10 @@ fn convert_routes() {
     assert_eq!((v["max"].clone(), v["default"].clone()), (json!(20), json!(2)));
     let r = srv.req("POST", "/api/convert/stop").cookie(&tok).send();
     assert_eq!((r.status, r.json()), (409, json!({"error": "Nicio conversie nu rulează."})));
+    // the page has the Seriale tab, the PC tab no longer has the conversion section
+    let html = srv.req("GET", "/").send().text();
+    assert!(html.contains("data-tab=\"seriale\"") && html.contains("id=\"view-seriale\""));
+    assert!(!html.contains("id=\"h-convert\""));
 }
 
 #[test]
