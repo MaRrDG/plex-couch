@@ -6,6 +6,7 @@
 //!   (Phase 2b; plan "New behaviour").
 //! - [`convert`]: the TV conversion, batches on request from the PC tab, its revert pass
 //!   every 5 min.
+//! - [`subs`]: one paced Bazarr RO subtitle search every 3 min, next episode first.
 //!
 //! Rules for every job: honour `app.dry_run` (never delete, import, remux or rescan in
 //! dry-run; only log what would happen), use the service URLs from the config (tests run
@@ -15,6 +16,7 @@ pub mod common;
 pub mod convert;
 pub mod seed_keeper;
 pub mod strip_dv;
+pub mod subs;
 pub mod watchlist;
 #[cfg(test)]
 pub mod testutil;
@@ -74,7 +76,8 @@ pub fn spawn_all(app: Arc<AppState>, stop: Stop) {
     watchlist::spawn(app.clone(), stop.clone());
     strip_dv::spawn(app.clone(), stop.clone());
     seed_keeper::spawn(app.clone(), stop.clone());
-    convert::spawn(app, stop);
+    convert::spawn(app.clone(), stop.clone());
+    subs::spawn(app, stop);
 }
 
 #[cfg(test)]

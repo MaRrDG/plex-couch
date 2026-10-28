@@ -78,6 +78,12 @@ impl PlexJobs {
     /// `GET {plex.url}/library/sections/<n>/all[?type=4]`: `path_key(file) -> viewCount`
     /// for every media part. `episodes` lists episodes (type 4) instead of top-level items.
     pub async fn view_counts(&self, section: u32, episodes: bool) -> UpResult<HashMap<String, i64>> {
+        Ok(self.view_info(section, episodes).await?.into_iter().map(|(k, (v, _))| (k, v)).collect())
+    }
+
+    /// [`PlexJobs::view_counts`] with `lastViewedAt` (unix seconds, 0 if never):
+    /// `path_key(file) -> (viewCount, lastViewedAt)`.
+    pub async fn view_info(&self, section: u32, episodes: bool) -> UpResult<HashMap<String, (i64, i64)>> {
         let token = self.c.keys.get("plex");
         let q = if episodes { "?type=4" } else { "" };
         let url = self.c.url("plex", &format!("/library/sections/{section}/all{q}"));
@@ -86,10 +92,11 @@ impl PlexJobs {
         let mut out = HashMap::new();
         for m in mc.get("Metadata").and_then(Value::as_array).into_iter().flatten() {
             let views = m.get("viewCount").and_then(Value::as_i64).unwrap_or(0);
+            let last = m.get("lastViewedAt").and_then(Value::as_i64).unwrap_or(0);
             for media in m.get("Media").and_then(Value::as_array).into_iter().flatten() {
                 for part in media.get("Part").and_then(Value::as_array).into_iter().flatten() {
                     if let Some(f) = part.get("file").and_then(Value::as_str) {
-                        out.insert(path_key(f), views);
+                        out.insert(path_key(f), (views, last));
                     }
                 }
             }

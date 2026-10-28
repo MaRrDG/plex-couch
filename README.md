@@ -160,6 +160,15 @@ still kept).
     unmapped torrent a converted episode just means its file has no library link (link count
     1), which is true: the library has its own copy.
 
+- **Paced Romanian subtitles** (every 3 minutes, first run 75 s after start): when a whole
+  season arrives at once, Bazarr searches every episode together and the Romanian providers
+  rate-limit it, so most episodes wait for Bazarr's next wanted search (every 6 h). This job asks
+  Bazarr for one `ro` search per run, for the episode you will watch next: the next unwatched
+  episode of each series (by Plex's watched state), the most recently watched series first.
+  Watched episodes are left to Bazarr; movies get a turn when no episode is due. After each
+  search the same episode waits 30 min, then 2 h, then 6 h (kept in `state.local.json` under
+  `subs_search`, dropped once the subtitle is found).
+
 The seed keeper and the next-season check read "watched" from Plex library section 1 (movies)
 and section 2 (TV); these are fixed. The DV strip takes the section of each library from the
 config.

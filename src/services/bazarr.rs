@@ -1,8 +1,9 @@
 //! Bazarr (spec 5.3): `GET {bazarr.url}/api/movies`, header `X-API-KEY`, timeout 4 s,
-//! `.data`, cached 60 s.
+//! `.data`, cached 60 s. For `jobs::subs`: uncached `.data` reads and the `PATCH` search.
 
 use crate::services::cache::TtlCache;
-use crate::services::{Client, UpResult};
+use crate::services::{Client, UpResult, UpstreamError};
+use reqwest::Method;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -44,5 +45,28 @@ impl Bazarr {
     /// Forget the cached list (tests).
     pub fn clear_cache(&self) {
         self.movies.clear();
+    }
+
+    /// Job call: `GET {bazarr.url}<path_and_query>` -> `.data` (uncached). A body without a
+    /// `data` array is an error (never "nothing wanted").
+    pub async fn data(&self, path_and_query: &str, timeout: Duration) -> UpResult<Vec<Value>> {
+        let key = self.key();
+        let url = self.c.url("bazarr", path_and_query);
+        match self.c.http.get_json(&url, &[("X-API-KEY", key.as_str())], timeout).await? {
+            Some(Value::Object(mut m)) => match m.remove("data") {
+                Some(Value::Array(a)) => Ok(a),
+                _ => Err(UpstreamError::Body),
+            },
+            _ => Err(UpstreamError::Body),
+        }
+    }
+
+    /// Job call: `PATCH {bazarr.url}<path_and_query>` (a subtitle search; Bazarr answers when
+    /// the search is over).
+    pub async fn patch(&self, path_and_query: &str, timeout: Duration) -> UpResult<()> {
+        let key = self.key();
+        let url = self.c.url("bazarr", path_and_query);
+        self.c.http.request(Method::PATCH, &url, &[("X-API-KEY", key.as_str())], None, timeout).await?;
+        Ok(())
     }
 }
