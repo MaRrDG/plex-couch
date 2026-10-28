@@ -8,11 +8,13 @@
 //!   (60 s, a failure 15 s).
 //! - `GET /api/series/<id>` ([`api_detail`]): seasons and episodes with a file: number, title,
 //!   watched, file name, size, codec, the video state (direct / needs converting / converted /
-//!   converting with its percent / queued), the RO subtitle (Bazarr
-//!   `GET /api/episodes?seriesid[]=<id>`: `subtitles[].code2`, `missing_subtitles[].code2`; a
-//!   running Bazarr translation job (`GET /api/system/jobs`, `job_name` with "Translating",
-//!   `progress_message` the `.en.srt` path) for that file is "translating"). Cached 20 s; the
-//!   running batch is merged in on every request.
+//!   converting with its percent / queued), the RO subtitle `ro`: `ok` / `missing` (Bazarr
+//!   `GET /api/episodes?seriesid[]=<id>`: `subtitles[].code2`, `missing_subtitles[].code2`),
+//!   `translating` (a running Bazarr translation job, `GET /api/system/jobs`, `job_name` with
+//!   "Translating", `progress_message` the `.en.srt` path, or our own one in flight), `queued`
+//!   (with `ro_pos`; [`crate::jobs::subs_manual`]). Cached 20 s; the running batch and the
+//!   translation queue are merged in on every request, and the response carries the
+//!   translation status as `subs`.
 //! - `GET /api/movies/<id>` ([`api_movie`]): the same for one Radarr movie (the Filme sheet).
 //!
 //! A service that is down blanks only its part (Plex: watched unknown, nothing can start;
@@ -21,6 +23,7 @@
 
 use crate::app::AppState;
 use crate::jobs::common::id_of;
+use crate::jobs::subs_manual;
 use crate::jobs::convert::{
     candidates, converted_keys, file_needs_conversion, ledger_error, ledger_path, load_ledger, plex_movie_views, plex_views, Settings,
     DEFAULT_COUNT, MAX_COUNT, RADARR_DOWN, SONARR_DOWN,
@@ -63,7 +66,7 @@ pub fn basename(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or("").to_string()
 }
 
-fn has_ro(list: Option<&Value>) -> bool {
+pub fn has_ro(list: Option<&Value>) -> bool {
     list.and_then(Value::as_array).is_some_and(|a| {
         a.iter().any(|s| {
             s.get("code2").and_then(Value::as_str).is_some_and(|c| c.eq_ignore_ascii_case("ro")) && !s.get("forced").and_then(Value::as_bool).unwrap_or(false)
@@ -71,11 +74,11 @@ fn has_ro(list: Option<&Value>) -> bool {
     })
 }
 
-/// The RO subtitle of one Bazarr record: `ro` (there), `translating`, `missing`, or None
+/// The RO subtitle of one Bazarr record: `ok` (there), `translating`, `missing`, or None
 /// (Bazarr does not know the file or does not want RO for it).
 pub fn ro_status(rec: Option<&Value>, translating: bool) -> Option<&'static str> {
     if rec.is_some_and(|r| has_ro(r.get("subtitles"))) {
-        return Some("ro");
+        return Some("ok");
     }
     if translating {
         return Some("translating");
@@ -173,7 +176,7 @@ pub fn detail(d: &DetailIn) -> Value {
                 "title": e.get("title").and_then(Value::as_str).unwrap_or(""),
                 "watched": watched_in(d.views, path), "file": basename(path), "size": f.get("size").and_then(Value::as_u64).unwrap_or(0),
                 "codec": codec_label(f.get("mediaInfo")), "needs_conversion": file_needs_conversion(f) && !converted,
-                "converted": converted, "can_convert": cand_ids.contains(&eid), "ro_sub": ro, "converting": null, "queued": false,
+                "converted": converted, "can_convert": cand_ids.contains(&eid), "ro": ro, "converting": null, "queued": false,
             }),
         ));
     }
@@ -251,7 +254,7 @@ pub fn merge_job(detail: &mut Value, job: &Value) {
 }
 
 /// The movie sheet: `{"id", "title", "year", "poster", "file", "size", "codec", "watched",
-/// "needs_conversion", "converted", "can_convert", "ro_sub", "converting", "plex"}`.
+/// "needs_conversion", "converted", "can_convert", "ro", "converting", "plex"}`.
 pub fn movie_detail(movie: &Value, views: Option<&HashMap<String, i64>>, converted: &HashSet<String>, ro: Option<Option<bool>>, texts: &[String]) -> Value {
     let id = id_of(movie.get("id")).unwrap_or(0);
     let file = movie.get("movieFile").filter(|f| f.is_object());
@@ -264,7 +267,7 @@ pub fn movie_detail(movie: &Value, views: Option<&HashMap<String, i64>>, convert
         Some("translating")
     } else {
         match ro {
-            Some(Some(true)) => Some("ro"),
+            Some(Some(true)) => Some("ok"),
             Some(Some(false)) => Some("missing"),
             _ => None,
         }
@@ -274,7 +277,7 @@ pub fn movie_detail(movie: &Value, views: Option<&HashMap<String, i64>>, convert
         "poster": poster_url("movie", &id.to_string()), "file": if has { Value::from(basename(path)) } else { Value::Null },
         "size": file.and_then(|f| f.get("size")).and_then(Value::as_u64).unwrap_or(0), "codec": codec_label(file.and_then(|f| f.get("mediaInfo"))),
         "watched": watched, "needs_conversion": needs, "converted": conv, "can_convert": needs && watched == Some(false),
-        "ro_sub": ro_sub, "converting": null, "plex": views.is_some(),
+        "ro": ro_sub, "converting": null, "plex": views.is_some(),
     })
 }
 
@@ -385,6 +388,20 @@ fn with_status(mut v: Value, job: Value, dry_run: bool, demo: bool) -> Value {
     v
 }
 
+/// The translation queue into a series screen (`series`) or a movie sheet, and its status
+/// as `subs` ([`crate::jobs::subs_manual`]).
+async fn with_subs(app: &AppState, mut v: Value, series: bool) -> Value {
+    if let Ok(snap) = app.subs.snapshot(app) {
+        if series {
+            subs_manual::merge_series(&mut v, &snap);
+        } else {
+            subs_manual::merge_movie(&mut v, &snap);
+        }
+    }
+    v["subs"] = subs_manual::api_status(app).await;
+    v
+}
+
 /// `GET /api/series/<id>` -> `(status, body)`.
 pub async fn api_detail(app: &Arc<AppState>, id: i64) -> (u16, Value) {
     if app.demo {
@@ -392,7 +409,7 @@ pub async fn api_detail(app: &Arc<AppState>, id: i64) -> (u16, Value) {
         return match demo_detail(id) {
             Some(mut v) => {
                 merge_job(&mut v, &job);
-                (200, with_status(v, job, true, true))
+                (200, with_subs(app, with_status(v, job, true, true), true).await)
             }
             None => (404, json!({"error": "Serialul nu există în Sonarr."})),
         };
@@ -410,7 +427,7 @@ pub async fn api_detail(app: &Arc<AppState>, id: i64) -> (u16, Value) {
     let job = app.convert.status_json();
     let mut v = base;
     merge_job(&mut v, &job);
-    (200, with_status(v, job, app.dry_run, false))
+    (200, with_subs(app, with_status(v, job, app.dry_run, false), true).await)
 }
 
 /// `GET /api/movies/<id>` -> `(status, body)`.
@@ -418,7 +435,7 @@ pub async fn api_movie(app: &Arc<AppState>, id: i64) -> (u16, Value) {
     if app.demo {
         let job = crate::jobs::convert::demo_job(app.started.elapsed().as_secs_f64());
         return match demo_movie(id) {
-            Some(v) => (200, with_status(v, job, true, true)),
+            Some(v) => (200, with_subs(app, with_status(v, job, true, true), false).await),
             None => (404, json!({"error": "Filmul nu există în Radarr."})),
         };
     }
@@ -440,7 +457,7 @@ pub async fn api_movie(app: &Arc<AppState>, id: i64) -> (u16, Value) {
     let mut v = movie_detail(&movie, views.as_ref(), &converted, ro, &translation_texts(&jobs));
     let job = app.convert.status_json();
     merge_movie_job(&mut v, &job);
-    (200, with_status(v, job, app.dry_run, false))
+    (200, with_subs(app, with_status(v, job, app.dry_run, false), false).await)
 }
 
 // -- demo ----------------------------------------------------------------------------------
@@ -583,7 +600,7 @@ mod tests {
         assert_eq!(basename("D:\\S\\Show - S01E01.mkv"), "Show - S01E01.mkv");
         assert_eq!(basename("/m/x.mkv"), "x.mkv");
         let ro = json!([{"code2": "ro"}]);
-        assert_eq!(ro_status(Some(&json!({"subtitles": ro, "missing_subtitles": []})), true), Some("ro"));
+        assert_eq!(ro_status(Some(&json!({"subtitles": ro, "missing_subtitles": []})), true), Some("ok"));
         assert_eq!(ro_status(Some(&json!({"subtitles": [], "missing_subtitles": ro})), false), Some("missing"));
         assert_eq!(ro_status(Some(&json!({"subtitles": [], "missing_subtitles": ro})), true), Some("translating"));
         assert_eq!(ro_status(Some(&json!({"subtitles": [{"code2": "ro", "forced": true}], "missing_subtitles": []})), false), None);
@@ -655,11 +672,11 @@ mod tests {
         let s1 = d["seasons"][0]["episodes"].as_array().unwrap();
         assert_eq!(s1.len(), 5);
         // e1 watched; e2 converted; e3 needs it, translating; e4-5 one file (only E04 starts it).
-        assert_eq!((s1[0]["watched"].clone(), s1[0]["ro_sub"].clone(), s1[0]["can_convert"].clone()), (json!(true), json!("ro"), json!(false)));
-        assert_eq!((s1[1]["converted"].clone(), s1[1]["needs_conversion"].clone(), s1[1]["ro_sub"].clone()), (json!(true), json!(false), json!("missing")));
-        assert_eq!((s1[2]["can_convert"].clone(), s1[2]["ro_sub"].clone(), s1[2]["file"].clone()), (json!(true), json!("translating"), json!("e3.mkv")));
+        assert_eq!((s1[0]["watched"].clone(), s1[0]["ro"].clone(), s1[0]["can_convert"].clone()), (json!(true), json!("ok"), json!(false)));
+        assert_eq!((s1[1]["converted"].clone(), s1[1]["needs_conversion"].clone(), s1[1]["ro"].clone()), (json!(true), json!(false), json!("missing")));
+        assert_eq!((s1[2]["can_convert"].clone(), s1[2]["ro"].clone(), s1[2]["file"].clone()), (json!(true), json!("translating"), json!("e3.mkv")));
         assert_eq!((s1[3]["can_convert"].clone(), s1[4]["can_convert"].clone(), s1[4]["needs_conversion"].clone()), (json!(true), json!(false), json!(true)));
-        assert_eq!((s1[3]["codec"].clone(), s1[3]["label"].clone(), s1[3]["ro_sub"].clone()), (json!("H.264, 10 biți"), json!("S01E04"), Value::Null));
+        assert_eq!((s1[3]["codec"].clone(), s1[3]["label"].clone(), s1[3]["ro"].clone()), (json!("H.264, 10 biți"), json!("S01E04"), Value::Null));
         assert_eq!(d["seasons"][1]["episodes"][0]["needs_conversion"], json!(false));
         assert_eq!((d["pending"].clone(), d["next"].clone(), d["unwatched"].clone()), (json!(3), json!("S01E03"), json!(6)));
         assert_eq!((d["default_season"].clone(), d["plex"].clone(), d["bazarr"].clone()), (json!(1), json!(true), json!(true)));
@@ -667,7 +684,7 @@ mod tests {
         // Plex and Bazarr down: nothing can start, no subtitle state.
         let d = detail(&DetailIn { series: &s, episodes: &eps, files: &files, views: None, converted: &converted, bazarr: None, jobs: None });
         assert_eq!((d["pending"].clone(), d["unwatched"].clone(), d["default_season"].clone()), (Value::Null, Value::Null, json!(1)));
-        assert!(d["seasons"][0]["episodes"].as_array().unwrap().iter().all(|e| e["can_convert"] == json!(false) && e["watched"].is_null() && e["ro_sub"].is_null()));
+        assert!(d["seasons"][0]["episodes"].as_array().unwrap().iter().all(|e| e["can_convert"] == json!(false) && e["watched"].is_null() && e["ro"].is_null()));
         // Everything watched: the last regular season.
         let all: HashMap<String, i64> = files.iter().map(|f| (path_key(f["path"].as_str().unwrap()), 1)).collect();
         let d = detail(&DetailIn { series: &s, episodes: &eps, files: &files, views: Some(&all), converted: &converted, bazarr: None, jobs: None });
@@ -701,12 +718,12 @@ mod tests {
         let m = json!({"id": 7, "title": "Film", "year": 2020, "movieFile": {"path": path, "size": 9, "mediaInfo": {"videoCodec": "x264", "videoBitDepth": 10}}});
         let views: HashMap<String, i64> = HashMap::new();
         let v = movie_detail(&m, Some(&views), &HashSet::new(), Some(Some(false)), &[]);
-        assert_eq!((v["can_convert"].clone(), v["watched"].clone(), v["ro_sub"].clone(), v["file"].clone()), (json!(true), json!(false), json!("missing"), json!("Film.mkv")));
+        assert_eq!((v["can_convert"].clone(), v["watched"].clone(), v["ro"].clone(), v["file"].clone()), (json!(true), json!(false), json!("missing"), json!("Film.mkv")));
         let texts = translation_texts(&[json!({"job_name": "Translating", "progress_message": "D:\\Media\\Movies\\Film (2020)\\Film.en.srt"})]);
-        assert_eq!(movie_detail(&m, Some(&views), &HashSet::new(), Some(Some(false)), &texts)["ro_sub"], json!("translating"));
+        assert_eq!(movie_detail(&m, Some(&views), &HashSet::new(), Some(Some(false)), &texts)["ro"], json!("translating"));
         let watched: HashMap<String, i64> = [(path_key(path), 1)].into_iter().collect();
         let v = movie_detail(&m, Some(&watched), &HashSet::new(), None, &[]);
-        assert_eq!((v["needs_conversion"].clone(), v["can_convert"].clone(), v["ro_sub"].clone()), (json!(true), json!(false), Value::Null));
+        assert_eq!((v["needs_conversion"].clone(), v["can_convert"].clone(), v["ro"].clone()), (json!(true), json!(false), Value::Null));
         let conv: HashSet<String> = [path_key(path)].into_iter().collect();
         let v = movie_detail(&m, None, &conv, None, &[]);
         assert_eq!((v["converted"].clone(), v["needs_conversion"].clone(), v["plex"].clone()), (json!(true), json!(false), json!(false)));
@@ -729,7 +746,7 @@ mod tests {
         merge_job(&mut d, &job);
         let s1 = &d["seasons"][0]["episodes"];
         assert_eq!((s1[4]["converted"].clone(), s1[5]["converting"]["percent"].clone(), s1[6]["queued"].clone()), (json!(true), json!(10.0), json!(true)));
-        assert_eq!(s1[5]["ro_sub"], json!("translating"));
+        assert_eq!(s1[5]["ro"], json!("translating"));
         assert!(demo_detail(99).is_none());
         assert_eq!(demo_movie(1).unwrap()["can_convert"], json!(true));
         assert_eq!(demo_movie(2).unwrap()["can_convert"], json!(false));
@@ -776,8 +793,8 @@ mod tests {
         let (code, d) = api_detail(&a, 4).await;
         assert_eq!(code, 200, "{d}");
         let s1 = &d["seasons"][0]["episodes"];
-        assert_eq!((s1[0]["watched"].clone(), s1[0]["ro_sub"].clone()), (json!(true), json!("ro")));
-        assert_eq!((s1[1]["can_convert"].clone(), s1[1]["ro_sub"].clone()), (json!(true), json!("translating")));
+        assert_eq!((s1[0]["watched"].clone(), s1[0]["ro"].clone()), (json!(true), json!("ok")));
+        assert_eq!((s1[1]["can_convert"].clone(), s1[1]["ro"].clone()), (json!(true), json!("translating")));
         assert_eq!((d["pending"].clone(), d["job"].clone(), d["max"].clone()), (json!(1), Value::Null, json!(MAX_COUNT)));
         // Cached: a second request asks nothing upstream.
         let n = f.requests().len();
@@ -789,7 +806,7 @@ mod tests {
         assert_eq!(api_detail(&a, 6).await, (404, json!({"error": "Serialul nu există în Sonarr."})));
         let (code, m) = api_movie(&a, 7).await;
         assert_eq!(code, 200, "{m}");
-        assert_eq!((m["can_convert"].clone(), m["ro_sub"].clone(), m["codec"].clone()), (json!(true), json!("ro"), json!("H.264, 10 biți")));
+        assert_eq!((m["can_convert"].clone(), m["ro"].clone(), m["codec"].clone()), (json!(true), json!("ok"), json!("H.264, 10 biți")));
         assert_eq!(api_movie(&a, 8).await.0, 404);
         assert!(f.mutations().is_empty(), "reads only");
     }

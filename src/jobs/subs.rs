@@ -23,13 +23,17 @@
 //! Bazarr or Plex down: logged once, nothing searched (Plex down: the order is plain episode
 //! order). Dry-run: the search is only logged and the backoff stays in memory.
 //!
-//! An item still missing `ro` after a search may then be translated from English by Bazarr's
-//! Gemini translator, one at a time: see [`crate::jobs::subs_translate`] (state under
-//! `subs_translate`).
+//! Translations from English by Bazarr's Gemini translator, one at a time (state under
+//! `subs_translate`): the ones the user queues in Seriale / Filme first
+//! ([`crate::jobs::subs_manual`]), then, only with `jobs.subs.auto_translate`, an item still
+//! missing `ro` after a search ([`crate::jobs::subs_translate`]). A queued request wakes the
+//! loop at once, and while one is queued or in flight the loop looks every 15 s
+//! ([`translate_tick`], translations only; the paced search stays every 3 min).
 
 use crate::app::AppState;
 use crate::jobs::common::{id_of, unix_now, Quiet};
-use crate::jobs::subs_translate::{self as translate, bazarr_gate, local_gate, order_movie_cands, pick_kind, SubTools, TrSettings, TrState, TR_KEY};
+use crate::jobs::subs_manual;
+use crate::jobs::subs_translate::{self as translate, bazarr_gate, local_gate, order_movie_cands, pick_kind, SubTools, TrSettings, TrState};
 use crate::jobs::Stop;
 use crate::services::plex_jobs::{path_key, PlexJobs};
 use crate::{log_info, log_warning};
@@ -40,6 +44,8 @@ use std::time::Duration;
 
 pub const INTERVAL: Duration = Duration::from_secs(3 * 60);
 pub const FIRST_RUN: Duration = Duration::from_secs(75);
+/// While a manual translation is queued or one is in flight: how often to look.
+pub const BUSY_INTERVAL: Duration = Duration::from_secs(15);
 /// `state.local.json` key: `{"ep:<sonarrEpisodeId>" | "movie:<radarrId>": {"tries", "next"}}`.
 pub const STATE_KEY: &str = "subs_search";
 pub const LANGUAGE: &str = "ro";
@@ -248,25 +254,65 @@ fn section(app: &AppState) -> u32 {
 /// One tick: at most one search and at most one translation started. Returns the key
 /// searched (or only logged in dry-run).
 pub async fn tick(app: &AppState, s: &mut Subs, now: f64) -> Option<String> {
-    let today = crate::log::asctime().get(..10).unwrap_or("").to_string();
-    tick_on(app, s, now, &today).await
+    tick_on(app, s, now, &translate::local_today()).await
+}
+
+/// The state file once per job instance; false (logged once) if it is unreadable.
+fn ensure_loaded(app: &AppState, s: &mut Subs) -> bool {
+    if s.loaded {
+        return true;
+    }
+    match app.state_file.try_load() {
+        Ok(m) => {
+            s.attempts = parse_attempts(m.get(STATE_KEY));
+            s.tr = app.subs.load_from(app, &m);
+            s.loaded = true;
+            s.quiet.clear("state");
+            true
+        }
+        Err(t) => {
+            s.quiet.warn("state", format!("subs: the state file is unreadable ({t}), nothing searched"));
+            false
+        }
+    }
+}
+
+/// The tools for a translation: the test fakes, else the installed ffmpeg.
+fn tools(app: &AppState, s: &Subs) -> Option<Arc<dyn SubTools>> {
+    s.tools.clone().or_else(|| translate::real_tools(app))
+}
+
+/// The translation in flight, then the next manual request. True: the state changed.
+async fn translations(app: &AppState, s: &mut Subs, cfg: &TrSettings, now: f64, today: &str) -> bool {
+    let mut changed = false;
+    if s.tr.inflight.is_some() {
+        changed |= translate::poll(app, &mut s.tr, cfg, section(app), now).await;
+    }
+    if s.tr.inflight.is_none() && app.subs.has_queue() {
+        let t = tools(app, s);
+        changed |= subs_manual::step(app, &mut s.tr, &mut s.quiet, t, cfg, translate::When { now, today }).await;
+    }
+    changed
+}
+
+/// Between the paced ticks, while a manual request is queued or a translation is in flight:
+/// only [`translations`], no search, no wanted lists. True: the state changed.
+pub async fn translate_tick(app: &AppState, s: &mut Subs, now: f64, today: &str) -> bool {
+    if !ensure_loaded(app, s) {
+        return false;
+    }
+    let cfg = TrSettings::from_app(app);
+    let changed = translations(app, s, &cfg, now, today).await;
+    if changed {
+        save(app, s);
+    }
+    changed
 }
 
 /// [`tick`] on the local day `today` (`YYYY-MM-DD`, for the daily translation cap).
 pub async fn tick_on(app: &AppState, s: &mut Subs, now: f64, today: &str) -> Option<String> {
-    if !s.loaded {
-        match app.state_file.try_load() {
-            Ok(m) => {
-                s.attempts = parse_attempts(m.get(STATE_KEY));
-                s.tr = TrState::from_json(m.get(TR_KEY));
-                s.loaded = true;
-                s.quiet.clear("state");
-            }
-            Err(t) => {
-                s.quiet.warn("state", format!("subs: the state file is unreadable ({t}), nothing searched"));
-                return None;
-            }
-        }
+    if !ensure_loaded(app, s) {
+        return None;
     }
     let bz = &app.services.bazarr;
     let (wanted, total) = match bz.data_total("/api/episodes/wanted?start=0&length=-1", LIST_TIMEOUT).await {
@@ -289,13 +335,13 @@ pub async fn tick_on(app: &AppState, s: &mut Subs, now: f64, today: &str) -> Opt
         changed |= s.tr.prune("ep:", |k| keys.contains(k));
     }
     let tcfg = TrSettings::from_app(app);
-    if s.tr.inflight.is_some() {
-        changed |= translate::poll(app, &mut s.tr, &tcfg, section(app), now).await;
-    }
+    // The one in flight, then the user's requests: they go before everything else.
+    changed |= translations(app, s, &tcfg, now, today).await;
 
-    // May a translation start this tick? Local checks first (off, in flight, daily cap), then
-    // is anything due (searched at least once), then Bazarr's side (translator, its jobs).
-    let tr_local = local_gate(&s.tr, &tcfg, today).is_ok();
+    // May an automatic translation start this tick? Local checks first (auto_translate, the
+    // manual queue empty, in flight, daily cap), then is anything due (searched at least
+    // once), then Bazarr's side (translator, its jobs).
+    let tr_local = !app.subs.has_queue() && local_gate(&s.tr, &tcfg, today).is_ok();
     let mut movies_wanted = if tr_local { Some(bz.data_total(MOVIES_WANTED, LIST_TIMEOUT).await) } else { None };
     let tr_due = |k: &str| s.attempts.contains_key(k) && s.tr.eligible(k, now);
     let tr_series: HashSet<i64> = if tr_local {
@@ -440,7 +486,7 @@ pub async fn tick_on(app: &AppState, s: &mut Subs, now: f64, today: &str) -> Opt
         }
         if let Some(c) = pick_kind(ep, movie, &s.tr.last) {
             let video = if c.movie_id != 0 { movie_paths.get(&c.movie_id) } else { ep_paths.get(&c.key) }.cloned().unwrap_or_default();
-            let tools = s.tools.clone().or_else(|| translate::real_tools(app));
+            let tools = tools(app, s);
             changed |= translate::start(app, &mut s.tr, &mut s.quiet, tools, &c, &video, translate::When { now, today }).await;
         }
     }
@@ -450,36 +496,47 @@ pub async fn tick_on(app: &AppState, s: &mut Subs, now: f64, today: &str) -> Opt
     searched
 }
 
-/// The backoff and the translation state to the state file (not in dry-run: memory only).
+/// The backoff and the translation state (with the manual queue) to the state file (not in
+/// dry-run: memory only).
 fn save(app: &AppState, s: &Subs) {
-    if app.dry_run {
-        return;
-    }
     let mut m = Map::new();
     m.insert(STATE_KEY.into(), attempts_json(&s.attempts));
-    m.insert(TR_KEY.into(), s.tr.to_json());
-    app.state_file.update(m);
+    app.subs.save(app, &s.tr, m);
 }
 
-/// Start the loop. A panic in a tick is logged and the loop goes on.
+/// Start the loop: the paced tick every 3 min (first after 75 s); in between, woken by a
+/// manual request and every 15 s while one is queued or in flight, [`translate_tick`]. A
+/// panic in a tick is logged and the loop goes on.
 pub fn spawn(app: Arc<AppState>, mut stop: Stop) {
     tokio::spawn(async move {
-        if stop.sleep(FIRST_RUN).await {
-            return;
-        }
         let st = Arc::new(tokio::sync::Mutex::new(Subs::default()));
+        let mut next_full = tokio::time::Instant::now() + FIRST_RUN;
         loop {
+            let mut wait = next_full.saturating_duration_since(tokio::time::Instant::now());
+            if app.subs.busy() {
+                wait = wait.min(BUSY_INTERVAL);
+            }
+            tokio::select! {
+                stopping = stop.sleep(wait) => if stopping { return },
+                _ = app.subs.wake.notified() => {}
+            }
+            let full = tokio::time::Instant::now() >= next_full;
             let (a, st2) = (app.clone(), st.clone());
             let r = tokio::spawn(async move {
                 let mut g = st2.lock().await;
-                tick(&a, &mut g, unix_now()).await
+                let now = unix_now();
+                if full {
+                    tick(&a, &mut g, now).await;
+                } else {
+                    translate_tick(&a, &mut g, now, &translate::local_today()).await;
+                }
             })
             .await;
             if r.is_err() {
                 log_warning!("subs: tick failed (panic)");
             }
-            if stop.sleep(INTERVAL).await {
-                return;
+            if full {
+                next_full = tokio::time::Instant::now() + INTERVAL;
             }
         }
     });
@@ -672,7 +729,7 @@ mod tests {
 
     // -- the translation fallback ----------------------------------------------------------
 
-    use crate::jobs::subs_translate::{InFlight, TrItem};
+    use crate::jobs::subs_translate::{InFlight, TrItem, TR_KEY};
     use crate::services::arr_jobs::urlencode;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -685,6 +742,8 @@ mod tests {
         movies: Mutex<Vec<i64>>,
         settings: Mutex<Value>,
         jobs: Mutex<Value>,
+        /// Episodes (n) Bazarr lists with a RO subtitle.
+        has_ro: Mutex<Vec<i64>>,
     }
 
     impl TrWorld {
@@ -708,7 +767,7 @@ mod tests {
 
     fn tr_world() -> Arc<TrWorld> {
         let root = crate::jobs::testutil::temp_dir("subs-tr");
-        let w = TrWorld { root, wanted: Mutex::new(vec![2, 3, 4]), movies: Mutex::new(vec![]), settings: Mutex::new(gemini()), jobs: Mutex::new(json!([])) };
+        let w = TrWorld { root, wanted: Mutex::new(vec![2, 3, 4]), movies: Mutex::new(vec![]), settings: Mutex::new(gemini()), jobs: Mutex::new(json!([])), has_ro: Mutex::new(vec![]) };
         fs::create_dir_all(w.root.join("Show")).unwrap();
         fs::create_dir_all(w.root.join("Movies")).unwrap();
         for n in 1..=5 {
@@ -736,7 +795,18 @@ mod tests {
                 return ok(json!({"data": recs, "total": recs.len()}));
             }
             if p.starts_with("/api/episodes?seriesid%5B%5D=4") {
-                return ok(json!({"data": (1..=5).map(|n| e(100 + n, 1, n, &w.ep(n).display().to_string())).collect::<Vec<_>>()}));
+                let has = w.has_ro.lock().unwrap().clone();
+                let recs: Vec<Value> = (1..=5)
+                    .map(|n| {
+                        let mut r = e(100 + n, 1, n, &w.ep(n).display().to_string());
+                        if has.contains(&n) {
+                            r["subtitles"] = ro();
+                            r["missing_subtitles"] = json!([]);
+                        }
+                        r
+                    })
+                    .collect();
+                return ok(json!({"data": recs}));
             }
             if p.starts_with("/api/movies/wanted") {
                 let recs: Vec<Value> = w.movies.lock().unwrap().iter().map(|id| json!({"radarrId": id, "title": format!("Film {id}"), "missing_subtitles": ro()})).collect();
@@ -815,7 +885,7 @@ mod tests {
     async fn translates_after_a_search_one_at_a_time() {
         let w = tr_world();
         let f = tr_serve(w.clone()).await;
-        let (a, _d) = app(&f.base, false, json!({"jobs": {"subs": {"translate_per_day": 2}}}));
+        let (a, _d) = app(&f.base, false, json!({"jobs": {"subs": {"translate_per_day": 2, "auto_translate": true}}}));
         let tools = Arc::new(FakeTools::default());
         let mut s = Subs { tools: Some(tools.clone()), ..Default::default() };
         let t0 = 1_000_000.0;
@@ -894,7 +964,7 @@ mod tests {
         *w.wanted.lock().unwrap() = vec![2];
         *w.movies.lock().unwrap() = vec![3, 7, 9];
         let f = tr_serve(w.clone()).await;
-        let (a, _d) = app(&f.base, false, json!({}));
+        let (a, _d) = app(&f.base, false, json!({"jobs": {"subs": {"auto_translate": true}}}));
         let mut s = Subs { tools: Some(Arc::new(FakeTools::default())), ..Default::default() };
         let t0 = 1_000_000.0;
         s.loaded = true;
@@ -946,7 +1016,7 @@ mod tests {
         let tools = Arc::new(FakeTools::default());
         // Google Translate: skipped.
         *w.settings.lock().unwrap() = json!({"translator": {"translator_type": "google_translate", "gemini_keys": ["k"]}});
-        let (a, _d) = app(&f.base, false, json!({}));
+        let (a, _d) = app(&f.base, false, json!({"jobs": {"subs": {"auto_translate": true}}}));
         let mut s = primed(&tools);
         tick_on(&a, &mut s, t0, DAY).await;
         tick_on(&a, &mut s, t0 + 180.0, DAY).await;
@@ -966,7 +1036,7 @@ mod tests {
         assert!(f.mutations().is_empty());
         *w.jobs.lock().unwrap() = json!([]);
         // Dry-run: probed and logged, nothing written, no PATCH, the state file untouched.
-        let (a_dry, _d3) = app(&f.base, true, json!({}));
+        let (a_dry, _d3) = app(&f.base, true, json!({"jobs": {"subs": {"auto_translate": true}}}));
         let mut s = primed(&tools);
         tick_on(&a_dry, &mut s, t0, DAY).await;
         assert!(f.mutations().is_empty());
@@ -1000,11 +1070,155 @@ mod tests {
         // A restart with a translation in flight keeps following it.
         let mut st = Subs { tools: Some(tools.clone()), ..Default::default() };
         st.tr.inflight = Some(InFlight { key: "ep:102".into(), series_id: 4, episode_id: 102, movie_id: 0, name: "Show S01E02".into(),
-                                         en: "x.en.srt".into(), ro: "x.ro.srt".into(), started: t0, tries: 0 });
+                                         en: "x.en.srt".into(), ro: "x.ro.srt".into(), started: t0, tries: 0, manual: false });
         save(&a, &st);
         let mut s2 = Subs::default();
         tick_on(&a, &mut s2, t0 + 60.0, DAY).await;
         assert_eq!(s2.tr.inflight, st.tr.inflight);
+        let _ = fs::remove_dir_all(&w.root);
+    }
+
+    // -- manual requests -------------------------------------------------------------------
+
+    use crate::jobs::subs_manual::{QueueItem, HAS_RO};
+
+    fn queue(a: &AppState, items: Vec<QueueItem>) {
+        a.subs.enqueue(a, items).unwrap();
+    }
+
+    fn ep_item(n: i64) -> QueueItem {
+        QueueItem::episode(4, 100 + n, "Show", 1, n, 1.0)
+    }
+
+    fn ntfy(f: &Fake) -> Vec<String> {
+        f.find("POST", "/").iter().filter(|q| q.path == "/").map(|q| q.json()["message"].as_str().unwrap_or("").to_string()).collect()
+    }
+
+    fn en_srt(dir: &Path, stem: &str) -> PathBuf {
+        let p = dir.join(format!("{stem}.en.srt"));
+        fs::write(&p, "1\n00:00:01,000 --> 00:00:02,000\nHi\n\n").unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn manual_requests_need_no_search_and_no_auto() {
+        let w = tr_world();
+        *w.wanted.lock().unwrap() = vec![];
+        let f = tr_serve(w.clone()).await;
+        let (a, _d) = app(&f.base, false, json!({})); // auto_translate is off by default
+        let mut s = Subs { tools: Some(Arc::new(FakeTools::default())), ..Default::default() };
+        let t0 = 1_000_000.0;
+        let show = w.root.join("Show");
+        // Nothing asked for, auto off: Bazarr's translator is not even looked at.
+        tick_on(&a, &mut s, t0, DAY).await;
+        assert!(translations(&f).is_empty() && f.find("GET", "/api/system/settings").is_empty());
+        // E3 and E4 asked for: E3 goes at once (its embedded track), never searched.
+        queue(&a, vec![ep_item(3), ep_item(4)]);
+        assert!(translate_tick(&a, &mut s, t0 + 1.0, DAY).await);
+        let en3 = show.join("S01E03.en.srt");
+        assert_eq!(translations(&f), [translate_path("episode", 103, &en3)]);
+        assert!(f.find("PATCH", "/api/episodes/subtitles").is_empty(), "no provider search");
+        assert!(s.tr.inflight.as_ref().unwrap().manual);
+        assert_eq!((a.subs.front().unwrap().key(), s.tr.used_today(DAY)), ("ep:104".to_string(), 1));
+        let saved = a.state_file.load();
+        assert_eq!((saved[TR_KEY]["queue"].as_array().unwrap().len(), saved[TR_KEY]["inflight"]["manual"].clone()), (1, json!(true)));
+        // Bazarr fails it: reported (page + ntfy), no backoff; E4 starts right away.
+        let ro3 = show.join("S01E03.ro.srt");
+        fs::write(&ro3, b"").unwrap();
+        w.job("failed", &en3);
+        translate_tick(&a, &mut s, t0 + 20.0, DAY).await;
+        assert!(!ro3.exists());
+        assert!(!s.tr.items.contains_key("ep:103"), "no backoff for a manual request");
+        assert_eq!(ntfy(&f), ["Traducere RO eșuată: Show S01E03 (job eșuat în Bazarr)"]);
+        let r = a.subs.snapshot(&a).unwrap().recent;
+        assert_eq!((r[0].key.as_str(), r[0].ok, r[0].text.as_str()), ("ep:103", false, "job eșuat în Bazarr"));
+        let en4 = show.join("S01E04.en.srt");
+        assert_eq!(translations(&f).last().unwrap(), &translate_path("episode", 104, &en4));
+        // Done: the result and ntfy; nothing left.
+        w.job("completed", &en4);
+        fs::write(show.join("S01E04.ro.srt"), HEADER_SRT).unwrap();
+        translate_tick(&a, &mut s, t0 + 40.0, DAY).await;
+        assert!(s.tr.inflight.is_none() && !a.subs.busy());
+        assert_eq!(ntfy(&f).last().unwrap(), "Subtitrare RO tradusă: Show S01E04");
+        assert_eq!(a.subs.snapshot(&a).unwrap().recent.last().unwrap().text, "tradusă");
+        // E4 again (its .ro.srt is there now) and E5 (Bazarr lists RO): both end as
+        // "avea deja RO", nothing is sent to Bazarr, the cap is not used.
+        w.has_ro.lock().unwrap().push(5);
+        queue(&a, vec![ep_item(4), ep_item(5)]);
+        let n = patches(&f).len();
+        translate_tick(&a, &mut s, t0 + 60.0, DAY).await;
+        assert_eq!(patches(&f).len(), n);
+        let r = a.subs.snapshot(&a).unwrap().recent;
+        assert_eq!(r[r.len() - 2..].iter().map(|o| (o.key.as_str(), o.text.as_str())).collect::<Vec<_>>(), [("ep:104", HAS_RO), ("ep:105", HAS_RO)]);
+        assert!(!a.subs.has_queue() && s.tr.used_today(DAY) == 2);
+        // A movie: its path from Bazarr's record, its external English file.
+        let en7 = en_srt(&w.root.join("Movies"), "Film7");
+        queue(&a, vec![QueueItem::movie(7, "Film 7", 1.0)]);
+        translate_tick(&a, &mut s, t0 + 80.0, DAY).await;
+        assert_eq!(translations(&f).last().unwrap(), &translate_path("movie", 7, &en7));
+        // One Bazarr does not know ends as a failure.
+        w.job("completed", &en7);
+        fs::write(w.root.join("Movies").join("Film7.ro.srt"), HEADER_SRT).unwrap();
+        queue(&a, vec![QueueItem::movie(42, "Nope", 1.0)]);
+        translate_tick(&a, &mut s, t0 + 100.0, DAY).await;
+        assert_eq!(ntfy(&f).last().unwrap(), "Traducere RO eșuată: Nope (Bazarr nu cunoaște filmul)");
+        assert!(!a.subs.has_queue());
+        let _ = fs::remove_dir_all(&w.root);
+    }
+
+    #[tokio::test]
+    async fn manual_goes_before_auto_and_counts_for_the_cap() {
+        let w = tr_world();
+        *w.wanted.lock().unwrap() = vec![2];
+        let f = tr_serve(w.clone()).await;
+        let (a, _d) = app(&f.base, false, json!({"jobs": {"subs": {"auto_translate": true, "translate_per_day": 1}}}));
+        let mut s = Subs { tools: Some(Arc::new(FakeTools::default())), ..Default::default() };
+        let t0 = 1_000_000.0;
+        s.loaded = true;
+        searched_once(&mut s, &["ep:102"], t0 + 9999.0); // an automatic candidate is due
+        let show = w.root.join("Show");
+        let en5 = en_srt(&show, "S01E05");
+        queue(&a, vec![ep_item(5)]);
+        tick_on(&a, &mut s, t0, DAY).await;
+        assert_eq!(translations(&f), [translate_path("episode", 105, &en5)], "the manual one first");
+        // Done; the cap (1) is reached: neither the next request nor the automatic one today.
+        w.job("completed", &en5);
+        fs::write(show.join("S01E05.ro.srt"), HEADER_SRT).unwrap();
+        let en3 = en_srt(&show, "S01E03");
+        queue(&a, vec![ep_item(3)]);
+        tick_on(&a, &mut s, t0 + 180.0, DAY).await;
+        assert_eq!(translations(&f).len(), 1);
+        assert!(a.subs.has_queue(), "it waits for tomorrow");
+        // Tomorrow: the request, still before ep:102.
+        tick_on(&a, &mut s, t0 + 360.0, "2026-10-29").await;
+        assert_eq!(translations(&f).last().unwrap(), &translate_path("episode", 103, &en3));
+        assert!(!a.subs.has_queue());
+        let _ = fs::remove_dir_all(&w.root);
+    }
+
+    #[tokio::test]
+    async fn a_request_wakes_the_loop() {
+        let w = tr_world();
+        let en2 = en_srt(&w.root.join("Show"), "S01E02");
+        let f = tr_serve(w.clone()).await;
+        let (a, _d) = app(&f.base, false, json!({}));
+        let (h, stop) = crate::jobs::stop_pair();
+        spawn(a.clone(), stop);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(f.requests().is_empty(), "the first paced run is 75 s away");
+        queue(&a, vec![ep_item(2)]);
+        let want = translate_path("episode", 102, &en2);
+        let mut seen = false;
+        for _ in 0..100 {
+            if translations(&f).contains(&want) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        h.stop();
+        assert!(seen, "woken at once, not after 75 s");
+        assert!(f.find("GET", "/api/episodes/wanted").is_empty(), "translations only, no paced search");
         let _ = fs::remove_dir_all(&w.root);
     }
 }

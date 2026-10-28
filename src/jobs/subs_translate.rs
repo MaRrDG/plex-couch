@@ -1,19 +1,26 @@
-//! The translation fallback of [`crate::jobs::subs`]: an episode or movie still missing `ro`
-//! after at least one paced provider search gets a Romanian subtitle translated by Bazarr's
-//! own translator (Gemini) from an English one.
+//! The translation of [`crate::jobs::subs`]: an episode or movie gets a Romanian subtitle
+//! translated by Bazarr's own translator (Gemini) from an English one.
 //!
+//! Two ways in:
+//! - **Manual** (the default): the user asks for it in Seriale / Filme. The queue, its API
+//!   and its processing live in [`crate::jobs::subs_manual`]; manual requests go before
+//!   anything else and need no prior provider search.
+//! - **Automatic** (`jobs.subs.auto_translate`, default off; the old `jobs.subs.translate`
+//!   key is read as its alias): an item still missing `ro` after at least one paced provider
+//!   search.
+//!
+//! For both:
 //! - Only when Bazarr's `translator.translator_type` is `gemini` and `translator.gemini_keys`
 //!   is not empty (`GET /api/system/settings`; nothing else of it is read, never logged).
 //!   Google Translate gets rate-limited and gave nothing: it is not used.
-//! - At most one translation is started per tick and none while one we started is still in
-//!   flight (persisted, given up after [`JOB_TIMEOUT`]) or while Bazarr runs any translation
-//!   job (`GET /api/system/jobs`, its queue cannot cancel a running job). A daily cap
-//!   (`jobs.subs.translate_per_day`, default 40, per local day) keeps the Gemini free tier
-//!   (500/day) safe.
-//! - Candidates: wanted items that already have a `subs_search` attempt, episodes in the
-//!   search order (next unwatched first), movies unwatched and newest Radarr id first (the
-//!   one just downloaded is likely watched soon); when both are due, episode and movie take
-//!   turns ([`pick_kind`]).
+//! - At most one translation in flight (persisted, given up after [`JOB_TIMEOUT`]) and none
+//!   while Bazarr runs any translation job (`GET /api/system/jobs`, its queue cannot cancel
+//!   a running job). A daily cap (`jobs.subs.translate_per_day`, default 40, per local day,
+//!   manual and automatic together) keeps the Gemini free tier (500/day) safe.
+//! - Automatic candidates: wanted items that already have a `subs_search` attempt, episodes
+//!   in the search order (next unwatched first), movies unwatched and newest Radarr id first
+//!   (the one just downloaded is likely watched soon); when both are due, episode and movie
+//!   take turns ([`pick_kind`]).
 //! - The English source, best first ([`external_en`], [`pick_track`]): `<video>.en.srt` or
 //!   `.eng.srt` next to the video, as is; else the embedded English text track (ass, ssa,
 //!   subrip, mov_text; not Signs/Songs/Forced), extracted by ffmpeg to stdout and cleaned
@@ -25,10 +32,10 @@
 //! - Later ticks ([`judge`]): done and non-empty -> its `# Subtitles translated with ... #`
 //!   header cue is removed ([`strip_header`]), Bazarr rescans, Plex refreshes the folder, ntfy
 //!   (`jobs.subs.translate_notify`, default on). Failed or timed out -> the empty `.ro.srt` is
-//!   deleted (else Bazarr would count it as present) and the item waits 1 h, 6 h, then 24 h.
+//!   deleted (else Bazarr would count it as present); an automatic item waits 1 h, 6 h, then
+//!   24 h, a manual one is reported (page + ntfy) and left to the user.
 //! - Never overwrites a non-empty `.ro.srt`, never touches the video, writes only in its
-//!   folder. Dry-run: only logged, nothing written, no PATCH. `jobs.subs.translate: false`
-//!   turns it off.
+//!   folder. Dry-run: only logged, nothing written, no PATCH.
 
 use crate::app::AppState;
 use crate::jobs::common::{ffmpeg_bin, job_cfg, quiet_command, run_capture, Quiet};
@@ -541,12 +548,14 @@ pub struct InFlight {
     pub ro: String,
     pub started: f64,
     pub tries: u32,
+    /// Asked for by the user ([`crate::jobs::subs_manual`]): a failure is reported, no backoff.
+    pub manual: bool,
 }
 
 impl InFlight {
     fn to_json(&self) -> Value {
         json!({"key": self.key, "series_id": self.series_id, "episode_id": self.episode_id, "movie_id": self.movie_id,
-               "name": self.name, "en": self.en, "ro": self.ro, "started": self.started, "tries": self.tries})
+               "name": self.name, "en": self.en, "ro": self.ro, "started": self.started, "tries": self.tries, "manual": self.manual})
     }
 
     fn from_json(v: &Value) -> Option<InFlight> {
@@ -562,6 +571,7 @@ impl InFlight {
             ro: s("ro")?,
             started: v.get("started")?.as_f64()?,
             tries: i("tries") as u32,
+            manual: v.get("manual").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 
@@ -626,7 +636,7 @@ impl TrState {
         }
     }
 
-    fn note_started(&mut self, today: &str, movie: bool) {
+    pub fn note_started(&mut self, today: &str, movie: bool) {
         if self.day != today {
             self.day = today.to_string();
             self.count = 0;
@@ -643,7 +653,7 @@ impl TrState {
         self.items.len() != before
     }
 
-    fn mark(&mut self, key: &str, tries: u32, wait: f64, now: f64, why: &str) {
+    pub fn mark(&mut self, key: &str, tries: u32, wait: f64, now: f64, why: &str) {
         self.items.insert(key.to_string(), TrItem { tries, next: now + wait, why: why.to_string() });
     }
 
@@ -652,7 +662,7 @@ impl TrState {
         self.mark(key, tries, tr_backoff(tries), now, "failed");
     }
 
-    fn prev_tries(&self, key: &str) -> u32 {
+    pub fn prev_tries(&self, key: &str) -> u32 {
         self.items.get(key).map_or(0, |x| x.tries)
     }
 }
@@ -662,30 +672,41 @@ pub fn tr_backoff(tries: u32) -> f64 {
     TR_BACKOFF[(tries.max(1) as usize - 1).min(TR_BACKOFF.len() - 1)]
 }
 
-/// `jobs.subs.translate` (default on), `.translate_per_day` (default 40),
+/// `jobs.subs.auto_translate` (default off; `jobs.subs.translate` is read as its alias when
+/// it is missing), `.translate_per_day` (default 40, manual and automatic together),
 /// `.translate_notify` (default on), `.movie_section` (default the DV strip's Radarr
-/// library, else 1).
+/// library, else 1). Manual requests work whatever `auto_translate` says.
 #[derive(Debug, Clone)]
 pub struct TrSettings {
-    pub enabled: bool,
+    /// Pick candidates on its own (after a provider search).
+    pub auto: bool,
     pub per_day: u32,
     pub notify: bool,
     pub movie_section: u32,
 }
 
+/// `auto_translate`, else the old `translate`, else off (see [`TrSettings`]).
+pub fn auto_setting(auto_translate: Option<&Value>, translate: Option<&Value>) -> bool {
+    auto_translate.and_then(Value::as_bool).or_else(|| translate.and_then(Value::as_bool)).unwrap_or(false)
+}
+
 impl TrSettings {
     pub fn from_app(app: &AppState) -> TrSettings {
-        let b = |k: &str| job_cfg(app, "subs", k).and_then(|v| v.as_bool()).unwrap_or(true);
         let movie_section = job_cfg(app, "subs", "movie_section").and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or_else(|| {
             crate::jobs::strip_dv::DvConfig::from_app(app).libraries.iter().find(|l| l.arr == "radarr").map_or(1, |l| l.section)
         });
         TrSettings {
-            enabled: b("translate"),
+            auto: auto_setting(job_cfg(app, "subs", "auto_translate").as_ref(), job_cfg(app, "subs", "translate").as_ref()),
             per_day: job_cfg(app, "subs", "translate_per_day").and_then(|v| v.as_u64()).map_or(DEFAULT_PER_DAY, |n| n as u32),
-            notify: b("translate_notify"),
+            notify: job_cfg(app, "subs", "translate_notify").and_then(|v| v.as_bool()).unwrap_or(true),
             movie_section,
         }
     }
+}
+
+/// The local day `YYYY-MM-DD` (the daily cap counts per local day).
+pub fn local_today() -> String {
+    crate::log::asctime().get(..10).unwrap_or("").to_string()
 }
 
 // -- candidates --------------------------------------------------------------------------
@@ -717,10 +738,8 @@ pub fn pick_kind(ep: Option<Cand>, movie: Option<Cand>, last: &str) -> Option<Ca
 }
 
 /// Why no translation may start now, if so (in flight, the daily cap).
-pub fn local_gate(tr: &TrState, cfg: &TrSettings, today: &str) -> Result<(), &'static str> {
-    if !cfg.enabled {
-        Err("off")
-    } else if tr.inflight.is_some() {
+pub fn manual_gate(tr: &TrState, cfg: &TrSettings, today: &str) -> Result<(), &'static str> {
+    if tr.inflight.is_some() {
         Err("in flight")
     } else if tr.used_today(today) >= cfg.per_day {
         Err("daily cap")
@@ -729,15 +748,27 @@ pub fn local_gate(tr: &TrState, cfg: &TrSettings, today: &str) -> Result<(), &'s
     }
 }
 
+/// [`manual_gate`] for the automatic pick, which also needs `auto_translate`.
+pub fn local_gate(tr: &TrState, cfg: &TrSettings, today: &str) -> Result<(), &'static str> {
+    if !cfg.auto {
+        Err("off")
+    } else {
+        manual_gate(tr, cfg, today)
+    }
+}
+
 /// The Bazarr side of the gate: its translator is Gemini with a key, and it is not running
-/// a translation. Each failure is logged once.
+/// a translation. Each failure is logged once; the translator answer is remembered for the
+/// page ([`crate::jobs::subs_manual::Manual::note_translator`]).
 pub async fn bazarr_gate(app: &AppState, quiet: &mut Quiet) -> bool {
     let bz = &app.services.bazarr;
     match bz.get("/api/system/settings", LIST_TIMEOUT).await {
         Ok(v) if translator_ready(&v) => {
+            app.subs.note_translator(true);
             quiet.clear("tr-settings");
         }
         Ok(_) => {
+            app.subs.note_translator(false);
             quiet.warn("tr-settings", "subs: Bazarr's translator is not Gemini with an API key, no translations".into());
             return false;
         }
@@ -794,22 +825,37 @@ pub struct When<'a> {
     pub today: &'a str,
 }
 
-/// Start the translation of `c` (its video at `video`). Returns true: the state changed.
-pub async fn start(app: &AppState, tr: &mut TrState, quiet: &mut Quiet, tools: Option<Arc<dyn SubTools>>, c: &Cand, video: &str, when: When<'_>) -> bool {
-    let When { now, today } = when;
+/// What [`prepare`] came to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Prep {
+    /// Bazarr translates it now.
+    Started(InFlight),
+    /// Dry-run: only logged.
+    DryRun,
+    /// The video file is gone.
+    NoFile,
+    /// A non-empty `.ro.srt` is there already.
+    HasRo,
+    /// No English source; the reason for the page.
+    NoSource(&'static str),
+    /// Something failed on the way; the reason for the page.
+    Failed(&'static str),
+}
+
+/// Find the English source of `c` (its video at `video`), write it if it is embedded, and
+/// ask Bazarr to translate it (the steps in the module docs). The state is not touched: the
+/// automatic ([`start`]) and the manual caller each book the outcome their own way.
+pub async fn prepare(app: &AppState, quiet: &mut Quiet, tools: Option<Arc<dyn SubTools>>, c: &Cand, video: &str, now: f64, tries: u32) -> Prep {
     let name = ascii(&c.name());
     let video = PathBuf::from(video);
-    let prev = tr.prev_tries(&c.key);
     if !video.is_file() {
         log_info!("subs: the file of {name} is missing, not translated");
-        tr.mark(&c.key, prev, NO_SOURCE_WAIT, now, "no_file");
-        return true;
+        return Prep::NoFile;
     }
     let ro = sibling(&video, &format!("{}.srt", crate::jobs::subs::LANGUAGE));
     if non_empty(&ro) {
         log_info!("subs: {name} already has a RO subtitle file, not translated");
-        tr.mark(&c.key, prev, DONE_WAIT, now, "has_ro");
-        return true;
+        return Prep::HasRo;
     }
     // The English source: an external file, else the embedded track.
     let (en, text, from) = match external_en(&video) {
@@ -820,22 +866,19 @@ pub async fn start(app: &AppState, tr: &mut TrState, quiet: &mut Quiet, tools: O
         None => {
             let Some(tools) = tools else {
                 quiet.warn("tr-ffmpeg", "subs: ffmpeg is not installed, only external English subtitles are translated".into());
-                tr.mark(&c.key, prev, NO_SOURCE_WAIT, now, "no_source");
-                return true;
+                return Prep::NoSource("nu are .en.srt, iar ffmpeg nu e instalat");
             };
             let (t, v) = (tools.clone(), video.clone());
             let probe = match blocking(move || t.probe(&v)).await {
                 Ok(p) => p,
                 Err(e) => {
                     log_warning!("subs: ffprobe of {name} failed: {e}");
-                    tr.failed(&c.key, now);
-                    return true;
+                    return Prep::Failed("ffprobe a eșuat");
                 }
             };
             let Some((index, codec)) = pick_track(&probe) else {
-                log_info!("subs: {name} has no English text subtitle, not translated (again in 24 h)");
-                tr.mark(&c.key, prev, NO_SOURCE_WAIT, now, "no_source");
-                return true;
+                log_info!("subs: {name} has no English text subtitle, not translated");
+                return Prep::NoSource("nu are subtitrare în engleză");
             };
             let ass = codec == "ass" || codec == "ssa";
             let from = format!("the embedded {codec} track {index}");
@@ -847,14 +890,12 @@ pub async fn start(app: &AppState, tr: &mut TrState, quiet: &mut Quiet, tools: O
                     Ok(r) => r,
                     Err(e) => {
                         log_warning!("subs: extracting the English subtitle of {name} failed: {e}");
-                        tr.failed(&c.key, now);
-                        return true;
+                        return Prep::Failed("extragerea subtitrării în engleză a eșuat");
                     }
                 };
                 let Some(srt) = english_srt(&raw, ass) else {
-                    log_info!("subs: the English track of {name} has no dialogue, not translated (again in 24 h)");
-                    tr.mark(&c.key, prev, NO_SOURCE_WAIT, now, "no_source");
-                    return true;
+                    log_info!("subs: the English track of {name} has no dialogue, not translated");
+                    return Prep::NoSource("subtitrarea în engleză nu are dialog");
                 };
                 (sibling(&video, "en.srt"), Some(srt), from)
             }
@@ -862,32 +903,27 @@ pub async fn start(app: &AppState, tr: &mut TrState, quiet: &mut Quiet, tools: O
     };
     if app.dry_run {
         log_info!("subs (dry-run): would translate {name} to RO with Bazarr (Gemini) from {from}");
-        tr.mark(&c.key, prev + 1, tr_backoff(prev + 1), now, "dry_run");
-        tr.note_started(today, c.movie_id != 0);
-        return true;
+        return Prep::DryRun;
     }
     if let Some((srt, n)) = text {
         if let Err(e) = write_atomic(&en, srt.as_bytes()) {
             log_warning!("subs: cannot write the English subtitle of {name}: {}", crate::state::io_error_name(&e));
-            tr.failed(&c.key, now);
-            return true;
+            return Prep::Failed("nu pot scrie subtitrarea în engleză");
         }
         log_info!("subs: wrote an English subtitle for {name} ({n} lines) from {from}");
     }
     let bz = &app.services.bazarr;
     if let Err(e) = bz.patch(&c.scan_path(), SCAN_TIMEOUT).await {
         log_warning!("subs: Bazarr scan-disk for {name} failed: {e}");
-        tr.failed(&c.key, now);
-        return true;
+        return Prep::Failed("Bazarr nu a putut scana folderul");
     }
     let en_s = en.to_string_lossy().into_owned();
     if let Err(e) = bz.patch(&c.translate_path(&en_s), TRANSLATE_TIMEOUT).await {
         log_warning!("subs: Bazarr translate for {name} failed: {e}");
-        tr.failed(&c.key, now);
-        return true;
+        return Prep::Failed("Bazarr nu a pornit traducerea");
     }
     log_info!("subs: translating {name} to RO with Bazarr (Gemini) from {from}");
-    tr.inflight = Some(InFlight {
+    Prep::Started(InFlight {
         key: c.key.clone(),
         series_id: c.series_id,
         episode_id: c.episode_id,
@@ -896,9 +932,31 @@ pub async fn start(app: &AppState, tr: &mut TrState, quiet: &mut Quiet, tools: O
         en: en_s,
         ro: ro.to_string_lossy().into_owned(),
         started: now,
-        tries: prev,
-    });
-    tr.note_started(today, c.movie_id != 0);
+        tries,
+        manual: false,
+    })
+}
+
+/// Start the automatic translation of `c` (its video at `video`) and book the outcome: no
+/// file or no English source waits 24 h, a RO file there a day, a failure its backoff.
+/// Returns true: the state changed.
+pub async fn start(app: &AppState, tr: &mut TrState, quiet: &mut Quiet, tools: Option<Arc<dyn SubTools>>, c: &Cand, video: &str, when: When<'_>) -> bool {
+    let When { now, today } = when;
+    let prev = tr.prev_tries(&c.key);
+    match prepare(app, quiet, tools, c, video, now, prev).await {
+        Prep::NoFile => tr.mark(&c.key, prev, NO_SOURCE_WAIT, now, "no_file"),
+        Prep::HasRo => tr.mark(&c.key, prev, DONE_WAIT, now, "has_ro"),
+        Prep::NoSource(_) => tr.mark(&c.key, prev, NO_SOURCE_WAIT, now, "no_source"),
+        Prep::Failed(_) => tr.failed(&c.key, now),
+        Prep::DryRun => {
+            tr.mark(&c.key, prev + 1, tr_backoff(prev + 1), now, "dry_run");
+            tr.note_started(today, c.movie_id != 0);
+        }
+        Prep::Started(f) => {
+            tr.inflight = Some(f);
+            tr.note_started(today, c.movie_id != 0);
+        }
+    }
     true
 }
 
@@ -937,6 +995,9 @@ pub async fn poll(app: &AppState, tr: &mut TrState, cfg: &TrSettings, tv_section
                 app.notifier.send("Subtitrări RO", &msg, Some(vec!["speech_balloon".into()]), None, crate::services::ntfy::TIMEOUT).await;
             }
             tr.mark(&f.key, 0, DONE_WAIT, now, "done");
+            if f.manual {
+                app.subs.record(crate::jobs::subs_manual::Outcome::new(&f.key, &f.name, true, "tradusă", now));
+            }
         }
         Verdict::Failed(why) => {
             log_warning!("subs: the RO translation of {name} failed ({why})");
@@ -946,11 +1007,19 @@ pub async fn poll(app: &AppState, tr: &mut TrState, cfg: &TrSettings, tv_section
                     log_warning!("subs: Bazarr scan-disk for {name} failed: {e}");
                 }
             }
-            let tries = f.tries + 1;
-            tr.mark(&f.key, tries, tr_backoff(tries), now, "failed");
+            if f.manual {
+                // Reported; the user may ask again (no backoff).
+                crate::jobs::subs_manual::report_failure(app, cfg, &f.key, &f.name, why, now).await;
+            } else {
+                let tries = f.tries + 1;
+                tr.mark(&f.key, tries, tr_backoff(tries), now, "failed");
+            }
         }
     }
     tr.inflight = None;
+    // The series screens and movie sheets show the new state at once.
+    app.convert.invalidate_list();
+    app.services.bazarr.clear_cache();
     true
 }
 
@@ -1098,6 +1167,17 @@ mod tests {
     }
 
     #[test]
+    fn auto_translate_and_its_alias() {
+        let (t, f) = (json!(true), json!(false));
+        assert!(!auto_setting(None, None), "off by default");
+        assert!(!auto_setting(None, Some(&f)), "the live config: translate: false");
+        assert!(auto_setting(None, Some(&t)), "the old key still turns it on");
+        assert!(!auto_setting(Some(&f), Some(&t)), "auto_translate wins");
+        assert!(auto_setting(Some(&t), Some(&f)));
+        assert!(!auto_setting(Some(&json!("yes")), None), "not a bool: off");
+    }
+
+    #[test]
     fn translator_settings() {
         assert!(translator_ready(&json!({"translator": {"translator_type": "gemini", "gemini_keys": ["k"]}})));
         assert!(translator_ready(&json!({"data": {"translator": {"translator_type": "Gemini", "gemini_keys": "k"}}})));
@@ -1149,9 +1229,9 @@ mod tests {
         assert_eq!(keys(candidates(&ranked, &searched, &tr, 100.0, Some("ep:2"))), ["ep:3"]);
         assert_eq!(keys(candidates(&ranked, &searched, &tr, 600.0, None)), ["ep:3", "ep:1", "ep:2"]);
         // In flight: not a candidate, and nothing may start.
-        tr.inflight = Some(InFlight { key: "ep:3".into(), series_id: 1, episode_id: 3, movie_id: 0, name: "x".into(), en: "a".into(), ro: "b".into(), started: 0.0, tries: 0 });
+        tr.inflight = Some(InFlight { key: "ep:3".into(), series_id: 1, episode_id: 3, movie_id: 0, name: "x".into(), en: "a".into(), ro: "b".into(), started: 0.0, tries: 0, manual: false });
         assert_eq!(keys(candidates(&ranked, &searched, &tr, 600.0, None)), ["ep:1", "ep:2"]);
-        let cfg = TrSettings { enabled: true, per_day: 2, notify: true, movie_section: 1 };
+        let cfg = TrSettings { auto: true, per_day: 2, notify: true, movie_section: 1 };
         assert_eq!(local_gate(&tr, &cfg, "2026-10-28"), Err("in flight"));
         tr.inflight = None;
         assert_eq!(local_gate(&tr, &cfg, "2026-10-28"), Ok(()));
@@ -1160,7 +1240,11 @@ mod tests {
         tr.note_started("2026-10-28", true);
         assert_eq!(local_gate(&tr, &cfg, "2026-10-28"), Err("daily cap"));
         assert_eq!(local_gate(&tr, &cfg, "2026-10-29"), Ok(()));
-        assert_eq!(local_gate(&tr, &TrSettings { enabled: false, ..cfg.clone() }, "2026-10-29"), Err("off"));
+        let off = TrSettings { auto: false, ..cfg.clone() };
+        assert_eq!(local_gate(&tr, &off, "2026-10-29"), Err("off"));
+        // Manual requests do not need auto_translate, but the cap counts for them too.
+        assert_eq!(manual_gate(&tr, &off, "2026-10-29"), Ok(()));
+        assert_eq!(manual_gate(&tr, &off, "2026-10-28"), Err("daily cap"));
         // Episode and movie take turns.
         let (e, m) = (Some(cand("ep:1", 0)), Some(cand("movie:7", 7)));
         assert_eq!(pick_kind(e.clone(), m.clone(), "ep").unwrap().key, "movie:7");
@@ -1174,8 +1258,12 @@ mod tests {
         let views: HashMap<String, i64> = [(path_key("d:/m/9.mkv"), 1)].into_iter().collect();
         assert_eq!(keys(order_movie_cands(&ms, &paths, &views)), ["movie:5", "movie:3"]);
         // State round trip.
-        tr.inflight = Some(InFlight { key: "movie:5".into(), series_id: 0, episode_id: 0, movie_id: 5, name: "Film".into(), en: "a".into(), ro: "b".into(), started: 9.5, tries: 2 });
+        tr.inflight = Some(InFlight { key: "movie:5".into(), series_id: 0, episode_id: 0, movie_id: 5, name: "Film".into(), en: "a".into(), ro: "b".into(), started: 9.5, tries: 2, manual: true });
         assert_eq!(TrState::from_json(Some(&tr.to_json())), tr);
+        // An in-flight record from before `manual` existed is automatic.
+        let mut old = tr.to_json();
+        old["inflight"].as_object_mut().unwrap().remove("manual");
+        assert!(!TrState::from_json(Some(&old)).inflight.unwrap().manual);
         assert_eq!(tr_backoff(1), 3600.0);
         assert_eq!(tr_backoff(2), 21600.0);
         assert_eq!(tr_backoff(7), 86400.0);

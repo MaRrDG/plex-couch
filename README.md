@@ -144,11 +144,13 @@ still kept).
   phone's back button returns to the grid): its seasons as chips (the season of the next
   unwatched episode first, specials last) and one row per episode with ✓ when watched and two
   pills: the video ("Merge direct", "Trebuie convertit", "În coadă", "Se convertește 45%",
-  "Convertit") and the Romanian subtitle from Bazarr ("RO ✓", "fără RO", or "RO se traduce"
-  while a Bazarr translation job works on that episode's `.en.srt`). Tapping an episode opens a
-  sheet with the file name, size, codec, subtitle and watched state. Endpoints:
-  `GET /api/series` (cached 60 s, loaded in the background), `GET /api/series/<id>` (cached
-  20 s), `GET /api/movies/<id>` (the Filme sheet).
+  "Convertit") and the Romanian subtitle ("RO ✓", "fără RO", "RO în coadă #2", or "RO se
+  traduce" while a translation works on that episode). Tapping an episode opens a sheet with the
+  file name, size, codec, subtitle and watched state, and "Tradu în română" when it has no RO
+  (see the translation below). Endpoints: `GET /api/series` (cached 60 s, loaded in the
+  background), `GET /api/series/<id>` (cached 20 s; per episode `ro`: `ok` / `missing` /
+  `queued` with `ro_pos` / `translating`), `GET /api/movies/<id>` (the Filme sheet, the same
+  `ro`).
 - **Conversie pentru TV** (only when you press it): the Samsung TV's Plex app cannot
   direct-play 10-bit H.264 (Hi10P), so Plex transcodes and the TV buffers. Which files need it
   comes from Sonarr's / Radarr's media info (no scan of the library). On a series screen the
@@ -195,13 +197,32 @@ still kept).
   Watched episodes are left to Bazarr; movies get a turn when no episode is due. After each
   search the same episode waits 30 min, then 2 h, then 6 h (kept in `state.local.json` under
   `subs_search`, dropped once the subtitle is found).
-  - **Translation fallback** (anime: the Romanian providers have next to nothing): an episode or
-    movie still missing `ro` after at least one of these searches is translated from English by
-    Bazarr's own translator, only when Bazarr's translator is set to Gemini with an API key
-    (Google Translate is never used). One at a time, at most one started per run and none while
-    Bazarr runs any translation; episodes in the search order, movies unwatched and newest
-    first, taking turns when both are due; at most `jobs.subs.translate_per_day` (default 40,
-    the Gemini free tier allows 500) per local day. The English source: a `<video>.en.srt` /
+  - **Translation from English** (anime: the Romanian providers have next to nothing), by
+    Bazarr's own translator, only when it is set to Gemini with an API key (Google Translate is
+    never used). It runs **only for what you ask for**:
+    - In Seriale, an episode's sheet has "Tradu în română" (queued: "În coadă (#2) · Anulează",
+      then "Se traduce…"), and the series screen has "Tradu sezonul (N fără RO)" for the chosen
+      season (disabled with "Configurează Gemini în Bazarr" when the translator is not set). In
+      Filme, a movie's sheet has "Tradu în română" when it has no RO. The pills follow the queue
+      live; a toast says what was queued and, later, what came of it.
+    - The requests wait in a queue (first in, first out; kept in `state.local.json` under
+      `subs_translate.queue`) and go before everything else, without a provider search first;
+      the job is woken at once and looks every 15 s while something is queued or running. One
+      that already has a RO subtitle ends as "avea deja RO"; a failure is shown on the page and
+      sent by ntfy, and the item leaves the queue (ask again to retry).
+    - API: `POST /api/subs/translate` with `{seriesId, episodeIds: [...]}`,
+      `{seriesId, season, missingOnly: true}` or `{movieId}` (how many were queued), the same
+      bodies to `POST /api/subs/translate/cancel` (queued ones only, never the one running),
+      `GET /api/subs` (the one running, the queue, today's count and the cap, the translator).
+    - Automatic mode (`jobs.subs.auto_translate: true`, default off): also an episode or movie
+      still missing `ro` after at least one of these searches, episodes in the search order,
+      movies unwatched and newest first, taking turns when both are due; it waits while
+      anything is queued.
+
+    One at a time and none while Bazarr runs any translation; at most
+    `jobs.subs.translate_per_day` (default 40, manual and automatic together, the Gemini free
+    tier allows 500) per local day; once reached, "Limita zilnică de traduceri (40) atinsă,
+    reîncearcă mâine" and the queue waits for the next day. The English source: a `<video>.en.srt` /
     `.eng.srt` next to the video as is, else the embedded English text track (ASS/SSA/SRT, not
     Signs/Songs/Forced) extracted with ffmpeg and cleaned into `<video>.en.srt`: only the
     dialogue styles (OP/ED karaoke, signs, preview, titles, songs, credits dropped; if that
@@ -209,10 +230,10 @@ still kept).
     no override tags. Bazarr then rescans the folder and translates into `<video>.ro.srt`; when
     it is done its `# Subtitles translated with ... #` line is removed, Plex refreshes the folder
     and ntfy says "Subtitrare RO tradusă: ..." (`jobs.subs.translate_notify: false` to mute).
-    A failed or stuck (15 min) translation deletes Bazarr's empty `.ro.srt` and waits 1 h, 6 h,
-    then 24 h; no English source waits 24 h (state under `subs_translate`). An existing
-    non-empty `.ro.srt` is never overwritten and the video is never touched.
-    `jobs.subs.translate: false` turns it off; dry-run only logs.
+    A failed or stuck (15 min) translation deletes Bazarr's empty `.ro.srt`; in automatic mode
+    the item then waits 1 h, 6 h, then 24 h, and one with no English source 24 h (state under
+    `subs_translate`). An existing non-empty `.ro.srt` is never overwritten and the video is
+    never touched. Dry-run only logs.
 
 The seed keeper and the next-season check read "watched" from Plex library section 1 (movies)
 and section 2 (TV); these are fixed. The DV strip takes the section of each library from the
@@ -339,9 +360,9 @@ against the config file's folder; give the `jobs` paths in full. The app writes 
 | `jobs.strip_dv.tmp_dir` | Where remuxes are written before they replace the original. |
 | `jobs.strip_dv.log`, `.seen` | The job's own log file and its list of files already checked. |
 | `jobs.seed_keeper.downloads_root` | Only torrents under this folder can be deleted. |
-| `jobs.subs.translate` | Translate missing RO subtitles from English with Bazarr's Gemini translator (default `true`). |
-| `jobs.subs.translate_per_day` | Translations started per local day at most (default `40`). |
-| `jobs.subs.translate_notify` | ntfy when a translation is done (default `true`). |
+| `jobs.subs.auto_translate` | Also translate missing RO subtitles on its own, after a provider search (default `false`; manual requests from Seriale / Filme work either way). The old key `jobs.subs.translate` is read as its alias when `auto_translate` is missing. |
+| `jobs.subs.translate_per_day` | Translations started per local day at most, manual and automatic together (default `40`). |
+| `jobs.subs.translate_notify` | ntfy when a translation is done or a manual one fails (default `true`). |
 | `jobs.subs.movie_section` | Plex movies section refreshed after a movie translation (default: the DV strip's Radarr library, else `1`). |
 
 The `jobs` defaults are the paths of the original setup (`D:\Media\Movies`, `D:\Media\Seriale`,
