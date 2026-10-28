@@ -50,7 +50,9 @@
 //! ledger is the app's own file and is kept). Demo: fixed data, start/stop do nothing.
 
 use crate::app::AppState;
-use crate::jobs::common::{ffmpeg_bin, file_id, free_bytes, id_of, job_cfg, job_str, quiet_command, run_capture, run_lines, same_volume, unix_now};
+use crate::jobs::common::{
+    ffmpeg_bin, file_id, free_bytes, id_of, job_cfg, job_str, quiet_command, run_capture, run_lines, same_volume, unix_now, FileId,
+};
 use crate::jobs::seed_keeper::under_root;
 use crate::jobs::strip_dv::{duration, stamp, DvConfig, Ffmpeg};
 use crate::jobs::Stop;
@@ -77,6 +79,11 @@ pub const DEFAULT_COUNT: i64 = 2;
 pub const DEFAULT_TMP_DIR: &str = "D:\\Media\\Downloads\\.reencode";
 /// `<stem>.hevc.mkv` in the temp dir.
 pub const TMP_SUFFIX: &str = ".hevc.mkv";
+/// `<library file>.partial` (cross-volume install) and `<library file>.revert.tmp` (revert).
+pub const PARTIAL_SUFFIX: &str = ".partial";
+pub const REVERT_SUFFIX: &str = ".revert.tmp";
+/// `state.local.json` key: the files the job is creating right now (deleted after a crash).
+pub const LEFTOVERS_KEY: &str = "convert_leftovers";
 /// The converted file may be this much shorter or longer than the source.
 pub const DURATION_TOLERANCE: f64 = 1.0;
 /// Sonarr's `EpisodeHistoryEventType.DownloadFolderImported`.
@@ -283,6 +290,27 @@ pub fn tmp_path(tmp_dir: &Path, file: &Path) -> PathBuf {
     tmp_dir.join(format!("{stem}{TMP_SUFFIX}"))
 }
 
+/// The temp dir must be a full path that does not overlap a library root, a torrent's
+/// content (either way round) or equal a torrent's save path. `Err`: the message.
+pub fn check_tmp_dir(tmp: &Path, overlap: &[String], equal: &[String]) -> Result<(), String> {
+    let s = tmp.to_string_lossy().to_string();
+    if s.trim().is_empty() || !tmp.is_absolute() {
+        return Err("dosarul temporar (jobs.convert.tmp_dir) nu e o cale completă.".into());
+    }
+    let k = path_key(&s);
+    let inside = |a: &str, b: &str| a == b || a.starts_with(&format!("{b}\\"));
+    for p in overlap {
+        let pk = path_key(p);
+        if !pk.is_empty() && (inside(&k, &pk) || inside(&pk, &k)) {
+            return Err(format!("dosarul temporar {s} se suprapune cu {p}."));
+        }
+    }
+    if let Some(p) = equal.iter().find(|p| path_key(p) == k) {
+        return Err(format!("dosarul temporar {s} e dosarul unui torrent ({p})."));
+    }
+    Ok(())
+}
+
 /// Seconds encoded so far from one `-progress` line (`out_time_us=`, `out_time_ms=` which is
 /// also microseconds, or `out_time=HH:MM:SS.ffffff`). Anything else (`N/A` too) is None.
 pub fn parse_progress(line: &str) -> Option<f64> {
@@ -368,6 +396,9 @@ pub struct Entry {
     /// The torrent's hash, when known (a hint for the qBittorrent check).
     pub torrent: Option<String>,
     pub original_size: u64,
+    /// The torrent file's identity when converted (NTFS volume serial, file index): another
+    /// file put there later under the same name is never linked back.
+    pub original_id: Option<(u64, u64)>,
     pub converted_size: u64,
     pub converted_at: f64,
     pub series_id: i64,
@@ -382,6 +413,7 @@ impl Entry {
         json!({
             "library": self.library, "original": self.original, "torrent": self.torrent,
             "original_size": self.original_size, "converted_size": self.converted_size, "converted_at": self.converted_at,
+            "original_volume": self.original_id.map(|x| x.0), "original_index": self.original_id.map(|x| x.1),
             "series_id": self.series_id, "series": self.series, "episode_id": self.episode_id,
             "season": self.season, "episode": self.episode,
         })
@@ -396,6 +428,10 @@ impl Entry {
             original: s("original"),
             torrent: s("torrent"),
             original_size: u("original_size"),
+            original_id: match (v.get("original_volume").and_then(Value::as_u64), v.get("original_index").and_then(Value::as_u64)) {
+                (Some(a), Some(b)) => Some((a, b)),
+                _ => None,
+            },
             converted_size: u("converted_size"),
             converted_at: v.get("converted_at").and_then(Value::as_f64).unwrap_or(0.0),
             series_id: n("series_id"),
@@ -459,17 +495,21 @@ pub fn converted_keys(entries: &[Entry]) -> HashSet<String> {
 pub enum Original {
     /// None was recorded (the library file had no hardlinked download copy).
     NotRecorded,
-    /// Missing, or another size than recorded.
+    /// Missing (`NotFound`), or another size than recorded.
     Gone,
-    /// There with its size; `in_torrent`: still a file of a torrent in qBittorrent (`None`:
-    /// qBittorrent did not answer, or it was not asked).
+    /// Another file than the one converted from (NTFS file id differs, or none was recorded).
+    Replaced,
+    /// Could not be checked now (an error other than `NotFound`): try again next pass.
+    Unknown,
+    /// The same file with its size; `in_torrent`: still a file of a torrent in qBittorrent
+    /// (`None`: qBittorrent did not answer, or it was not asked).
     Present { in_torrent: Option<bool> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Facts {
-    /// The library file exists with the converted size.
-    pub library_ok: bool,
+    /// The library file exists with the converted size (`None`: could not be checked now).
+    pub library_ok: Option<bool>,
     /// Plex `viewCount > 0` (`None`: not in Plex).
     pub watched: Option<bool>,
     pub playing: bool,
@@ -485,8 +525,10 @@ pub enum Decision {
 }
 
 pub fn revert_decision(f: &Facts) -> Decision {
-    if !f.library_ok {
-        return Decision::Drop("the library file changed or is gone");
+    match f.library_ok {
+        Some(false) => return Decision::Drop("the library file changed or is gone"),
+        None => return Decision::Keep,
+        Some(true) => {}
     }
     if f.watched != Some(true) || f.playing {
         return Decision::Keep;
@@ -494,6 +536,8 @@ pub fn revert_decision(f: &Facts) -> Decision {
     match f.original {
         Original::NotRecorded => Decision::Drop("watched, no torrent file to go back to"),
         Original::Gone => Decision::Drop("watched, the torrent file is gone"),
+        Original::Replaced => Decision::Drop("watched, the torrent path holds another file now"),
+        Original::Unknown => Decision::Keep,
         Original::Present { in_torrent: Some(true) } => Decision::Revert,
         Original::Present { in_torrent: Some(false) } => Decision::Drop("watched, the file is no longer in a torrent"),
         Original::Present { in_torrent: None } => Decision::Keep,
@@ -512,8 +556,9 @@ pub fn episodes_ro(n: usize) -> String {
     }
 }
 
-/// The ntfy text when a batch ends: `(message, is an error)`.
-pub fn summary(title: &str, ok: usize, failed: usize, stopped: bool, dry_run: bool) -> (String, bool) {
+/// The ntfy text when a batch ends: `(message, is an error)`. `skipped`: passed over
+/// (playing, or refused as unsafe).
+pub fn summary(title: &str, ok: usize, failed: usize, skipped: usize, stopped: bool, dry_run: bool) -> (String, bool) {
     if dry_run {
         return (format!("Probă: s-ar fi convertit {} ({title})", episodes_ro(ok)), false);
     }
@@ -525,6 +570,9 @@ pub fn summary(title: &str, ok: usize, failed: usize, stopped: bool, dry_run: bo
         };
     }
     match (ok, failed) {
+        (0, 0) if skipped > 0 => {
+            (format!("Nicio conversie: {} {} ({title})", episodes_ro(skipped), if skipped == 1 { "sărit" } else { "sărite" }), true)
+        }
         (0, 0) => (format!("Nimic de convertit ({title})"), false),
         (0, f) => (format!("Conversie eșuată: {} ({title})", episodes_ro(f)), true),
         (o, 0) => (format!("Conversie gata: {} ({title})", episodes_ro(o)), false),
@@ -600,6 +648,17 @@ pub struct Control {
     pub wake: tokio::sync::Notify,
     list: Mutex<Option<ListCache>>,
     loading: AtomicBool,
+    unavailable: AtomicBool,
+}
+
+/// What [`Control::begin`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Begin {
+    Started,
+    /// A batch runs already.
+    Busy,
+    /// The job thread is not running.
+    Unavailable,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -624,11 +683,38 @@ impl Control {
         lock(&self.batch).as_ref().is_some_and(|b| b.running)
     }
 
-    /// Start a batch: false (refused) while one runs. Wakes the job thread.
-    pub fn begin(&self, r: Request, dry_run: bool) -> bool {
+    /// The job thread could not start: no batch can run.
+    pub fn set_unavailable(&self) {
+        self.unavailable.store(true, Ordering::SeqCst);
+    }
+
+    pub fn available(&self) -> bool {
+        !self.unavailable.load(Ordering::SeqCst)
+    }
+
+    /// End the running batch with `text` (an internal failure: no ntfy).
+    pub fn abort(&self, text: String) {
+        self.update(|b| {
+            if b.running {
+                b.running = false;
+                b.stopping = false;
+                b.current = None;
+                b.remaining = 0;
+                b.summary = Some(text);
+                b.finished_at = Some(unix_now());
+            }
+        });
+        self.invalidate_list();
+    }
+
+    /// Start a batch and wake the job thread; refused while one runs or without the thread.
+    pub fn begin(&self, r: Request, dry_run: bool) -> Begin {
+        if !self.available() {
+            return Begin::Unavailable;
+        }
         let mut b = lock(&self.batch);
         if b.as_ref().is_some_and(|b| b.running) {
-            return false;
+            return Begin::Busy;
         }
         *b = Some(Batch {
             series_id: r.series_id,
@@ -644,7 +730,7 @@ impl Control {
         *lock(&self.pending) = Some(r);
         drop(b);
         self.wake.notify_one();
-        true
+        Begin::Started
     }
 
     /// Ask the running batch to stop; false if none runs.
@@ -762,6 +848,7 @@ impl Settings {
 }
 
 const SONARR_DOWN: &str = "Sonarr nu răspunde.";
+const QBIT_DOWN: &str = "qBittorrent nu răspunde, nu pot verifica torrentele.";
 const PLEX_DOWN: &str = "Plex nu răspunde, nu știu ce episoade ai văzut.";
 
 fn ledger_error(t: &str) -> String {
@@ -881,6 +968,10 @@ pub async fn api_start(app: &Arc<AppState>, body: &Map<String, Value>) -> (u16, 
         return (200, json!({"ok": true, "demo": true, "job": null}));
     }
     let busy = || (409, json!({"error": "O conversie rulează deja. Oprește-o sau așteaptă să se termine."}));
+    let unavailable = || (503, json!({"error": "Conversia nu poate porni (lucrarea din fundal nu rulează, vezi jurnalul)."}));
+    if !app.convert.available() {
+        return unavailable();
+    }
     if app.convert.running() {
         return busy();
     }
@@ -894,8 +985,10 @@ pub async fn api_start(app: &Arc<AppState>, body: &Map<String, Value>) -> (u16, 
         return (409, json!({"error": "Nu e nimic de convertit la acest serial."}));
     }
     let count = (count as usize).min(cands.len());
-    if !app.convert.begin(Request { series_id, title, count }, app.dry_run) {
-        return busy();
+    match app.convert.begin(Request { series_id, title, count }, app.dry_run) {
+        Begin::Started => {}
+        Begin::Busy => return busy(),
+        Begin::Unavailable => return unavailable(),
     }
     app.convert.invalidate_list();
     (200, json!({"ok": true, "job": app.convert.status_json()}))
@@ -923,16 +1016,64 @@ pub enum Done {
     DryRun,
     /// ffprobe says it is no Hi10P (Sonarr's media info was stale): does not count.
     NotNeeded,
+    /// Refused as unsafe (the library path is itself a torrent file, or that cannot be
+    /// checked): does not count.
+    Skipped(String),
     Stopped,
     Failed(String),
 }
 
-/// A found original: the torrent file, its torrent's hash (when known), its size.
+/// A found original: the torrent file, its torrent's hash (when known), its size and id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Found {
     pub path: String,
     pub torrent: Option<String>,
     pub size: u64,
+    pub id: FileId,
+}
+
+/// `Ok(Some(x))`, `Ok(None)` for `NotFound`, `Err` for any other error.
+fn found<T>(r: std::io::Result<T>) -> Result<Option<T>, ()> {
+    match r {
+        Ok(x) => Ok(Some(x)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// The library file now: converted size? (`None`: could not be checked).
+pub fn library_state(path: &Path, converted_size: u64) -> Option<bool> {
+    match found(fs::metadata(path)) {
+        Ok(Some(m)) => Some(m.is_file() && m.len() == converted_size),
+        Ok(None) => Some(false),
+        Err(()) => None,
+    }
+}
+
+/// The recorded original now (see [`Original`]); `in_torrent` is filled in by the caller.
+pub fn original_state(e: &Entry) -> Original {
+    let Some(o) = e.original.as_deref() else { return Original::NotRecorded };
+    match found(fs::metadata(o)) {
+        Ok(Some(m)) if m.is_file() && m.len() == e.original_size => {}
+        Ok(_) => return Original::Gone,
+        Err(()) => return Original::Unknown,
+    }
+    let Some((vol, idx)) = e.original_id else { return Original::Replaced };
+    match found(file_id(Path::new(o))) {
+        Ok(Some(id)) if id.volume == vol && id.index == idx => Original::Present { in_torrent: None },
+        Ok(Some(_)) => Original::Replaced,
+        Ok(None) => Original::Gone,
+        Err(()) => Original::Unknown,
+    }
+}
+
+/// Why a revert did not happen.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RevertError {
+    /// The library or the torrent file is not what it was: forget the entry.
+    Changed(&'static str),
+    /// Try again next pass.
+    Failed(String),
 }
 
 pub struct Job<'a> {
@@ -970,20 +1111,89 @@ impl Job<'_> {
         self.rt.block_on(self.stop.clone().sleep(d)) || self.control().stop_requested()
     }
 
-    /// Delete leftover `*.hevc.mkv` in the temp dir (no batch runs at this point).
-    fn clean_tmp(&self) {
-        let Ok(rd) = fs::read_dir(&self.cfg.tmp_dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            if !e.file_name().to_string_lossy().to_lowercase().ends_with(TMP_SUFFIX) || !p.is_file() {
-                continue;
-            }
-            if self.app.dry_run {
-                log_info!("convert (dry-run): would delete the old temp file {}", p.display());
-            } else if fs::remove_file(&p).is_ok() {
-                log_info!("convert: deleted the old temp file {}", p.display());
+    /// The files the job is creating right now, from the state file.
+    fn leftovers(&self) -> Vec<String> {
+        let st = self.app.state_file.load();
+        st.get(LEFTOVERS_KEY).and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
+    }
+
+    fn set_leftovers(&self, v: Vec<String>) {
+        if self.app.dry_run {
+            return;
+        }
+        let mut m = Map::new();
+        m.insert(LEFTOVERS_KEY.into(), json!(v));
+        self.app.state_file.update(m);
+    }
+
+    /// Remember a file before creating it (a crash leaves it to [`Job::sweep`]).
+    fn note_leftover(&self, p: &Path) {
+        let s = p.to_string_lossy().to_string();
+        let mut v = self.leftovers();
+        if !v.contains(&s) {
+            v.push(s);
+            self.set_leftovers(v);
+        }
+    }
+
+    /// Delete `paths` if they are still there and forget them.
+    fn drop_leftovers(&self, paths: &[&Path]) {
+        if self.app.dry_run {
+            return;
+        }
+        for p in paths {
+            if p.is_file() {
+                let _ = fs::remove_file(p);
             }
         }
+        let keys: Vec<String> = paths.iter().map(|p| path_key(&p.to_string_lossy())).collect();
+        let v = self.leftovers();
+        let left: Vec<String> = v.iter().filter(|s| !keys.contains(&path_key(s))).cloned().collect();
+        if left.len() != v.len() {
+            self.set_leftovers(left);
+        }
+    }
+
+    /// Delete what an earlier run may have left: the files recorded as being created, and
+    /// `<file>.partial` / `<file>.revert.tmp` next to `libraries` (ledger and batch paths).
+    /// Only these exact names; nothing else is ever scanned or deleted.
+    pub fn sweep(&self, libraries: &[String]) {
+        let ours = |p: &str| {
+            let l = p.to_lowercase();
+            l.ends_with(TMP_SUFFIX) || l.ends_with(&format!(".mkv{PARTIAL_SUFFIX}")) || l.ends_with(&format!(".mkv{REVERT_SUFFIX}"))
+        };
+        let recorded = self.leftovers();
+        let mut paths: Vec<PathBuf> = recorded.iter().filter(|p| ours(p)).map(PathBuf::from).collect();
+        for l in libraries {
+            paths.push(partial_path(Path::new(l)));
+            paths.push(revert_tmp(Path::new(l)));
+        }
+        for p in paths.iter().filter(|p| p.is_file()) {
+            if self.app.dry_run {
+                log_info!("convert (dry-run): would delete the leftover {}", p.display());
+            } else if fs::remove_file(p).is_ok() {
+                log_info!("convert: deleted the leftover {}", p.display());
+            }
+        }
+        if !recorded.is_empty() {
+            self.set_leftovers(Vec::new());
+        }
+    }
+
+    /// The temp dir is safe to write into (see [`check_tmp_dir`]); also checks that Sonarr and
+    /// qBittorrent answer (both are needed to convert safely).
+    async fn check_tmp(&self) -> Result<(), String> {
+        let mut overlap = self.app.services.sonarr.arr().root_folders().await.map_err(|_| SONARR_DOWN.to_string())?;
+        match crate::services::arr_jobs::Arr::radarr(self.app.services.radarr.c.clone()).root_folders().await {
+            Ok(r) => overlap.extend(r),
+            Err(e) => log_info!("convert: Radarr root folders unknown ({}), not checked", e.type_name()),
+        }
+        let qbit = QbitJobs::new(self.app.services.qbittorrent.c.clone());
+        let torrents = qbit.torrents().await.map_err(|_| QBIT_DOWN.to_string())?;
+        let s = |t: &Value, k: &str| t.get(k).and_then(Value::as_str).map(String::from);
+        overlap.extend(torrents.iter().filter_map(|t| s(t, "content_path")));
+        let equal: Vec<String> = torrents.iter().filter_map(|t| s(t, "save_path")).collect();
+        check_tmp_dir(&self.cfg.tmp_dir, &overlap, &equal)
     }
 
     /// One batch, then the ntfy summary.
@@ -998,14 +1208,17 @@ impl Job<'_> {
         let Some(tools) = tools else {
             return fail("ffmpeg nu e instalat (winget Gyan.FFmpeg).".into());
         };
-        self.clean_tmp();
+        if let Err(m) = self.rt.block_on(self.check_tmp()) {
+            return fail(m);
+        }
         let cands = match self.rt.block_on(series_candidates(self.app, req.series_id)) {
             Ok((_, c)) => c,
             Err(Lookup::NotFound) => return fail("serialul nu mai există în Sonarr.".into()),
             Err(Lookup::Down(m)) => return fail(m),
         };
+        self.sweep(&cands.iter().map(|e| e.path.clone()).collect::<Vec<_>>());
         let mut queue: VecDeque<Episode> = cands.into_iter().collect();
-        let (mut attempts, mut ok, mut failed, mut stopped) = (0usize, 0usize, 0usize, false);
+        let (mut attempts, mut ok, mut failed, mut skipped_n, mut stopped) = (0usize, 0usize, 0usize, 0usize, false);
         while attempts < req.count {
             if self.stopped() {
                 stopped = true;
@@ -1016,6 +1229,7 @@ impl Job<'_> {
             for s in skipped {
                 log_info!("convert: {} {} is playing, taking the next one", ascii_log(&title), s.label());
                 self.control().update(|b| b.push(s.label(), "skipped", "se redă acum"));
+                skipped_n += 1;
             }
             let Some(ep) = next else { break };
             let left = (req.count - attempts - 1).min(queue.len());
@@ -1027,15 +1241,20 @@ impl Job<'_> {
                 Ok(src) => self.convert_one(&ep, &src, tools),
                 Err(e) => Done::Failed(format!("ffprobe: {e}")),
             };
+            let file = Path::new(&ep.path);
+            self.drop_leftovers(&[&tmp_path(&self.cfg.tmp_dir, file), &partial_path(file)]);
             let (result, note) = match &done {
                 Done::Converted => ("ok", String::new()),
                 Done::DryRun => ("dry", "probă: nimic schimbat".to_string()),
                 Done::NotNeeded => ("skipped", "nu mai e nevoie".to_string()),
+                Done::Skipped(why) => ("skipped", why.clone()),
                 Done::Stopped => ("stopped", "oprit".to_string()),
                 Done::Failed(e) => ("failed", e.clone()),
             };
-            if let Done::Failed(e) = &done {
-                log_warning!("convert: {} {} failed: {}", ascii_log(&title), ep.label(), ascii_log(e));
+            match &done {
+                Done::Failed(e) => log_warning!("convert: {} {} failed: {}", ascii_log(&title), ep.label(), ascii_log(e)),
+                Done::Skipped(e) => log_warning!("convert: {} {} refused: {}", ascii_log(&title), ep.label(), ascii_log(e)),
+                _ => {}
             }
             self.control().update(|b| {
                 b.current = None;
@@ -1051,6 +1270,7 @@ impl Job<'_> {
                     failed += 1;
                 }
                 Done::NotNeeded => {}
+                Done::Skipped(_) => skipped_n += 1,
                 Done::Stopped => {
                     stopped = true;
                     break;
@@ -1059,7 +1279,7 @@ impl Job<'_> {
             let left = (req.count.saturating_sub(attempts)).min(queue.len());
             self.control().update(|b| b.remaining = left);
         }
-        let (text, error) = summary(&title, ok, failed, stopped, self.app.dry_run);
+        let (text, error) = summary(&title, ok, failed, skipped_n, stopped, self.app.dry_run);
         log_info!("convert: batch done: {ok} converted, {failed} failed{}", if stopped { ", stopped" } else { "" });
         self.finish(text, error);
     }
@@ -1089,12 +1309,24 @@ impl Job<'_> {
             log_info!("convert: {} is no Hi10P any more, skipped", file.display());
             return Done::NotNeeded;
         }
+        // Renaming over the library path must never touch a torrent's own file.
+        let qbit = QbitJobs::new(self.app.services.qbittorrent.c.clone());
+        match self.rt.block_on(self.in_qbit(&qbit, &ep.path, None)) {
+            Ok(false) => {}
+            Ok(true) => return Done::Skipped("fișierul din bibliotecă e chiar fișierul torrentului".into()),
+            Err(e) => return Done::Skipped(format!("qBittorrent nu răspunde ({e}), nu pot verifica torrentul")),
+        }
         let size = fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-        if free_bytes(&self.cfg.tmp_dir).is_some_and(|free| (free as f64) < size as f64 * 1.1) {
+        let short = |p: &Path| free_bytes(p).is_some_and(|free| (free as f64) < size as f64 * 1.1);
+        if short(&self.cfg.tmp_dir) {
             return Done::Failed("spațiu insuficient pe disc".into());
         }
-        let original = self.find_original(file, ep);
         let tmp = tmp_path(&self.cfg.tmp_dir, file);
+        let cross = self.cfg.force_cross_volume || !same_volume(&tmp, file);
+        if cross && short(file) {
+            return Done::Failed("spațiu insuficient pe discul bibliotecii".into());
+        }
+        let original = self.find_original(file, ep);
         if self.app.dry_run {
             let o = original.as_ref().map(|f| f.path.clone()).unwrap_or_else(|| "none".into());
             log_info!("convert (dry-run): would convert {} -> {} (torrent file: {o})", file.display(), tmp.display());
@@ -1102,6 +1334,10 @@ impl Job<'_> {
         }
         if let Err(e) = fs::create_dir_all(&self.cfg.tmp_dir) {
             return Done::Failed(format!("dosarul temporar: {}", crate::state::io_error_name(&e)));
+        }
+        self.note_leftover(&tmp);
+        if cross {
+            self.note_leftover(&partial_path(file));
         }
         log_info!("convert: start {} ({:.1} GB)", file.display(), size as f64 / 1_073_741_824.0);
         let t0 = Instant::now();
@@ -1147,6 +1383,7 @@ impl Job<'_> {
             original: original.as_ref().map(|f| f.path.clone()),
             torrent: original.as_ref().and_then(|f| f.torrent.clone()),
             original_size: original.as_ref().map(|f| f.size).unwrap_or(size),
+            original_id: original.as_ref().map(|f| (f.id.volume, f.id.index)),
             converted_size,
             converted_at: unix_now(),
             series_id: ep.series_id,
@@ -1172,9 +1409,7 @@ impl Job<'_> {
     fn install(&self, tmp: &Path, file: &Path, before: &str, ep: &Episode) -> Result<(), Done> {
         let cross = self.cfg.force_cross_volume || !same_volume(tmp, file);
         let src = if cross {
-            let mut name = file.file_name().unwrap_or_default().to_os_string();
-            name.push(".partial");
-            let partial = file.with_file_name(name);
+            let partial = partial_path(file);
             let want = fs::metadata(tmp).map(|m| m.len()).ok();
             let copied = fs::copy(tmp, &partial).ok();
             if want.is_none() || copied != want || fs::metadata(&partial).map(|m| m.len()).ok() != want {
@@ -1248,7 +1483,7 @@ impl Job<'_> {
                     let Some(p) = r.get("data").and_then(|d| d.get("droppedPath")).and_then(Value::as_str) else { continue };
                     if same(p) {
                         let torrent = r.get("downloadId").and_then(Value::as_str).map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty());
-                        return Some(Found { path: p.to_string(), torrent, size });
+                        return Some(Found { path: p.to_string(), torrent, size, id });
                     }
                 }
             }
@@ -1266,7 +1501,7 @@ impl Job<'_> {
             for (name, sz) in files {
                 let full = format!("{}\\{}", save.trim_end_matches(['\\', '/']), name.replace('/', "\\"));
                 if sz == size && same(&full) {
-                    return Some(Found { path: full, torrent: Some(hash), size });
+                    return Some(Found { path: full, torrent: Some(hash), size, id });
                 }
             }
         }
@@ -1304,6 +1539,7 @@ impl Job<'_> {
                 return;
             }
         };
+        self.sweep(&entries.iter().map(|e| e.library.clone()).collect::<Vec<_>>());
         if entries.is_empty() {
             return;
         }
@@ -1320,21 +1556,18 @@ impl Job<'_> {
                 keep.push(e);
                 continue;
             }
-            let lib_size = fs::metadata(&e.library).ok().filter(|m| m.is_file()).map(|m| m.len());
+            let lib = Path::new(&e.library);
+            let library_ok = library_state(lib, e.converted_size);
+            let lib_stamp = stamp(lib).ok();
             let watched = views.get(&path_key(&e.library)).map(|n| *n > 0);
             let is_playing = playing.contains(&e.library, &e.series, e.season, e.episode);
-            let original = match &e.original {
-                None => Original::NotRecorded,
-                Some(o) => match fs::metadata(o) {
-                    Ok(m) if m.is_file() && m.len() == e.original_size => {
-                        let asked = watched == Some(true) && !is_playing;
-                        let in_torrent = if asked { self.rt.block_on(self.in_qbit(&qbit, o, e.torrent.as_deref())).ok() } else { None };
-                        Original::Present { in_torrent }
-                    }
-                    _ => Original::Gone,
-                },
-            };
-            let facts = Facts { library_ok: lib_size == Some(e.converted_size), watched, playing: is_playing, original };
+            let mut original = original_state(&e);
+            if let (Original::Present { .. }, Some(o)) = (&original, e.original.as_deref()) {
+                if watched == Some(true) && !is_playing {
+                    original = Original::Present { in_torrent: self.rt.block_on(self.in_qbit(&qbit, o, e.torrent.as_deref())).ok() };
+                }
+            }
+            let facts = Facts { library_ok, watched, playing: is_playing, original };
             match revert_decision(&facts) {
                 Decision::Keep => keep.push(e),
                 Decision::Drop(why) => {
@@ -1345,17 +1578,31 @@ impl Job<'_> {
                     log_info!("convert (dry-run): would put the torrent file back in place of {}", e.library);
                     keep.push(e);
                 }
-                Decision::Revert => match revert_file(Path::new(&e.library), Path::new(e.original.as_deref().unwrap_or(""))) {
-                    Ok(()) => {
-                        log_info!("convert: watched, {} is the torrent file again", e.library);
-                        self.update_apps(e.series_id, Path::new(&e.library));
-                        changed = true;
-                    }
-                    Err(why) => {
-                        log_warning!("convert: cannot put the torrent file back for {}: {why}", e.library);
+                Decision::Revert => {
+                    let (Some(o), Some(id), Some(st)) = (e.original.as_deref(), e.original_id, lib_stamp) else {
                         keep.push(e);
+                        continue;
+                    };
+                    let tmp = revert_tmp(lib);
+                    self.note_leftover(&tmp);
+                    let r = revert_file(lib, Path::new(o), id, &st);
+                    self.drop_leftovers(&[&tmp]);
+                    match r {
+                        Ok(()) => {
+                            log_info!("convert: watched, {} is the torrent file again", e.library);
+                            self.update_apps(e.series_id, lib);
+                            changed = true;
+                        }
+                        Err(RevertError::Changed(why)) => {
+                            log_info!("convert: forgetting {} ({why}), the converted file stays", e.library);
+                            changed = true;
+                        }
+                        Err(RevertError::Failed(why)) => {
+                            log_warning!("convert: cannot put the torrent file back for {}: {why}", e.library);
+                            keep.push(e);
+                        }
                     }
-                },
+                }
             }
         }
         if changed {
@@ -1382,25 +1629,49 @@ impl Job<'_> {
     }
 }
 
+/// `<file>.revert.tmp` next to the library file.
+pub fn revert_tmp(library: &Path) -> PathBuf {
+    with_suffix(library, REVERT_SUFFIX)
+}
+
+/// `<file>.partial` next to the library file (cross-volume install).
+pub fn partial_path(library: &Path) -> PathBuf {
+    with_suffix(library, PARTIAL_SUFFIX)
+}
+
+fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
+    let mut name = p.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    p.with_file_name(name)
+}
+
 /// Make `library` a hard link to `original` again: a new link next to it, then one rename
-/// over the converted file. `Err` says why not (the converted file stays).
-pub fn revert_file(library: &Path, original: &Path) -> Result<(), String> {
-    let mut name = library.file_name().unwrap_or_default().to_os_string();
-    name.push(".revert.tmp");
-    let tmp = library.with_file_name(name);
+/// over the converted file. Only while `original` is still the file `original_id` and
+/// `library` still has the stamp `library_stamp` (checked right before the rename).
+pub fn revert_file(library: &Path, original: &Path, original_id: (u64, u64), library_stamp: &str) -> Result<(), RevertError> {
+    match file_id(original) {
+        Ok(id) if (id.volume, id.index) == original_id => {}
+        Ok(_) => return Err(RevertError::Changed("the torrent path holds another file now")),
+        Err(e) => return Err(RevertError::Failed(format!("torrent file: {}", crate::state::io_error_name(&e)))),
+    }
+    let tmp = revert_tmp(library);
     let _ = fs::remove_file(&tmp);
-    fs::hard_link(original, &tmp).map_err(|e| format!("hard link: {}", crate::state::io_error_name(&e)))?;
+    fs::hard_link(original, &tmp).map_err(|e| RevertError::Failed(format!("hard link: {}", crate::state::io_error_name(&e))))?;
     let same = match (file_id(&tmp), file_id(original)) {
-        (Ok(a), Ok(b)) => a.same_file(&b),
+        (Ok(a), Ok(b)) => a.same_file(&b) && (b.volume, b.index) == original_id,
         _ => false,
     };
     if !same {
         let _ = fs::remove_file(&tmp);
-        return Err("the new link is not the torrent file".into());
+        return Err(RevertError::Failed("the new link is not the torrent file".into()));
+    }
+    if stamp(library).ok().as_deref() != Some(library_stamp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(RevertError::Changed("the library file changed"));
     }
     if let Err(e) = fs::rename(&tmp, library) {
         let _ = fs::remove_file(&tmp);
-        return Err(format!("rename: {} (playing?)", crate::state::io_error_name(&e)));
+        return Err(RevertError::Failed(format!("rename: {} (playing?)", crate::state::io_error_name(&e))));
     }
     Ok(())
 }
@@ -1408,7 +1679,19 @@ pub fn revert_file(library: &Path, original: &Path) -> Result<(), String> {
 /// Start the job on its own thread: batches on request, the revert pass every 5 minutes.
 pub fn spawn(app: Arc<AppState>, stop: Stop) {
     let rt = Handle::current();
+    let a2 = app.clone();
     let r = std::thread::Builder::new().name("convert".into()).spawn(move || {
+        let guarded = |what: &str, f: &dyn Fn()| {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+                log_warning!("convert: {what} failed (panic)");
+            }
+        };
+        // Whatever a crash left behind (temp files of a batch, a half-made revert link).
+        guarded("cleanup", &|| {
+            let job = Job { app: &app, rt: rt.clone(), cfg: Settings::from_app(&app), stop: &stop };
+            let libs: Vec<String> = load_ledger(&ledger_path(&app)).unwrap_or_default().into_iter().map(|e| e.library).collect();
+            job.sweep(&libs);
+        });
         let mut s = stop.clone();
         let mut next_revert = Instant::now() + FIRST_RUN;
         loop {
@@ -1422,28 +1705,27 @@ pub fn spawn(app: Arc<AppState>, stop: Stop) {
             if stopping || stop.is_stopped() {
                 return;
             }
-            let job = Job { app: &app, rt: rt.clone(), cfg: Settings::from_app(&app), stop: &stop };
             if let Some(req) = app.convert.take_request() {
-                let tools = ffmpeg_bin(&job.cfg.ffmpeg_bin, &job.cfg.ffmpeg_packages).map(|bin| Ffmpeg { bin });
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run_batch(&req, tools.as_ref().map(|t| t as &dyn Tools))));
-                if r.is_err() {
-                    log_warning!("convert: batch failed (panic)");
-                    if app.convert.running() {
-                        job.finish(format!("Conversie eșuată ({}): eroare internă.", req.title), true);
-                    }
+                guarded("batch", &|| {
+                    let job = Job { app: &app, rt: rt.clone(), cfg: Settings::from_app(&app), stop: &stop };
+                    let tools = ffmpeg_bin(&job.cfg.ffmpeg_bin, &job.cfg.ffmpeg_packages).map(|bin| Ffmpeg { bin });
+                    job.run_batch(&req, tools.as_ref().map(|t| t as &dyn Tools));
+                });
+                // A panic anywhere above (settings, ffmpeg lookup, the batch) must not leave
+                // the batch "running" forever.
+                if app.convert.running() {
+                    app.convert.abort(format!("Conversie eșuată ({}): eroare internă, vezi jurnalul.", req.title));
                 }
             }
             if Instant::now() >= next_revert {
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.revert_pass()));
-                if r.is_err() {
-                    log_warning!("convert: revert pass failed (panic)");
-                }
+                guarded("revert pass", &|| Job { app: &app, rt: rt.clone(), cfg: Settings::from_app(&app), stop: &stop }.revert_pass());
                 next_revert = Instant::now() + INTERVAL;
             }
         }
     });
     if r.is_err() {
-        log_warning!("convert: cannot start its thread");
+        log_warning!("convert: cannot start its thread, conversions are off");
+        a2.convert.set_unavailable();
     }
 }
 
@@ -1597,6 +1879,7 @@ mod tests {
             original: orig.map(String::from),
             torrent: Some("abc".into()),
             original_size: 10,
+            original_id: Some((7, 42)),
             converted_size: 7,
             converted_at: 1_793_017_815.5,
             series_id: 4,
@@ -1633,16 +1916,93 @@ mod tests {
     #[test]
     fn revert_decisions() {
         let present = |t: Option<bool>| Original::Present { in_torrent: t };
-        let f = |library_ok, watched, playing, original| Facts { library_ok, watched, playing, original };
+        let f = |ok: bool, watched, playing, original| Facts { library_ok: Some(ok), watched, playing, original };
         assert_eq!(revert_decision(&f(true, Some(true), false, present(Some(true)))), Decision::Revert);
         assert!(matches!(revert_decision(&f(true, Some(true), false, Original::Gone)), Decision::Drop(_)));
         assert!(matches!(revert_decision(&f(true, Some(true), false, Original::NotRecorded)), Decision::Drop(_)));
+        assert!(matches!(revert_decision(&f(true, Some(true), false, Original::Replaced)), Decision::Drop(_)));
         assert!(matches!(revert_decision(&f(true, Some(true), false, present(Some(false)))), Decision::Drop(_)));
         assert_eq!(revert_decision(&f(true, Some(true), false, present(None))), Decision::Keep);
+        assert_eq!(revert_decision(&f(true, Some(true), false, Original::Unknown)), Decision::Keep);
         assert_eq!(revert_decision(&f(true, Some(false), false, present(Some(true)))), Decision::Keep);
         assert_eq!(revert_decision(&f(true, None, false, Original::Gone)), Decision::Keep);
         assert_eq!(revert_decision(&f(true, Some(true), true, present(Some(true)))), Decision::Keep);
         assert!(matches!(revert_decision(&f(false, Some(false), false, present(Some(true)))), Decision::Drop(_)));
+        // The library file could not be checked (not NotFound): kept for the next pass.
+        let unknown = Facts { library_ok: None, watched: Some(true), playing: false, original: present(Some(true)) };
+        assert_eq!(revert_decision(&unknown), Decision::Keep);
+    }
+
+    #[test]
+    fn file_states() {
+        let d = temp_dir("conv-states");
+        let lib = d.join("lib.mkv");
+        let orig = d.join("orig.mkv");
+        fs::write(&lib, b"encoded").unwrap();
+        fs::write(&orig, b"original-1").unwrap();
+        assert_eq!(library_state(&lib, 7), Some(true));
+        assert_eq!(library_state(&lib, 8), Some(false));
+        assert_eq!(library_state(&d.join("none.mkv"), 7), Some(false));
+        let id = file_id(&orig).unwrap();
+        let mut e = entry(&lib.display().to_string(), Some(&orig.display().to_string()));
+        e.original_id = Some((id.volume, id.index));
+        assert_eq!(original_state(&e), Original::Present { in_torrent: None });
+        e.original_size = 9;
+        assert_eq!(original_state(&e), Original::Gone);
+        e.original_size = 10;
+        // No recorded id (an entry from before ids were kept): never linked back.
+        let old = Entry { original_id: None, ..e.clone() };
+        assert_eq!(original_state(&old), Original::Replaced);
+        // Another file of the same size under the same name.
+        fs::remove_file(&orig).unwrap();
+        fs::write(&orig, b"original-1").unwrap();
+        assert_eq!(original_state(&e), Original::Replaced);
+        fs::remove_file(&orig).unwrap();
+        assert_eq!(original_state(&e), Original::Gone);
+        assert_eq!(original_state(&entry("x", None)), Original::NotRecorded);
+    }
+
+    #[test]
+    fn revert_file_checks_both_files_right_before_the_rename() {
+        let d = temp_dir("conv-revert");
+        let lib = d.join("lib.mkv");
+        let orig = d.join("orig.mkv");
+        fs::write(&lib, b"encoded").unwrap();
+        fs::write(&orig, b"original").unwrap();
+        let id = file_id(&orig).unwrap();
+        let st = stamp(&lib).unwrap();
+        // The torrent path holds another file now.
+        assert!(matches!(revert_file(&lib, &orig, (id.volume, id.index + 1), &st), Err(RevertError::Changed(_))));
+        // The library file changed since it was checked.
+        assert!(matches!(revert_file(&lib, &orig, (id.volume, id.index), "D:\\x|1|2"), Err(RevertError::Changed(_))));
+        assert_eq!(fs::read(&lib).unwrap(), b"encoded");
+        assert!(!revert_tmp(&lib).exists());
+        assert_eq!(revert_file(&lib, &orig, (id.volume, id.index), &st), Ok(()));
+        assert!(file_id(&lib).unwrap().same_file(&id));
+        assert!(!revert_tmp(&lib).exists());
+    }
+
+    #[test]
+    fn tmp_dir_rules() {
+        let roots = vec!["D:\\Media\\Seriale".to_string(), "D:\\Media\\Downloads\\sonarr\\Show.S01".to_string()];
+        let saves = vec!["D:\\Media\\Downloads\\sonarr".to_string()];
+        assert_eq!(check_tmp_dir(Path::new("D:\\Media\\Downloads\\.reencode"), &roots, &saves), Ok(()));
+        for bad in ["", "relative\\tmp", "D:\\Media\\Seriale", "d:\\media\\seriale\\tmp", "D:\\Media", "D:\\Media\\Downloads\\sonarr",
+                    "D:\\Media\\Downloads\\sonarr\\Show.S01\\x"] {
+            assert!(check_tmp_dir(Path::new(bad), &roots, &saves).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn control_abort_and_unavailable() {
+        let c = Control::new();
+        assert_eq!(c.begin(req(2), false), Begin::Started);
+        assert_eq!(c.begin(req(2), false), Begin::Busy);
+        c.abort("Conversie eșuată (Show): eroare internă.".into());
+        let b = c.batch().unwrap();
+        assert!(!b.running && b.summary.as_deref() == Some("Conversie eșuată (Show): eroare internă."));
+        c.set_unavailable();
+        assert_eq!(c.begin(req(2), false), Begin::Unavailable);
     }
 
     #[test]
@@ -1650,12 +2010,14 @@ mod tests {
         assert_eq!(episodes_ro(1), "1 episod");
         assert_eq!(episodes_ro(3), "3 episoade");
         assert_eq!(episodes_ro(20), "20 de episoade");
-        assert_eq!(summary("Demon Slayer", 3, 0, false, false), ("Conversie gata: 3 episoade (Demon Slayer)".into(), false));
-        assert_eq!(summary("X", 2, 1, false, false), ("Conversie gata: 2 episoade, 1 eșuat (X)".into(), true));
-        assert_eq!(summary("X", 0, 2, false, false), ("Conversie eșuată: 2 episoade (X)".into(), true));
-        assert_eq!(summary("X", 1, 0, true, false), ("Conversie oprită după 1 episod (X)".into(), false));
-        assert_eq!(summary("X", 0, 0, true, false).0, "Conversie oprită (X)");
-        assert!(summary("X", 2, 0, false, true).0.starts_with("Probă"));
+        assert_eq!(summary("Demon Slayer", 3, 0, 0, false, false), ("Conversie gata: 3 episoade (Demon Slayer)".into(), false));
+        assert_eq!(summary("X", 2, 1, 0, false, false), ("Conversie gata: 2 episoade, 1 eșuat (X)".into(), true));
+        assert_eq!(summary("X", 0, 2, 0, false, false), ("Conversie eșuată: 2 episoade (X)".into(), true));
+        assert_eq!(summary("X", 1, 0, 0, true, false), ("Conversie oprită după 1 episod (X)".into(), false));
+        assert_eq!(summary("X", 0, 0, 0, true, false).0, "Conversie oprită (X)");
+        assert_eq!(summary("X", 0, 0, 2, false, false), ("Nicio conversie: 2 episoade sărite (X)".into(), true));
+        assert_eq!(summary("X", 0, 0, 0, false, false).0, "Nimic de convertit (X)");
+        assert!(summary("X", 2, 0, 0, false, true).0.starts_with("Probă"));
     }
 
     // -- the job against fake services and a fake ffmpeg ----------------------------------
@@ -1709,6 +2071,8 @@ mod tests {
         downloads: PathBuf,
         views: StdMutex<Vec<(String, i64)>>,
         sessions: StdMutex<Value>,
+        qbit_up: StdMutex<bool>,
+        lib_is_torrent: StdMutex<bool>,
     }
 
     impl World {
@@ -1729,7 +2093,15 @@ mod tests {
                     fs::hard_link(&t, &l).unwrap();
                 }
             }
-            Arc::new(World { root, lib, downloads, views: StdMutex::new(vec![]), sessions: StdMutex::new(json!({"MediaContainer": {"size": 0}})) })
+            Arc::new(World {
+                root,
+                lib,
+                downloads,
+                views: StdMutex::new(vec![]),
+                sessions: StdMutex::new(json!({"MediaContainer": {"size": 0}})),
+                qbit_up: StdMutex::new(true),
+                lib_is_torrent: StdMutex::new(false),
+            })
         }
 
         fn lib_file(&self, n: i64) -> PathBuf {
@@ -1790,8 +2162,24 @@ mod tests {
             if p.starts_with("/library/sections/2/refresh") {
                 return ok(json!({}));
             }
+            if p.starts_with("/api/v2/") && !*w.qbit_up.lock().unwrap() {
+                return status(500);
+            }
+            if p == "/api/v3/rootfolder" {
+                return ok(json!([{"path": w.root.join("Seriale").display().to_string()}]));
+            }
             if p == "/api/v2/torrents/info" {
-                return ok(json!([{"hash": HASH, "progress": 1.0, "save_path": w.downloads.join("sonarr").display().to_string()}]));
+                let mut t = vec![json!({"hash": HASH, "progress": 1.0, "save_path": w.downloads.join("sonarr").display().to_string(),
+                                        "content_path": w.downloads.join("sonarr").join("Show.S01").display().to_string()})];
+                if *w.lib_is_torrent.lock().unwrap() {
+                    // A torrent saved straight into the library season folder.
+                    t.push(json!({"hash": "libtorrent", "progress": 1.0, "save_path": w.lib.display().to_string(),
+                                  "content_path": w.lib_file(1).display().to_string()}));
+                }
+                return ok(json!(t));
+            }
+            if p.starts_with("/api/v2/torrents/files?hash=libtorrent") {
+                return ok(json!([{"name": "Show - S01E01.mkv", "size": 10}]));
             }
             if p.starts_with("/api/v2/torrents/files") {
                 return ok(json!((1..=4).map(|n| json!({"name": format!("Show.S01/Show.S01E0{n}.mkv"), "size": 10})).collect::<Vec<_>>()));
@@ -1866,7 +2254,7 @@ mod tests {
 
     /// `begin` + `take_request`, as the route and the job thread do.
     fn begun(r: &Rig, count: usize) -> Request {
-        assert!(r.a.convert.begin(req(count), r.a.dry_run));
+        assert_eq!(r.a.convert.begin(req(count), r.a.dry_run), Begin::Started);
         r.a.convert.take_request().unwrap()
     }
 
@@ -1959,6 +2347,92 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_file_under_the_torrent_name_is_never_linked_back() {
+        let r = rig(false).await;
+        run(&r, req(1), Arc::new(tools(0))).await;
+        assert_eq!(ledger(&r)[0].original_id.map(|x| x.0), Some(file_id(&r.w.torrent_file(1)).unwrap().volume));
+        // The torrent was re-downloaded: same name and size, another file.
+        fs::remove_file(r.w.torrent_file(1)).unwrap();
+        fs::write(r.w.torrent_file(1), b"original-1").unwrap();
+        r.w.watch(1);
+        revert(&r).await;
+        assert!(ledger(&r).is_empty());
+        assert_eq!(fs::read(r.w.lib_file(1)).unwrap(), b"encoded");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_library_file_that_is_a_torrent_file_is_refused() {
+        let r = rig(false).await;
+        *r.w.lib_is_torrent.lock().unwrap() = true;
+        let rq = begun(&r, 1);
+        let t = Arc::new(tools(0));
+        run(&r, rq, t.clone()).await;
+        // E1 is refused (not counted), E2 is converted instead.
+        assert_eq!(fs::read(r.w.lib_file(1)).unwrap(), b"original-1");
+        assert_eq!(fs::read(r.w.lib_file(2)).unwrap(), b"encoded");
+        let b = r.a.convert.batch().unwrap();
+        assert_eq!(b.items.iter().map(|i| (i.label.as_str(), i.result)).collect::<Vec<_>>(), [("S01E01", "skipped"), ("S01E02", "ok")]);
+        assert!(b.items[0].note.contains("torrent"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn qbittorrent_down_converts_nothing() {
+        let r = rig(false).await;
+        *r.w.qbit_up.lock().unwrap() = false;
+        let rq = begun(&r, 2);
+        let t = Arc::new(tools(0));
+        run(&r, rq, t.clone()).await;
+        assert!(t.calls.lock().unwrap().is_empty());
+        let b = r.a.convert.batch().unwrap();
+        assert!(!b.running);
+        assert_eq!(b.summary.as_deref(), Some(format!("Conversie eșuată (Show): {QBIT_DOWN}").as_str()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bad_tmp_dir_converts_nothing() {
+        let w = World::new();
+        let f = serve(w.clone()).await;
+        let extra = json!({"jobs": {"convert": {"tmp_dir": w.root.join("Seriale").join("tmp").display().to_string()}}});
+        let (a, _d) = app(&f.base, false, extra);
+        let r = Rig { f, a, w };
+        let rq = begun(&r, 2);
+        let t = Arc::new(tools(0));
+        run(&r, rq, t.clone()).await;
+        assert!(t.calls.lock().unwrap().is_empty());
+        assert!(r.a.convert.batch().unwrap().summary.unwrap().contains("se suprapune"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leftovers_are_swept_only_by_their_exact_names() {
+        let r = rig(false).await;
+        run(&r, req(1), Arc::new(tools(0))).await;
+        let a = r.a.clone();
+        // What a crash would leave: a half-made revert link next to a ledger file, a recorded
+        // temp file; plus files the job never makes, which must stay.
+        let revert_left = revert_tmp(&r.w.lib_file(1));
+        let tmp_left = r.w.root.join("tmp").join("Show - S01E03.hevc.mkv");
+        let foreign = [r.w.lib.join("other.partial"), r.w.root.join("tmp").join("keep.hevc.mkv"), partial_path(&r.w.lib_file(4))];
+        fs::create_dir_all(r.w.root.join("tmp")).unwrap();
+        for p in [&revert_left, &tmp_left].into_iter().chain(foreign.iter()) {
+            fs::write(p, b"x").unwrap();
+        }
+        let mut m = Map::new();
+        m.insert(LEFTOVERS_KEY.into(), json!([tmp_left.display().to_string(), "C:\\Windows\\win.ini"]));
+        a.state_file.update(m);
+        let rt = Handle::current();
+        let libs: Vec<String> = ledger(&r).into_iter().map(|e| e.library).collect();
+        tokio::task::spawn_blocking(move || {
+            let (_h, stop) = crate::jobs::stop_pair();
+            Job { app: &a, rt, cfg: settings(&a), stop: &stop }.sweep(&libs);
+        })
+        .await
+        .unwrap();
+        assert!(!revert_left.exists() && !tmp_left.exists());
+        assert!(foreign.iter().all(|p| p.exists()), "nothing else is touched");
+        assert!(r.a.state_file.load()[LEFTOVERS_KEY].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn playing_episode_is_passed_over() {
         let r = rig(false).await;
         r.w.play(json!({"MediaContainer": {"Metadata": [{"type": "episode", "Media": [{"Part": [{"file": r.w.lib_file(1).display().to_string()}]}]}]}}));
@@ -2023,7 +2497,7 @@ mod tests {
         assert_eq!(b.summary.as_deref(), Some("Conversie oprită după 1 episod (Show)"));
         assert!(!b.running);
         // A new batch may start after it.
-        assert!(r.a.convert.begin(req(1), false));
+        assert_eq!(r.a.convert.begin(req(1), false), Begin::Started);
     }
 
     #[tokio::test(flavor = "multi_thread")]

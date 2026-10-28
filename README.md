@@ -149,13 +149,20 @@ still kept).
   rescans the series and Plex refreshes the folder. The tab shows the episode, the percent, the
   queue and the results; "Oprește conversia" kills ffmpeg at once and deletes its temp file
   (the library file stays as it was). One batch at a time; ntfy says when it is done.
+  - Safety: nothing runs unless Sonarr and qBittorrent answer and the temp folder is a full
+    path that does not overlap a Sonarr/Radarr root folder or a torrent's files. An episode
+    whose library path is itself a file of a torrent (or when that cannot be checked) is skipped.
+    ffmpeg is tied to the app (a Windows Job Object), so it never outlives plex-couch. Only
+    the files the job itself creates are ever cleaned up after a crash (recorded in
+    `state.local.json`, plus `<file>.partial` / `<file>.revert.tmp` next to converted files).
   - **Back to the original after watching**: `convert-ledger.json` (next to the config) records
     each converted file and the torrent file it was hardlinked to (found through Sonarr's import
     history, else qBittorrent's file list, and checked to be the same NTFS file). Every 5
     minutes, once an episode is watched in Plex and not playing, and the torrent file is still
-    there with its size and still part of a torrent in qBittorrent, the library file becomes a
-    hard link to it again (Plex and Sonarr are refreshed). If the torrent is gone by then (the
-    seed keeper deleted it), the converted file simply stays.
+    there with its size, still the very same NTFS file (volume serial + file index recorded at
+    conversion) and still part of a torrent in qBittorrent, the library file becomes a hard
+    link to it again (Plex and Sonarr are refreshed). If the torrent is gone or replaced by then
+    (the seed keeper deleted it, or it was downloaded again), the converted file simply stays.
   - The seed keeper is not affected: for mapped torrents it decides by "watched", and for an
     unmapped torrent a converted episode just means its file has no library link (link count
     1), which is true: the library has its own copy.

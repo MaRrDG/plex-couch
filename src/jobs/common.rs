@@ -190,6 +190,9 @@ pub fn run_capture(cmd: Command, timeout: Duration, stop: &dyn Fn() -> bool) -> 
 pub fn run_lines(mut cmd: Command, timeout: Duration, stop: &dyn Fn() -> bool, on_line: &mut dyn FnMut(&str)) -> Result<(i32, Vec<u8>), String> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("cannot start: {e}"))?;
+    if !kill_with_app(&child) {
+        log_warning!("cannot tie a child process to the app (it may outlive an exit)");
+    }
     let so = child.stdout.take();
     let t_err = read_all(child.stderr.take());
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -231,6 +234,52 @@ pub fn run_lines(mut cmd: Command, timeout: Duration, stop: &dyn Fn() -> bool, o
         on_line(&l);
     }
     Ok((code, t_err.join().unwrap_or_default()))
+}
+
+/// The app's Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`): its only handle closes when
+/// the app exits, however it exits, and Windows then kills every process in it.
+#[cfg(windows)]
+fn app_job() -> Option<usize> {
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    static JOB: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *JOB.get_or_init(|| {
+        // SAFETY: plain Win32 calls; the struct is zeroed and then filled; the handle is
+        // kept for the life of the process on purpose (never closed).
+        unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            (ok != 0).then_some(h as usize)
+        }
+    })
+}
+
+/// Put `child` in the app's Job Object, so it dies with the app (ffmpeg must never keep
+/// running, or keep a temp file open, after plex-couch exits). False if that failed.
+#[cfg(windows)]
+pub fn kill_with_app(child: &std::process::Child) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+    let Some(job) = app_job() else { return false };
+    // SAFETY: the job handle lives for the whole process, the child handle while `child` does.
+    unsafe { AssignProcessToJobObject(job as windows_sys::Win32::Foundation::HANDLE, child.as_raw_handle()) != 0 }
+}
+
+#[cfg(not(windows))]
+pub fn kill_with_app(_child: &std::process::Child) -> bool {
+    true
 }
 
 /// Same drive / UNC share (a rename cannot cross volumes).
@@ -314,6 +363,29 @@ mod tests {
         assert_eq!(parse_iso_utc("2026-10-26"), Some(1_792_972_800));
         assert_eq!(parse_iso_utc("nope"), None);
         assert_eq!(parse_iso_utc(""), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn children_join_the_kill_on_close_job() {
+        let mut c = quiet_command(Path::new("cmd.exe"));
+        c.args(["/c", "exit", "0"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = c.spawn().unwrap();
+        let r = kill_with_app(&child);
+        let _ = child.wait();
+        assert!(r, "AssignProcessToJobObject");
+        let (code, out) = run_lines(
+            {
+                let mut c = quiet_command(Path::new("cmd.exe"));
+                c.args(["/c", "echo", "out_time_us=5"]);
+                c
+            },
+            Duration::from_secs(20),
+            &|| false,
+            &mut |_l: &str| {},
+        )
+        .unwrap();
+        assert_eq!((code, out.is_empty()), (0, true));
     }
 
     #[test]
