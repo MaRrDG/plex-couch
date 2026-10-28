@@ -308,6 +308,59 @@ fn series_routes() {
 }
 
 #[test]
+fn subs_routes() {
+    let srv = closed_services_server(false);
+    let ep = json!({"seriesId": 4, "episodeIds": [11]});
+    // login and CSRF like every other route
+    assert_eq!(srv.req("GET", "/api/subs").send().status, 401);
+    for path in ["/api/subs/translate", "/api/subs/translate/cancel"] {
+        assert_eq!(srv.req("POST", path).json(ep.clone()).send().status, 401, "{path}");
+    }
+    let tok = srv.app.new_session(None);
+    for path in ["/api/subs/translate", "/api/subs/translate/cancel"] {
+        let r = srv.req("POST", path).cookie(&tok).no_csrf().json(ep.clone()).send();
+        assert_eq!((r.status, r.json()), (403, json!({"error": "Cerere respinsă (CSRF)."})), "{path}");
+    }
+    // validation before any upstream call
+    for body in [json!({}), json!({"seriesId": 4}), json!({"seriesId": 4, "episodeIds": []}), json!({"seriesId": 4, "episodeIds": [1, 1]}),
+                 json!({"seriesId": 4, "season": 1}), json!({"seriesId": 4, "season": 1, "missingOnly": false}), json!({"movieId": "7"}),
+                 json!({"movieId": 7, "seriesId": 4}), json!({"seriesId": 4, "season": 1, "missingOnly": true, "episodeIds": [3]})] {
+        for path in ["/api/subs/translate", "/api/subs/translate/cancel"] {
+            let r = srv.req("POST", path).cookie(&tok).json(body.clone()).send();
+            assert_eq!((r.status, r.json()), (400, json!({"error": "Cerere invalidă."})), "{path} {body}");
+        }
+    }
+    // Bazarr down: a message, never a crash; nothing queued
+    let r = srv.req("POST", "/api/subs/translate").cookie(&tok).json(ep.clone()).send();
+    assert_eq!((r.status, r.json()), (502, json!({"error": "Bazarr nu răspunde."})));
+    let r = srv.req("POST", "/api/subs/translate/cancel").cookie(&tok).json(ep).send();
+    assert_eq!((r.status, r.json()["removed"].clone()), (200, json!(0)));
+    let v = srv.req("GET", "/api/subs").cookie(&tok).send().json();
+    assert_eq!((v["translator"].clone(), v["queue_len"].clone(), v["per_day"].clone(), v["auto"].clone()), (Value::Null, json!(0), json!(40), json!(false)));
+    assert!(!srv.app.subs.has_queue());
+}
+
+#[test]
+fn subs_in_demo() {
+    let demo = closed_services_server(true);
+    let v = demo.req("GET", "/api/subs").send().json();
+    assert_eq!((v["demo"].clone(), v["translator"].clone(), v["queue_len"].clone()), (json!(true), json!(true), json!(2)));
+    let d = demo.req("GET", "/api/series/1").send().json();
+    let s1 = &d["seasons"][0]["episodes"];
+    assert_eq!((s1[5]["ro"].clone(), s1[6]["ro"].clone(), s1[7]["ro_pos"].clone()), (json!("translating"), json!("queued"), json!(2)));
+    assert_eq!(d["subs"]["queue_len"], json!(2));
+    let r = demo.req("POST", "/api/subs/translate").json(json!({"seriesId": 1, "season": 1, "missingOnly": true})).send();
+    assert_eq!((r.status, r.json()["queued"].clone()), (200, json!(4)));
+    let r = demo.req("POST", "/api/subs/translate/cancel").json(json!({"seriesId": 1, "episodeIds": [10107]})).send();
+    assert_eq!((r.status, r.json()["removed"].clone()), (200, json!(1)));
+    let m = demo.req("GET", "/api/movies/4").send().json();
+    assert_eq!((m["ro"].clone(), m["subs"]["translator"].clone()), (json!("missing"), json!(true)));
+    let r = demo.req("POST", "/api/subs/translate").json(json!({"movieId": 4})).send();
+    assert_eq!((r.status, r.json()["message"].clone()), (200, json!("Filmul e în coadă pentru traducere.")));
+    assert_eq!(demo.req("GET", "/api/movies/4").send().json()["ro"], json!("queued"));
+}
+
+#[test]
 fn convert_in_demo() {
     let demo = closed_services_server(true);
     let v = demo.req("GET", "/api/convert").send().json();

@@ -397,6 +397,11 @@ a { color: inherit; }
   border: 0;
 }
 
+/* ---------- Traduceri RO: the season action, the queued line in a sheet ---------- */
+.tr-season { display: grid; gap: var(--space-2); }
+.tr-line { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); min-height: var(--size-tap); }
+.tr-line .btn-text { margin: 0; }
+
 /* ---------- Seriale: the sticky action bar above the tab bar ---------- */
 .actionbar {
   position: fixed;

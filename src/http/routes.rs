@@ -165,6 +165,9 @@ async fn app_get(r: &Req, ctx: &ConnCtx, rc: &mut ReqCtx) -> Response<Body> {
         if path == "/api/series" {
             return json(rc, 200, &crate::logic::series::api_list(app).await, &[]);
         }
+        if path == "/api/subs" {
+            return json(rc, 200, &crate::jobs::subs_manual::api_status(app).await, &[]);
+        }
         if let Some(id) = path_id(path, "/api/series/") {
             let (code, out) = crate::logic::series::api_detail(app, id).await;
             return json(rc, code, &out, &[]);
@@ -343,6 +346,19 @@ async fn app_post(r: &mut Req, ctx: &ConnCtx, rc: &mut ReqCtx) -> Option<Respons
         "/api/convert/stop" => {
             log_info!("action convert/stop from {ip}");
             let (code, out) = crate::jobs::convert::api_stop(app);
+            json(rc, code, &out, &[])
+        }
+        "/api/subs/translate" | "/api/subs/translate/cancel" => {
+            let num = |k: &str| body.get(k).and_then(Value::as_i64).unwrap_or(0);
+            let ids = body.get("episodeIds").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+            let season = body.get("season").and_then(Value::as_i64).map_or("-".to_string(), |n| n.to_string());
+            let what = if path.ends_with("/cancel") { "subs/translate/cancel" } else { "subs/translate" };
+            log_info!("action {what} series {} episodes {ids} season {season} movie {} from {ip}", num("seriesId"), num("movieId"));
+            let (code, out) = if path.ends_with("/cancel") {
+                crate::jobs::subs_manual::api_cancel(app, &body).await
+            } else {
+                crate::jobs::subs_manual::api_translate(app, &body).await
+            };
             json(rc, code, &out, &[])
         }
         "/api/settings" => {
