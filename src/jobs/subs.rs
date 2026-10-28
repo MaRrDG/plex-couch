@@ -17,7 +17,9 @@
 //!
 //! Backoff per episode/movie after each search: 30 min, then 2 h, then every 6 h
 //! ([`backoff_seconds`]), kept in `state.local.json` under `subs_search`. An entry is dropped
-//! once Bazarr no longer lists it as wanted (the subtitle was found, or the file is gone).
+//! once Bazarr no longer lists it as wanted (the subtitle was found, or the file is gone);
+//! never by an empty or partial list ([`complete_list`]). Specials (season 0) never set
+//! "where you are" and come last.
 //! Bazarr or Plex down: logged once, nothing searched (Plex down: the order is plain episode
 //! order). Dry-run: the search is only logged and the backoff stays in memory.
 
@@ -168,13 +170,17 @@ pub fn order(series: &[SeriesEps], wanted: &HashSet<String>, views: &HashMap<Str
         eps.sort_by_key(|(season, number, id, _)| (*season == 0, *season, *number, *id));
         let view = |p: &str| if p.is_empty() { (0, 0) } else { views.get(p).copied().unwrap_or((0, 0)) };
         let last_seen = eps.iter().map(|e| view(&e.3).1).max().unwrap_or(0);
-        let last_watched = eps.iter().rposition(|e| view(&e.3).0 > 0);
+        // Specials (season 0) never set where you are; they come after everything else.
+        let last_watched = eps.iter().rposition(|e| e.0 != 0 && view(&e.3).0 > 0);
         let todo: Vec<(usize, &Ep)> =
             eps.iter().enumerate().filter(|(_, e)| wanted.contains(&episode_key(e.2)) && view(&e.3).0 == 0).collect();
-        // After the last watched episode first (where you are), then the ones skipped before it.
-        let after = todo.iter().filter(|(i, _)| last_watched.is_none_or(|w| *i > w));
-        let before = todo.iter().filter(|(i, _)| last_watched.is_some_and(|w| *i < w));
-        for (pos, (_, e)) in after.chain(before).enumerate() {
+        // After the last watched episode first (where you are), then the ones skipped before
+        // it, then the specials.
+        let regular = |e: &&(usize, &Ep)| e.1 .0 != 0;
+        let after = todo.iter().filter(regular).filter(|(i, _)| last_watched.is_none_or(|w| *i > w));
+        let before = todo.iter().filter(regular).filter(|(i, _)| last_watched.is_some_and(|w| *i < w));
+        let specials = todo.iter().filter(|e| e.1 .0 == 0);
+        for (pos, (_, e)) in after.chain(before).chain(specials).enumerate() {
             let c = Cand { key: episode_key(e.2), series_id: s.id, episode_id: e.2, movie_id: 0, title: s.title.clone(), season: e.0, episode: e.1 };
             ranked.push((pos, last_seen, c));
         }
@@ -196,6 +202,19 @@ pub fn order_movies(wanted: &[Value]) -> Vec<Cand> {
         .collect();
     out.sort_by_key(|c| std::cmp::Reverse(c.movie_id));
     out
+}
+
+/// A wanted list to prune the backoff by: not empty (an empty answer may be Bazarr still
+/// starting up) and as long as the `total` Bazarr reports.
+pub fn complete_list(len: usize, total: Option<u64>) -> bool {
+    len > 0 && total.is_none_or(|t| t as usize <= len)
+}
+
+/// Drop the `prefix` entries `still` says no longer apply; true if any went.
+pub fn prune(a: &mut HashMap<String, Attempt>, prefix: &str, still: impl Fn(&str) -> bool) -> bool {
+    let before = a.len();
+    a.retain(|k, _| !k.starts_with(prefix) || still(k));
+    a.len() != before
 }
 
 /// The job's memory between ticks.
@@ -229,7 +248,7 @@ pub async fn tick(app: &AppState, s: &mut Subs, now: f64) -> Option<String> {
         }
     }
     let bz = &app.services.bazarr;
-    let wanted = match bz.data("/api/episodes/wanted?start=0&length=-1", LIST_TIMEOUT).await {
+    let (wanted, total) = match bz.data_total("/api/episodes/wanted?start=0&length=-1", LIST_TIMEOUT).await {
         Ok(w) => {
             if s.quiet.clear("bazarr") {
                 log_info!("subs: Bazarr answers again");
@@ -241,11 +260,10 @@ pub async fn tick(app: &AppState, s: &mut Subs, now: f64) -> Option<String> {
             return None;
         }
     };
+    let complete = complete_list(wanted.len(), total);
     let wanted: Vec<&Value> = wanted.iter().filter(|w| missing_ro(w)).collect();
     let keys: HashSet<String> = wanted.iter().filter_map(|w| id_of(w.get("sonarrEpisodeId"))).map(episode_key).collect();
-    let before = s.attempts.len();
-    s.attempts.retain(|k, _| !k.starts_with("ep:") || keys.contains(k));
-    let mut changed = s.attempts.len() != before;
+    let mut changed = complete && prune(&mut s.attempts, "ep:", |k| keys.contains(k));
 
     // The series that have an episode to search now, with the wanted records as a fallback.
     let open: HashSet<i64> = wanted
@@ -287,13 +305,13 @@ pub async fn tick(app: &AppState, s: &mut Subs, now: f64) -> Option<String> {
         chosen = order(&series, &keys, &views).into_iter().find(|c| eligible(&s.attempts, &c.key, now));
     }
     if chosen.is_none() {
-        match bz.data("/api/movies/wanted?start=0&length=-1", LIST_TIMEOUT).await {
-            Ok(m) => {
+        match bz.data_total("/api/movies/wanted?start=0&length=-1", LIST_TIMEOUT).await {
+            Ok((m, total)) => {
                 let movies = order_movies(&m);
                 let mkeys: HashSet<&str> = movies.iter().map(|c| c.key.as_str()).collect();
-                let before = s.attempts.len();
-                s.attempts.retain(|k, _| !k.starts_with("movie:") || mkeys.contains(k.as_str()));
-                changed |= s.attempts.len() != before;
+                if complete_list(m.len(), total) {
+                    changed |= prune(&mut s.attempts, "movie:", |k| mkeys.contains(k));
+                }
                 chosen = movies.into_iter().find(|c| eligible(&s.attempts, &c.key, now));
             }
             Err(e) => s.quiet.warn("bazarr-movies", format!("subs: Bazarr wanted movies failed ({e})")),
@@ -417,6 +435,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn specials_never_set_the_cursor() {
+        // A watched special must not push S01E03/E04 behind as "skipped before it".
+        let a = SeriesEps { id: 1, title: "A".into(), episodes: vec![
+            e(11, 1, 1, "D:\\A\\1.mkv"), e(12, 1, 2, "D:\\A\\2.mkv"), e(13, 1, 3, "D:\\A\\3.mkv"), e(10, 0, 1, "D:\\A\\0.mkv"), e(9, 0, 2, "D:\\A\\00.mkv")] };
+        let mut views = HashMap::new();
+        views.insert(path_key("D:\\A\\1.mkv"), (1, 100));
+        views.insert(path_key("D:\\A\\0.mkv"), (1, 200));
+        let wanted: HashSet<String> = [12, 13, 9].into_iter().map(episode_key).collect();
+        let got: Vec<String> = order(&[a], &wanted, &views).iter().map(Cand::name).collect();
+        assert_eq!(got, ["A S01E02", "A S01E03", "A S00E02"]);
+    }
+
+    #[test]
+    fn only_complete_lists_prune() {
+        assert!(complete_list(3, Some(3)) && complete_list(3, None));
+        assert!(!complete_list(0, Some(0)) && !complete_list(0, None), "empty: maybe Bazarr is starting");
+        assert!(!complete_list(2, Some(5)), "partial");
+        let mut a: HashMap<String, Attempt> =
+            [("ep:1", 1), ("ep:2", 1), ("movie:3", 1)].into_iter().map(|(k, t)| (k.to_string(), Attempt { tries: t, next: 0.0 })).collect();
+        assert!(prune(&mut a, "ep:", |k| k == "ep:2"));
+        assert!(!a.contains_key("ep:1") && a.contains_key("ep:2") && a.contains_key("movie:3"));
+        assert!(!prune(&mut a, "ep:", |_| true));
+    }
+
     struct World {
         wanted: Mutex<Vec<i64>>,
         movies: Mutex<Value>,
@@ -505,6 +548,11 @@ mod tests {
         assert!(patches(&f).is_empty(), "dry-run: no search");
         assert!(a.state_file.load().get(STATE_KEY).is_none(), "dry-run: backoff in memory only");
         assert_eq!(tick(&a, &mut s, 1100.0).await.as_deref(), Some("ep:103"));
+        // An empty wanted list (Bazarr starting up) prunes nothing either.
+        let saved = std::mem::take(&mut *w.wanted.lock().unwrap());
+        assert_eq!(tick(&a, &mut s, 1150.0).await, None);
+        assert_eq!(s.attempts.len(), 2, "an empty list prunes nothing");
+        *w.wanted.lock().unwrap() = saved;
         *w.bazarr_up.lock().unwrap() = false;
         assert_eq!(tick(&a, &mut s, 1200.0).await, None);
         assert_eq!(s.attempts.len(), 2, "a failed fetch prunes nothing");

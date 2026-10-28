@@ -50,13 +50,21 @@ impl Bazarr {
     /// Job call: `GET {bazarr.url}<path_and_query>` -> `.data` (uncached). A body without a
     /// `data` array is an error (never "nothing wanted").
     pub async fn data(&self, path_and_query: &str, timeout: Duration) -> UpResult<Vec<Value>> {
+        Ok(self.data_total(path_and_query, timeout).await?.0)
+    }
+
+    /// [`Bazarr::data`] with the `total` Bazarr reports (if any), to spot a partial list.
+    pub async fn data_total(&self, path_and_query: &str, timeout: Duration) -> UpResult<(Vec<Value>, Option<u64>)> {
         let key = self.key();
         let url = self.c.url("bazarr", path_and_query);
         match self.c.http.get_json(&url, &[("X-API-KEY", key.as_str())], timeout).await? {
-            Some(Value::Object(mut m)) => match m.remove("data") {
-                Some(Value::Array(a)) => Ok(a),
-                _ => Err(UpstreamError::Body),
-            },
+            Some(Value::Object(mut m)) => {
+                let total = m.get("total").and_then(Value::as_u64);
+                match m.remove("data") {
+                    Some(Value::Array(a)) => Ok((a, total)),
+                    _ => Err(UpstreamError::Body),
+                }
+            }
             _ => Err(UpstreamError::Body),
         }
     }
