@@ -21,9 +21,12 @@
 //! (a session's file path, or show + season + episode; a movie by path or title) is passed
 //! over for the next one. Per
 //! episode: ffprobe (still Hi10P? else it is skipped), find the torrent file the library file is
-//! hardlinked to (below), ffmpeg with exactly [`ffmpeg_args`] (below-normal priority, no
-//! window) into the temp dir, verify the result (HEVC, duration within 1 s, as many audio and
-//! subtitle streams), then one rename over the library file while it still has the stamp it had
+//! hardlinked to (below), ffmpeg in two passes (below-normal priority, no window): the encode
+//! with exactly [`ffmpeg_args`] into `<stem>.hevc.enc.mkv`, then a stream-copy remux with
+//! [`remux_args`] (`hevc_metadata`: BT.709 in the HEVC VUI; `hevc_amf` gives that filter no
+//! extradata in one pass) into `<stem>.hevc.mkv`, both in the temp dir (the encode is deleted
+//! after the remux). Verify the result (HEVC, BT.709 primaries and transfer, duration within
+//! 1 s, as many audio and subtitle streams), then one rename over the library file while it still has the stamp it had
 //! before (across volumes via `<file>.partial`; retried every 30 s for 10 min while locked or
 //! playing; on failure the temp file is deleted and the library file stays). Then the ledger
 //! entry, a Plex refresh of the folder and Sonarr `RescanSeries` (Radarr `RescanMovie` for a
@@ -32,7 +35,7 @@
 //! when the batch ends (also after errors). A failed episode counts towards the count, so a
 //! broken encoder never runs through the whole series.
 //!
-//! **Stop** (`POST /api/convert/stop`) kills ffmpeg at once and deletes its temp file; the
+//! **Stop** (`POST /api/convert/stop`) kills ffmpeg (either pass) at once and deletes its temp files; the
 //! library file is untouched and the batch ends.
 //!
 //! ## Finding the torrent file (before converting)
@@ -88,6 +91,12 @@ pub const DEFAULT_COUNT: i64 = 2;
 pub const DEFAULT_TMP_DIR: &str = "D:\\Media\\Downloads\\.reencode";
 /// `<stem>.hevc.mkv` in the temp dir.
 pub const TMP_SUFFIX: &str = ".hevc.mkv";
+/// `<stem>.hevc.enc.mkv` in the temp dir: the encode before the remux that writes the BT.709
+/// VUI ([`remux_args`]).
+pub const ENC_SUFFIX: &str = ".hevc.enc.mkv";
+/// The progress bar: the encode is 0..=97 %, the remux shows [`REMUX_PERCENT`].
+const ENCODE_SHARE: f64 = 97.0;
+const REMUX_PERCENT: f64 = 99.0;
 /// `<library file>.partial` (cross-volume install) and `<library file>.revert.tmp` (revert).
 pub const PARTIAL_SUFFIX: &str = ".partial";
 pub const REVERT_SUFFIX: &str = ".revert.tmp";
@@ -311,30 +320,54 @@ pub fn pick(cands: &[Episode], playing: &dyn Fn(&Episode) -> bool, count: usize)
 
 // -- ffmpeg ------------------------------------------------------------------------------
 
-/// The hand-tested command (HEVC Main10 on the AMD encoder, BT.709 tags written into the
-/// stream too: the sources say "unknown" and the TV then shows wrong colours; everything
-/// else copied), plus `-progress pipe:1 -nostats` for the progress bar.
-pub fn ffmpeg_args(input: &Path, out: &Path) -> Vec<String> {
+/// The BT.709 VUI the TV needs: the sources say "unknown" and `hevc_amf` writes BT.2020/PQ
+/// into the bitstream, so the TV shows wrong colours.
+const HEVC_METADATA: &str = "hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1:video_full_range_flag=0";
+const BT709_TAGS: [&str; 8] = ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv"];
+
+/// Pass 1, the hand-tested encode (HEVC Main10 on the AMD encoder, BT.709 container tags,
+/// everything else copied) into `<stem>.hevc.enc.mkv`, plus `-progress pipe:1 -nostats` for
+/// the progress bar. No `-bsf:v` here: `hevc_amf` has no extradata when the filter starts
+/// ("Failed to read extradata"), so the VUI is fixed in pass 2 ([`remux_args`]).
+pub fn ffmpeg_args(input: &Path, enc: &Path) -> Vec<String> {
     let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-y", "-progress", "pipe:1", "-nostats", "-i"].map(String::from).to_vec();
     a.push(input.to_string_lossy().into_owned());
     a.extend(
         [
             "-map", "0", "-c", "copy", "-c:v", "hevc_amf", "-profile:v", "main10", "-pix_fmt", "p010le", "-quality", "quality",
-            "-rc", "cqp", "-qp_i", "19", "-qp_p", "21", "-qp_b", "23", "-color_primaries", "bt709", "-color_trc", "bt709",
-            "-colorspace", "bt709", "-color_range", "tv", "-bsf:v",
-            "hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1:video_full_range_flag=0",
-            "-tag:v", "hvc1",
+            "-rc", "cqp", "-qp_i", "19", "-qp_p", "21", "-qp_b", "23",
         ]
         .map(String::from),
     );
+    a.extend(BT709_TAGS.map(String::from));
+    a.extend(["-tag:v", "hvc1"].map(String::from));
+    a.push(enc.to_string_lossy().into_owned());
+    a
+}
+
+/// Pass 2, a stream-copy remux of the encode that writes BT.709 into the HEVC VUI
+/// (`hevc_metadata`) and the container tags (seconds, no progress).
+pub fn remux_args(enc: &Path, out: &Path) -> Vec<String> {
+    let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-y", "-i"].map(String::from).to_vec();
+    a.push(enc.to_string_lossy().into_owned());
+    a.extend(["-map", "0", "-c", "copy", "-bsf:v", HEVC_METADATA].map(String::from));
+    a.extend(BT709_TAGS.map(String::from));
     a.push(out.to_string_lossy().into_owned());
     a
 }
 
-/// `<stem>.hevc.mkv` in the temp dir.
+fn stem(file: &Path) -> String {
+    file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// `<stem>.hevc.mkv` in the temp dir (the final, remuxed file).
 pub fn tmp_path(tmp_dir: &Path, file: &Path) -> PathBuf {
-    let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    tmp_dir.join(format!("{stem}{TMP_SUFFIX}"))
+    tmp_dir.join(format!("{}{TMP_SUFFIX}", stem(file)))
+}
+
+/// `<stem>.hevc.enc.mkv` in the temp dir (pass 1's output, deleted after the remux).
+pub fn enc_path(tmp_dir: &Path, file: &Path) -> PathBuf {
+    tmp_dir.join(format!("{}{ENC_SUFFIX}", stem(file)))
 }
 
 /// The temp dir must be a full path that does not overlap a library root, a torrent's
@@ -386,12 +419,19 @@ fn stream_count(probe: &Value, kind: &str) -> usize {
     probe.get("streams").and_then(Value::as_array).map(|a| a.iter().filter(|s| s.get("codec_type").and_then(Value::as_str) == Some(kind)).count()).unwrap_or(0)
 }
 
-/// The converted file is usable: HEVC video, the same length within 1 s, as many audio and
-/// subtitle streams as the source. `Err` says why not (log text).
+/// The converted file is usable: HEVC video tagged BT.709 (`color_primaries` and
+/// `color_transfer`), the same length within 1 s, as many audio and subtitle streams as the
+/// source. `Err` says why not (log text).
 pub fn verify(src: &Value, out: &Value) -> Result<(), String> {
-    let codec = first_video(out).and_then(|v| v.get("codec_name")).and_then(Value::as_str).unwrap_or("");
+    let v = first_video(out);
+    let field = |k: &str| v.and_then(|v| v.get(k)).and_then(Value::as_str).unwrap_or("");
+    let codec = field("codec_name");
     if codec != "hevc" {
         return Err(format!("video {codec:?}, nu hevc"));
+    }
+    let (prim, trc) = (field("color_primaries"), field("color_transfer"));
+    if prim != "bt709" || trc != "bt709" {
+        return Err(format!("culori {prim:?}/{trc:?}, nu bt709"));
     }
     let (a, b) = (duration(src), duration(out));
     if a <= 0.0 || (a - b).abs() > DURATION_TOLERANCE {
@@ -1384,7 +1424,7 @@ impl Job<'_> {
     pub fn sweep(&self, libraries: &[String]) {
         let ours = |p: &str| {
             let l = p.to_lowercase();
-            l.ends_with(TMP_SUFFIX) || l.ends_with(&format!(".mkv{PARTIAL_SUFFIX}")) || l.ends_with(&format!(".mkv{REVERT_SUFFIX}"))
+            l.ends_with(TMP_SUFFIX) || l.ends_with(ENC_SUFFIX) || l.ends_with(&format!(".mkv{PARTIAL_SUFFIX}")) || l.ends_with(&format!(".mkv{REVERT_SUFFIX}"))
         };
         let recorded = self.leftovers();
         let mut paths: Vec<PathBuf> = recorded.iter().filter(|p| ours(p)).map(PathBuf::from).collect();
@@ -1477,7 +1517,7 @@ impl Job<'_> {
                 Err(e) => Done::Failed(format!("ffprobe: {e}")),
             };
             let file = Path::new(&ep.path);
-            self.drop_leftovers(&[&tmp_path(&self.cfg.tmp_dir, file), &partial_path(file)]);
+            self.drop_leftovers(&[&enc_path(&self.cfg.tmp_dir, file), &tmp_path(&self.cfg.tmp_dir, file), &partial_path(file)]);
             let (result, note) = match &done {
                 Done::Converted => ("ok", String::new()),
                 Done::DryRun => ("dry", "probă: nimic schimbat".to_string()),
@@ -1581,42 +1621,81 @@ impl Job<'_> {
         if let Err(e) = fs::create_dir_all(&self.cfg.tmp_dir) {
             return Done::Failed(format!("dosarul temporar: {}", crate::state::io_error_name(&e)));
         }
+        let enc = enc_path(&self.cfg.tmp_dir, file);
+        self.note_leftover(&enc);
         self.note_leftover(&tmp);
         if cross {
             self.note_leftover(&partial_path(file));
         }
+        let clean = || {
+            let _ = fs::remove_file(&enc);
+            let _ = fs::remove_file(&tmp);
+        };
         log_info!("convert: start {} ({:.1} GB)", file.display(), size as f64 / 1_073_741_824.0);
         let t0 = Instant::now();
         let total = duration(src);
         let mut last_pct = -1.0;
+        let set_pct = |p: f64| {
+            self.control().update(|b| {
+                if let Some(c) = b.current.as_mut() {
+                    c.percent = p;
+                }
+            })
+        };
         let mut on_line = |l: &str| {
             if let Some(t) = parse_progress(l) {
-                let p = percent(t, total);
+                let p = crate::json::py_round(percent(t, total) * ENCODE_SHARE / 100.0, 1);
                 if p != last_pct {
                     last_pct = p;
-                    self.control().update(|b| {
-                        if let Some(c) = b.current.as_mut() {
-                            c.percent = p;
-                        }
-                    });
+                    set_pct(p);
                 }
             }
         };
-        let r = tools.encode(&ffmpeg_args(file, &tmp), &mut on_line, &|| self.stopped());
+        // Pass 1: the encode (no bitstream filter, see `ffmpeg_args`).
+        let r = tools.encode(&ffmpeg_args(file, &enc), &mut on_line, &|| self.stopped());
         let (code, lines) = match r {
             Ok(x) => x,
             Err(e) => {
-                let _ = fs::remove_file(&tmp);
+                clean();
                 return if self.stopped() { Done::Stopped } else { Done::Failed(format!("ffmpeg: {e}")) };
             }
         };
         for l in &lines {
             log_info!("convert:   ffmpeg: {}", ascii_log(l));
         }
-        if code != 0 || !tmp.is_file() {
-            let _ = fs::remove_file(&tmp);
+        if code != 0 || !enc.is_file() {
+            clean();
             let last = lines.last().map(|l| format!(": {l}")).unwrap_or_default();
             return Done::Failed(format!("ffmpeg a eșuat ({code}){last}"));
+        }
+        if self.stopped() {
+            clean();
+            return Done::Stopped;
+        }
+        // Pass 2: the remux writes the BT.709 VUI; the encode and the result are both in the
+        // temp dir until the encode is deleted.
+        let enc_size = fs::metadata(&enc).map(|m| m.len()).unwrap_or(0);
+        if free_bytes(&self.cfg.tmp_dir).is_some_and(|free| (free as f64) < enc_size as f64 * 1.1) {
+            clean();
+            return Done::Failed("spațiu insuficient pe disc".into());
+        }
+        set_pct(REMUX_PERCENT);
+        let r = tools.encode(&remux_args(&enc, &tmp), &mut |_| {}, &|| self.stopped());
+        let (code, lines) = match r {
+            Ok(x) => x,
+            Err(e) => {
+                clean();
+                return if self.stopped() { Done::Stopped } else { Done::Failed(format!("ffmpeg (remux): {e}")) };
+            }
+        };
+        for l in &lines {
+            log_info!("convert:   ffmpeg remux: {}", ascii_log(l));
+        }
+        let _ = fs::remove_file(&enc);
+        if code != 0 || !tmp.is_file() {
+            clean();
+            let last = lines.last().map(|l| format!(": {l}")).unwrap_or_default();
+            return Done::Failed(format!("remux a eșuat ({code}){last}"));
         }
         let checked = tools.probe(&tmp).and_then(|out| verify(src, &out));
         if let Err(e) = checked {
@@ -2109,15 +2188,26 @@ mod tests {
 
     #[test]
     fn ffmpeg_command_and_progress() {
-        let a = ffmpeg_args(Path::new("D:\\S\\e1.mkv"), Path::new("D:\\T\\e1.hevc.mkv"));
+        // Pass 1: the encode, no bitstream filter (hevc_amf gives it no extradata).
+        let a = ffmpeg_args(Path::new("D:\\S\\e1.mkv"), Path::new("D:\\T\\e1.hevc.enc.mkv"));
         assert_eq!(
             a.join(" "),
             "-hide_banner -loglevel error -y -progress pipe:1 -nostats -i D:\\S\\e1.mkv -map 0 -c copy -c:v hevc_amf -profile:v main10 \
              -pix_fmt p010le -quality quality -rc cqp -qp_i 19 -qp_p 21 -qp_b 23 -color_primaries bt709 -color_trc bt709 \
-             -colorspace bt709 -color_range tv -bsf:v hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1:video_full_range_flag=0 \
-             -tag:v hvc1 D:\\T\\e1.hevc.mkv"
+             -colorspace bt709 -color_range tv -tag:v hvc1 D:\\T\\e1.hevc.enc.mkv"
         );
+        assert!(!a.iter().any(|x| x.starts_with("-bsf")), "no -bsf in the encode");
+        // Pass 2: the stream-copy remux writes the BT.709 VUI.
+        let b = remux_args(Path::new("D:\\T\\e1.hevc.enc.mkv"), Path::new("D:\\T\\e1.hevc.mkv"));
+        assert_eq!(
+            b.join(" "),
+            "-hide_banner -loglevel error -y -i D:\\T\\e1.hevc.enc.mkv -map 0 -c copy \
+             -bsf:v hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1:video_full_range_flag=0 \
+             -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv D:\\T\\e1.hevc.mkv"
+        );
+        assert!(!b.iter().any(|x| x == "hevc_amf" || x == "-c:v"), "the remux encodes nothing");
         assert_eq!(tmp_path(Path::new("D:\\T"), Path::new("D:\\S\\Show - S01E01.mkv")), PathBuf::from("D:\\T\\Show - S01E01.hevc.mkv"));
+        assert_eq!(enc_path(Path::new("D:\\T"), Path::new("D:\\S\\Show - S01E01.mkv")), PathBuf::from("D:\\T\\Show - S01E01.hevc.enc.mkv"));
         assert_eq!(parse_progress("out_time_us=62500000"), Some(62.5));
         assert_eq!(parse_progress("out_time_ms=1000000"), Some(1.0));
         assert_eq!(parse_progress("out_time=00:01:02.500000"), Some(62.5));
@@ -2133,7 +2223,8 @@ mod tests {
     }
 
     fn src_probe(codec: &str, dur: &str, audio: usize, subs: usize) -> Value {
-        let mut streams = vec![json!({"index": 0, "codec_type": "video", "codec_name": codec, "pix_fmt": "yuv420p10le"})];
+        let mut streams = vec![json!({"index": 0, "codec_type": "video", "codec_name": codec, "pix_fmt": "yuv420p10le",
+                                      "color_primaries": "bt709", "color_transfer": "bt709"})];
         for _ in 0..audio {
             streams.push(json!({"codec_type": "audio", "codec_name": "flac"}));
         }
@@ -2153,6 +2244,22 @@ mod tests {
         assert!(verify(&src, &src_probe("hevc", "1420.1", 1, 3)).is_err());
         assert!(verify(&src, &src_probe("hevc", "1420.1", 2, 2)).is_err());
         assert!(verify(&src_probe("h264", "0", 2, 3), &src_probe("hevc", "0", 2, 3)).is_err());
+        // The colours: BT.709 primaries and transfer, else (HDR from AMF, untagged) refused.
+        for (k, v) in [("color_primaries", json!("bt2020")), ("color_transfer", json!("smpte2084")), ("color_primaries", Value::Null)] {
+            let out = colours(src_probe("hevc", "1420.1", 2, 3), k, v);
+            assert!(verify(&src, &out).unwrap_err().starts_with("culori"), "{k}");
+        }
+    }
+
+    /// `probe` with its video stream's `key` set to `v` (null removes it).
+    fn colours(mut probe: Value, key: &str, v: Value) -> Value {
+        let s = probe["streams"][0].as_object_mut().unwrap();
+        if v.is_null() {
+            s.remove(key);
+        } else {
+            s.insert(key.into(), v);
+        }
+        probe
     }
 
     fn entry(lib: &str, orig: Option<&str>) -> Entry {
@@ -2343,13 +2450,33 @@ mod tests {
 
     // -- the job against fake services and a fake ffmpeg ----------------------------------
 
-    /// Probes by file name (`*.hevc.mkv`: `out`); encode writes the output and reports progress.
+    /// Probes by file name (`*.hevc.mkv`: `out`). The encode (pass 1, no `-bsf`) writes
+    /// `*.hevc.enc.mkv` and reports progress; the remux (pass 2, `-bsf:v hevc_metadata`) needs
+    /// that file and writes `*.hevc.mkv`.
     struct FakeTools {
         out: Value,
+        /// Pass 1's exit code.
         exit: i32,
+        /// Pass 2's exit code.
+        remux_exit: i32,
         calls: StdMutex<Vec<Vec<String>>>,
-        /// Press Stop during this encode (1-based): ffmpeg is "killed".
+        /// Press Stop during this ffmpeg run (1-based, either pass): ffmpeg is "killed".
         stop_on: Option<(usize, Arc<AppState>)>,
+        /// The progress bar when Stop was pressed.
+        pct_at_stop: StdMutex<Option<f64>>,
+    }
+
+    fn is_remux(args: &[String]) -> bool {
+        args.iter().any(|a| a == "-bsf:v")
+    }
+
+    impl FakeTools {
+        /// (encodes, remuxes) run so far.
+        fn passes(&self) -> (usize, usize) {
+            let c = self.calls.lock().unwrap();
+            let r = c.iter().filter(|a| is_remux(a)).count();
+            (c.len() - r, r)
+        }
     }
 
     impl Tools for FakeTools {
@@ -2364,15 +2491,32 @@ mod tests {
                 c.push(args.to_vec());
                 c.len()
             };
-            fs::write(args.last().unwrap(), b"encoded").unwrap();
-            on_line("out_time_us=50000000");
+            let out = args.last().unwrap();
+            let remux = is_remux(args);
+            if remux {
+                assert!(out.ends_with(TMP_SUFFIX) && !out.ends_with(ENC_SUFFIX), "{out}");
+                assert!(!args.iter().any(|a| a == "hevc_amf"), "the remux encodes nothing");
+                let input = &args[args.iter().position(|a| a == "-i").unwrap() + 1];
+                assert!(input.ends_with(ENC_SUFFIX), "{input}");
+                assert_eq!(fs::read(input).unwrap(), b"encoded", "the remux reads pass 1's file");
+                fs::write(out, b"encoded").unwrap();
+            } else {
+                assert!(out.ends_with(ENC_SUFFIX), "{out}");
+                assert!(args.iter().any(|a| a == "hevc_amf"));
+                fs::write(out, b"encoded").unwrap();
+                on_line("out_time_us=50000000");
+            }
             if let Some((at, a)) = &self.stop_on {
                 if *at == n {
+                    *self.pct_at_stop.lock().unwrap() = a.convert.batch().and_then(|b| b.current).map(|c| c.percent);
                     assert!(a.convert.request_stop());
                 }
             }
             if stop() {
                 return Err("oprit".into());
+            }
+            if remux {
+                return Ok((self.remux_exit, if self.remux_exit == 0 { vec![] } else { vec!["remux error".into()] }));
             }
             on_line("progress=end");
             Ok((self.exit, vec![]))
@@ -2380,7 +2524,7 @@ mod tests {
     }
 
     fn tools(exit: i32) -> FakeTools {
-        FakeTools { out: src_probe("hevc", "100.4", 2, 1), exit, calls: StdMutex::new(vec![]), stop_on: None }
+        FakeTools { out: src_probe("hevc", "100.4", 2, 1), exit, remux_exit: 0, calls: StdMutex::new(vec![]), stop_on: None, pct_at_stop: StdMutex::new(None) }
     }
 
     const HASH: &str = "abcdef0123456789abcdef0123456789abcdef01";
@@ -2653,7 +2797,12 @@ mod tests {
         let t = Arc::new(tools(0));
         run(&r, rq, t.clone()).await;
         // E1 is watched: E2 (hardlinked) and E3 (a plain copy) are converted, E4 is left.
-        assert_eq!(t.calls.lock().unwrap().len(), 2);
+        // Each one: the encode, then the remux of that encode.
+        assert_eq!(t.passes(), (2, 2));
+        let calls = t.calls.lock().unwrap().clone();
+        assert!(!is_remux(&calls[0]) && is_remux(&calls[1]) && !is_remux(&calls[2]) && is_remux(&calls[3]));
+        assert!(calls[0].last().unwrap().ends_with("Show - S01E02.hevc.enc.mkv"));
+        assert!(calls[1].last().unwrap().ends_with("Show - S01E02.hevc.mkv"));
         for n in [2, 3] {
             assert_eq!(fs::read(r.w.lib_file(n)).unwrap(), b"encoded");
             assert_eq!(fs::read(r.w.torrent_file(n)).unwrap(), format!("original-{n}").as_bytes(), "the torrent copy is untouched");
@@ -2787,13 +2936,19 @@ mod tests {
         // temp file; plus files the job never makes, which must stay.
         let revert_left = revert_tmp(&r.w.lib_file(1));
         let tmp_left = r.w.root.join("tmp").join("Show - S01E03.hevc.mkv");
-        let foreign = [r.w.lib.join("other.partial"), r.w.root.join("tmp").join("keep.hevc.mkv"), partial_path(&r.w.lib_file(4))];
+        let enc_left = r.w.root.join("tmp").join("Show - S01E03.hevc.enc.mkv");
+        let foreign = [
+            r.w.lib.join("other.partial"),
+            r.w.root.join("tmp").join("keep.hevc.mkv"),
+            r.w.root.join("tmp").join("keep.hevc.enc.mkv"),
+            partial_path(&r.w.lib_file(4)),
+        ];
         fs::create_dir_all(r.w.root.join("tmp")).unwrap();
-        for p in [&revert_left, &tmp_left].into_iter().chain(foreign.iter()) {
+        for p in [&revert_left, &tmp_left, &enc_left].into_iter().chain(foreign.iter()) {
             fs::write(p, b"x").unwrap();
         }
         let mut m = Map::new();
-        m.insert(LEFTOVERS_KEY.into(), json!([tmp_left.display().to_string(), "C:\\Windows\\win.ini"]));
+        m.insert(LEFTOVERS_KEY.into(), json!([tmp_left.display().to_string(), enc_left.display().to_string(), "C:\\Windows\\win.ini"]));
         a.state_file.update(m);
         let rt = Handle::current();
         let libs: Vec<String> = ledger(&r).into_iter().map(|e| e.library).collect();
@@ -2803,7 +2958,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(!revert_left.exists() && !tmp_left.exists());
+        assert!(!revert_left.exists() && !tmp_left.exists() && !enc_left.exists());
         assert!(foreign.iter().all(|p| p.exists()), "nothing else is touched");
         assert!(r.a.state_file.load()[LEFTOVERS_KEY].as_array().unwrap().is_empty());
     }
@@ -2824,15 +2979,25 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn failures_keep_the_library_file() {
-        // ffmpeg fails, then the verification fails: originals stay, temp files go.
-        for (exit, out) in [(1, src_probe("hevc", "100", 2, 1)), (0, src_probe("hevc", "90", 2, 1))] {
+        // The encode fails, the remux fails, the verification fails (length, then the colours
+        // still HDR): originals stay, temp files (the encode too) go.
+        let hdr = colours(colours(src_probe("hevc", "100", 2, 1), "color_primaries", json!("bt2020")), "color_transfer", json!("smpte2084"));
+        for (exit, remux_exit, out, passes, why) in [
+            (1, 0, src_probe("hevc", "100", 2, 1), (2, 0), "ffmpeg a eșuat"),
+            (0, 1, src_probe("hevc", "100", 2, 1), (2, 2), "remux a eșuat (1): remux error"),
+            (0, 0, src_probe("hevc", "90", 2, 1), (2, 2), "verificare eșuată: durata"),
+            (0, 0, hdr, (2, 2), "verificare eșuată: culori"),
+        ] {
             let r = rig(false).await;
             let rq = begun(&r, 2);
             let mut t = tools(exit);
+            t.remux_exit = remux_exit;
             t.out = out;
             let t = Arc::new(t);
             run(&r, rq, t.clone()).await;
-            assert_eq!(t.calls.lock().unwrap().len(), 2, "a failure counts towards the count");
+            assert_eq!(t.passes(), passes, "a failure counts towards the count ({why})");
+            assert!(r.a.state_file.load()[LEFTOVERS_KEY].as_array().is_none_or(|a| a.is_empty()), "{why}");
+            assert!(r.a.convert.batch().unwrap().items.iter().all(|i| i.note.starts_with(why)), "{why}");
             for n in 1..=4 {
                 assert_eq!(fs::read(r.w.lib_file(n)).unwrap(), format!("original-{n}").as_bytes());
             }
@@ -2857,14 +3022,30 @@ mod tests {
         let b = r.a.convert.batch().unwrap();
         assert!(!b.running);
         assert_eq!(b.summary.as_deref(), Some("Conversie oprită (Show)"));
-        // Stop pressed while ffmpeg runs on the second episode.
+        // Stop pressed during the first episode's remux: nothing installed, both temps gone.
         let r = rig(false).await;
         let rq = begun(&r, 3);
         let mut t = tools(0);
         t.stop_on = Some((2, r.a.clone()));
         let t = Arc::new(t);
         run(&r, rq, t.clone()).await;
-        assert_eq!(t.calls.lock().unwrap().len(), 2);
+        assert_eq!(t.passes(), (1, 1));
+        assert_eq!(fs::read(r.w.lib_file(1)).unwrap(), b"original-1");
+        assert!(tmp_is_empty(&r), "the killed remux's files are deleted");
+        assert!(!ledger_path(&r.a).exists() || ledger(&r).is_empty());
+        assert_eq!(*t.pct_at_stop.lock().unwrap(), Some(REMUX_PERCENT), "the remux shows 99 %");
+        let b = r.a.convert.batch().unwrap();
+        assert_eq!(b.items.iter().map(|i| i.result).collect::<Vec<_>>(), ["stopped"]);
+        assert_eq!(b.summary.as_deref(), Some("Conversie oprită (Show)"));
+        // Stop pressed while ffmpeg encodes the second episode.
+        let r = rig(false).await;
+        let rq = begun(&r, 3);
+        let mut t = tools(0);
+        t.stop_on = Some((3, r.a.clone()));
+        let t = Arc::new(t);
+        run(&r, rq, t.clone()).await;
+        assert_eq!(t.passes(), (2, 1));
+        assert_eq!(*t.pct_at_stop.lock().unwrap(), Some(48.5), "50 % of the encode is 48.5 % of the bar");
         assert_eq!(fs::read(r.w.lib_file(1)).unwrap(), b"encoded");
         assert_eq!(fs::read(r.w.lib_file(2)).unwrap(), b"original-2");
         assert!(tmp_is_empty(&r), "the killed encode's temp file is deleted");
@@ -2973,7 +3154,7 @@ mod tests {
         let rq = r.a.convert.take_request().unwrap();
         let t = Arc::new(tools(0));
         run(&r, rq, t.clone()).await;
-        assert_eq!(t.calls.lock().unwrap().len(), 1);
+        assert_eq!(t.passes(), (1, 1));
         assert_eq!(fs::read(r.w.movie_file()).unwrap(), b"encoded");
         assert_eq!(fs::read(r.w.movie_torrent()).unwrap(), b"movie-original", "the torrent copy is untouched");
         assert!(tmp_is_empty(&r));
