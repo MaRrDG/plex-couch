@@ -25,6 +25,7 @@
   let countdownTimer = null;
   let segment = 'lib';
   let convertBusy = false;
+  let subsBusy = false;
 
   // ---------- formatting (Romanian: decimal comma, tabular figures in CSS) ----------
   const nf = (d) => new Intl.NumberFormat('ro-RO', { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -255,6 +256,8 @@
     $('sheet-after').disabled = off;
     // Conversion controls (Seriale, the sheets, the Acasă banner) carry data-net.
     for (const b of document.querySelectorAll('button[data-net]')) b.disabled = off || convertBusy || b.dataset.off === '1';
+    // Translation controls (the season action, the sheets) carry data-subs.
+    for (const b of document.querySelectorAll('button[data-subs]')) b.disabled = off || subsBusy || b.dataset.off === '1';
   }
   function setOffline(on) {
     if (offline === on) return;
@@ -458,6 +461,8 @@
       saveLast(s);
       loadConvert();
       if (currentTab() === 'seriale') { if (detailId != null) loadDetail(); else loadSeries(); }
+      const movieOpen = movieInfo && !$('info-sheet').hidden;
+      if ((currentTab() === 'seriale' && detailId != null) || movieOpen || subsActive()) loadSubs();
     } catch (e) {
       if (e.message === 'auth') return;
       if (e.offline) {
@@ -731,6 +736,138 @@
     return b;
   }
 
+  // ---------- Traduceri RO: the manual translation queue (GET /api/subs) ----------
+  // Fed by the series screen, the movie sheet and its own poll while one is queued or runs.
+  let subs = null;
+  let subsLoading = false;
+  let subsSeen = null; // `at` of the newest result already shown
+  const subsActive = () => !!(subs && (subs.inflight || subs.queue_len));
+
+  function resultText(o) {
+    if (!o.ok) return `Traducerea a eșuat: ${o.label} (${o.text}).`;
+    return o.text === 'tradusă' ? `Subtitrare RO tradusă: ${o.label}.` : `${o.label}: ${o.text}.`;
+  }
+  // A new status; a result that came in since is toasted. True when a translation ended
+  // (the screens then reload what Bazarr says now).
+  function setSubs(s) {
+    if (!s) return false;
+    const before = subs;
+    subs = s;
+    const recent = s.recent || [];
+    const newest = recent.length ? recent[0].at : 0;
+    let fresh = [];
+    if (subsSeen == null) subsSeen = newest;
+    else {
+      fresh = recent.filter((o) => o.at > subsSeen);
+      subsSeen = Math.max(subsSeen, newest);
+      if (fresh.length) toast(resultText(fresh[0]), !fresh[0].ok);
+    }
+    const was = before && before.inflight ? before.inflight.key : null;
+    const now = s.inflight ? s.inflight.key : null;
+    return fresh.length > 0 || (was != null && was !== now);
+  }
+  function renderSubsViews() {
+    if (currentTab() === 'seriale' && detailId != null) renderDetail();
+    refreshInfo();
+  }
+  async function loadSubs() {
+    if (subsLoading || $('app').hidden) return;
+    subsLoading = true;
+    let ended = false;
+    try {
+      ended = setSubs(await api('/api/subs'));
+      renderSubsViews();
+    } catch (e) {
+      /* the last state stays; offline is shown by setOffline */
+    } finally {
+      subsLoading = false;
+    }
+    if (ended) {
+      if (detailId != null) loadDetail(true);
+      if (movieInfo && !$('info-sheet').hidden) fetchMovie(movieInfo.id);
+    }
+  }
+
+  // The live RO state of `key` (`ep:<id>` / `movie:<id>`) from the screen's `ro`/`ro_pos`.
+  function roState(key, base, pos) {
+    if (subs) {
+      if (subs.inflight && subs.inflight.key === key) return { state: 'translating' };
+      const q = (subs.queue || []).find((x) => x.key === key);
+      if (q) return { state: 'queued', pos: q.position };
+      if (base === 'queued') return { state: 'missing' }; // left the queue since the screen loaded
+    }
+    return { state: base || null, pos: pos || null };
+  }
+  const translatorOff = () => !!(subs && subs.translator === false);
+
+  // A translation button (disabled while offline or while a request runs).
+  function subsButton(cls, text, onClick, key, off) {
+    const b = h('button', cls, text);
+    b.type = 'button';
+    b.dataset.subs = '1';
+    b.dataset.off = off ? '1' : '';
+    if (key) b.dataset.key = key;
+    b.disabled = offline || subsBusy || !!off;
+    b.addEventListener('click', onClick);
+    return b;
+  }
+  async function subsAction(path, body) {
+    if (subsBusy) return;
+    subsBusy = true;
+    applyDisabled();
+    try {
+      const r = await api(path, body);
+      toast(r.demo ? `${r.message} Mod demo: nu se traduce nimic.` : r.message);
+      if (r.subs) setSubs(r.subs);
+    } catch (e) {
+      if (e.message !== 'auth') toast(e.message, true);
+      if (e.data && e.data.translator === false && subs) subs.translator = false;
+    } finally {
+      subsBusy = false;
+      renderSubsViews();
+      applyDisabled();
+    }
+  }
+
+  // The translation part of an episode / movie sheet; `body` names it for the API.
+  function trControls(st, body, label) {
+    if (st.state === 'translating') return [h('p', 'body-strong', 'Se traduce…')];
+    if (st.state === 'queued') {
+      const cancel = subsButton('btn-text body-strong accent', 'Anulează',
+        () => subsAction('/api/subs/translate/cancel', body), 'tr-act');
+      cancel.setAttribute('aria-label', `Anulează traducerea: ${label}`);
+      return [h('div', 'tr-line', h('span', 'body-strong', st.pos ? `În coadă (#${st.pos})` : 'În coadă'),
+        h('span', 'meta muted', '·'), cancel)];
+    }
+    if (st.state !== 'missing') return [];
+    const off = translatorOff();
+    const go = subsButton('btn btn-plain btn-on-surface', 'Tradu în română',
+      () => subsAction('/api/subs/translate', body), 'tr-act', off);
+    return [go, off ? h('p', 'meta muted', 'Configurează Gemini în Bazarr.') : null];
+  }
+
+  // The series screen: translate the season's episodes without RO, and today's count.
+  function seasonTranslate(d, cur) {
+    if (!d.bazarr || !cur) return null;
+    const missing = cur.episodes.filter((e) => roState('ep:' + e.id, e.ro, e.ro_pos).state === 'missing').length;
+    const off = translatorOff();
+    const b = subsButton('btn btn-plain', `Tradu sezonul (${missing} fără RO)`,
+      () => subsAction('/api/subs/translate', { seriesId: d.id, season: cur.number, missingOnly: true }),
+      'tr-season', missing === 0 || off);
+    b.setAttribute('aria-label', missing
+      ? `Tradu în română ${epText(missing)} fără RO din ${cur.label}`
+      : `Niciun episod fără RO în ${cur.label}`);
+    let line = null;
+    if (off) line = 'Configurează Gemini în Bazarr.';
+    else if (subs) {
+      const parts = [`Traduceri azi: ${subs.used} din ${subs.per_day}`];
+      if (subs.queue_len) parts.push(`${subs.queue_len} în coadă`);
+      if (subs.inflight) parts.push(`se traduce ${subs.inflight.label}`);
+      line = parts.join(' · ');
+    }
+    return h('div', 'tr-season', b, line ? h('p', 'meta muted', line) : null);
+  }
+
   // ---------- Acasă: the banner while a conversion runs ----------
   function renderBanner() {
     const box = $('convert-banner');
@@ -823,6 +960,7 @@
       detailError = null;
       detailAt = Date.now();
       if (d.job !== undefined && !convertLoading) job = d.job;
+      if (d.subs) setSubs(d.subs);
       if (season == null || !d.seasons.some((s) => s.number === season)) season = d.default_season;
     } catch (e) {
       if (e.message === 'auth' || id !== detailId) return;
@@ -855,8 +993,14 @@
     if (st.needs) return null;
     return ['Merge direct', ''];
   }
-  const RO_PILL = { ro: ['RO ✓', ''], missing: ['fără RO', 'warn'], translating: ['RO se traduce', ''] };
+  const RO_PILL = { ok: ['RO ✓', ''], missing: ['fără RO', 'warn'], translating: ['RO se traduce', ''], queued: ['RO în coadă', ''] };
   const pill = (p) => (p ? h('span', 'pill' + (p[1] ? ' pill-' + p[1] : ''), p[0]) : null);
+  function roPill(st) {
+    const p = RO_PILL[st.state];
+    if (!p) return null;
+    return pill(st.state === 'queued' && st.pos ? [`RO în coadă #${st.pos}`, p[1]] : p);
+  }
+  const epRo = (e) => roState('ep:' + e.id, e.ro, e.ro_pos);
 
   function episodeRow(e) {
     const st = epState(e);
@@ -866,7 +1010,7 @@
         h('span', 'data ep-num', String(e.episode)),
         h('span', 'tile-label ep-title', e.title || e.label),
         seen ? h('span', 'ep-seen', h('span', '', '✓'), sr(' văzut')) : null),
-      h('span', 'pills', pill(videoPill(e, st)), pill(RO_PILL[e.ro_sub])));
+      h('span', 'pills', pill(videoPill(e, st)), roPill(epRo(e))));
     b.type = 'button';
     b.dataset.key = 'ep-' + e.id;
     b.setAttribute('aria-haspopup', 'dialog');
@@ -961,7 +1105,7 @@
     const oldRow = box.querySelector('.season-chips');
     const keepLeft = oldRow ? oldRow.scrollLeft : null;
     keepFocus(box, () => fill(box, backButton(), title, head,
-      d.seasons.length > 1 ? seasonChips(d.seasons) : null, list, ...notes));
+      d.seasons.length > 1 ? seasonChips(d.seasons) : null, seasonTranslate(d, cur), list, ...notes));
     const row = box.querySelector('.season-chips');
     if (row && keepLeft != null) row.scrollLeft = keepLeft;
     else if (row) {
@@ -1026,8 +1170,9 @@
   function fact(label, value) {
     return h('div', 'fact', h('dt', 'meta muted', label), h('dd', 'data', value));
   }
-  function roText(ro) {
-    return { ro: 'există', missing: 'lipsește', translating: 'se traduce acum' }[ro] || 'necunoscută';
+  function roText(st) {
+    if (st.state === 'queued') return st.pos ? `în coadă pentru traducere (#${st.pos})` : 'în coadă pentru traducere';
+    return { ok: 'există', missing: 'lipsește', translating: 'se traduce acum' }[st.state] || 'necunoscută';
   }
   const seenText = (w) => (w === true ? 'da' : w === false ? 'nu' : 'necunoscut');
   function fillInfo(title, sub, ...nodes) {
@@ -1055,12 +1200,15 @@
       if (!e) return closeSheet();
       const st = epState(e);
       const vp = videoPill(e, st);
+      const ro = epRo(e);
       const facts = h('dl', 'facts',
         fact('Fișier', e.file || ''),
         fact('Mărime', gb(e.size)),
         fact('Video', [e.codec || 'necunoscut', vp ? vp[0].toLocaleLowerCase('ro-RO') : 'merge direct'].join(', ')),
-        fact('Subtitrare RO', roText(e.ro_sub)),
+        fact('Subtitrare RO', roText(ro)),
         fact('Văzut', seenText(e.watched)));
+      const tr = trControls(ro, { seriesId: detail.id, episodeIds: [e.id] }, e.label);
+      const trNote = ro.state === 'missing' && e.ro_note ? h('p', 'meta muted', e.ro_note) : null;
       const actions = [];
       let note = null;
       if (st.converting != null) {
@@ -1078,26 +1226,30 @@
         note = 'Convertit pentru TV. După ce îl vezi, pun la loc fișierul din torrent.';
       }
       fillInfo(`${e.label} · ${e.title || ''}`.replace(/ · $/, ''), detail.title, facts,
-        note ? h('p', 'meta muted', note) : null, ...actions);
+        note ? h('p', 'meta muted', note) : null, ...actions, trNote, ...tr);
     });
   }
 
   // Filme: the movie sheet (GET /api/movies/<radarr id>, loaded when it opens).
   let movieInfo = null;
-  async function openMovie(m) {
-    const id = m.radarr_id;
-    movieInfo = { id, data: null, error: null };
-    openInfo(() => renderMovie(m));
+  async function fetchMovie(id) {
     try {
       const d = await api('/api/movies/' + id, undefined, DETAIL_TIMEOUT_MS);
       if (!movieInfo || movieInfo.id !== id) return;
       movieInfo.data = d;
+      movieInfo.error = null;
       if (d.job !== undefined && !convertLoading) job = d.job;
+      if (d.subs) setSubs(d.subs);
     } catch (e) {
       if (e.message === 'auth' || !movieInfo || movieInfo.id !== id) return;
-      movieInfo.error = e.offline ? OFFLINE_TEXT : e.message;
+      if (!movieInfo.data) movieInfo.error = e.offline ? OFFLINE_TEXT : e.message;
     }
     refreshInfo();
+  }
+  function openMovie(m) {
+    movieInfo = { id: m.radarr_id, data: null, error: null };
+    openInfo(() => renderMovie(m));
+    fetchMovie(m.radarr_id);
   }
   function renderMovie(m) {
     const mi = movieInfo && movieInfo.id === m.radarr_id ? movieInfo : null;
@@ -1111,12 +1263,15 @@
     if (converting != null) video += `, se convertește ${pct(converting)}`;
     else if (converted) video += ', convertit';
     else if (d.needs_conversion) video += ', nu merge direct pe TV';
+    const ro = roState('movie:' + d.id, d.ro, d.ro_pos);
     const facts = h('dl', 'facts',
       d.file ? fact('Fișier', d.file) : null,
       fact('Mărime', gb(d.size)),
       fact('Video', video),
-      fact('Subtitrare RO', roText(d.ro_sub)),
+      fact('Subtitrare RO', roText(ro)),
       fact('Văzut', seenText(d.watched)));
+    const tr = d.file ? trControls(ro, { movieId: d.id }, d.title || m.title) : [];
+    const trNote = ro.state === 'missing' && d.ro_note ? h('p', 'meta muted', d.ro_note) : null;
     const actions = [];
     let note = null;
     if (converting != null) {
@@ -1136,7 +1291,8 @@
     } else if (d.needs_conversion && !d.plex) {
       note = 'Plex nu răspunde, nu știu dacă ai văzut filmul.';
     }
-    fillInfo(d.title || m.title, d.year ? String(d.year) : sub, facts, note ? h('p', 'meta muted', note) : null, ...actions);
+    fillInfo(d.title || m.title, d.year ? String(d.year) : sub, facts, note ? h('p', 'meta muted', note) : null, ...actions,
+      trNote, ...tr);
   }
 
   function renderDisk(pc) {
