@@ -136,6 +136,30 @@ still kept).
     copy shares it.
   - Any API error, unknown mapping, missing file or failed check keeps the torrent.
 
+- **Conversie pentru TV** (PC tab, only when you press it): the Samsung TV's Plex app cannot
+  direct-play 10-bit H.264 (Hi10P), so Plex transcodes and the TV buffers. The PC tab lists the
+  series with unwatched Hi10P episodes (from Sonarr's media info, no scan of the library), how
+  many and the next one. Pick a series and a count (1-20, default 2) and press "Convertește":
+  the next unwatched episodes, in episode order, are re-encoded one at a time to HEVC Main10 on
+  the AMD GPU (`hevc_amf`, BT.709 colour tags, audio/subtitles/fonts copied), at below-normal
+  priority without a window, into `jobs.convert.tmp_dir` (default `D:\Media\Downloads\.reencode`).
+  An episode playing in Plex is passed over. The result is checked (HEVC, same length within
+  1 s, same number of audio and subtitle streams) and then renamed over the library file; that
+  breaks the library hardlink, so the torrent copy stays byte-identical for seeding. Sonarr
+  rescans the series and Plex refreshes the folder. The tab shows the episode, the percent, the
+  queue and the results; "Oprește conversia" kills ffmpeg at once and deletes its temp file
+  (the library file stays as it was). One batch at a time; ntfy says when it is done.
+  - **Back to the original after watching**: `convert-ledger.json` (next to the config) records
+    each converted file and the torrent file it was hardlinked to (found through Sonarr's import
+    history, else qBittorrent's file list, and checked to be the same NTFS file). Every 5
+    minutes, once an episode is watched in Plex and not playing, and the torrent file is still
+    there with its size and still part of a torrent in qBittorrent, the library file becomes a
+    hard link to it again (Plex and Sonarr are refreshed). If the torrent is gone by then (the
+    seed keeper deleted it), the converted file simply stays.
+  - The seed keeper is not affected: for mapped torrents it decides by "watched", and for an
+    unmapped torrent a converted episode just means its file has no library link (link count
+    1), which is true: the library has its own copy.
+
 The seed keeper and the next-season check read "watched" from Plex library section 1 (movies)
 and section 2 (TV); these are fixed. The DV strip takes the section of each library from the
 config.

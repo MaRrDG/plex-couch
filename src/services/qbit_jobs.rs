@@ -1,7 +1,7 @@
-//! Job-only qBittorrent calls for the seed keeper: all torrents, tracker statuses, delete
-//! with `deleteFiles=true`. Logs in on HTTP 403 and retries once (spec 5.5); the SID
-//! cookie is kept in memory. Tracker URLs are never stored, logged or returned: only
-//! "is FileList" and the status leave this module.
+//! Job-only qBittorrent calls for the seed keeper and the TV conversion: all torrents,
+//! tracker statuses, file lists, delete with `deleteFiles=true`. Logs in on HTTP 403 and
+//! retries once (spec 5.5); the SID cookie is kept in memory. Tracker URLs are never stored,
+//! logged or returned: only "is FileList" and the status leave this module.
 
 use crate::services::arr_jobs::urlencode;
 use crate::services::{Client, UpResult, UpstreamError};
@@ -110,6 +110,18 @@ impl QbitJobs {
         let b = self.call(Method::GET, &format!("/api/v2/torrents/files?hash={}", urlencode(hash)), None).await?;
         let Ok(Value::Array(a)) = serde_json::from_slice::<Value>(&b) else { return Err(UpstreamError::Body) };
         a.iter().map(|f| f.get("name").and_then(Value::as_str).map(String::from).ok_or(UpstreamError::Body)).collect()
+    }
+
+    /// [`QbitJobs::files`] with each file's size in bytes.
+    pub async fn files_sized(&self, hash: &str) -> UpResult<Vec<(String, u64)>> {
+        let b = self.call(Method::GET, &format!("/api/v2/torrents/files?hash={}", urlencode(hash)), None).await?;
+        let Ok(Value::Array(a)) = serde_json::from_slice::<Value>(&b) else { return Err(UpstreamError::Body) };
+        a.iter()
+            .map(|f| {
+                let name = f.get("name").and_then(Value::as_str).ok_or(UpstreamError::Body)?;
+                Ok((name.to_string(), f.get("size").and_then(Value::as_u64).unwrap_or(0)))
+            })
+            .collect()
     }
 
     /// `POST /api/v2/torrents/delete` `hashes=<h>&deleteFiles=true`.

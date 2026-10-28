@@ -176,6 +176,12 @@ impl Arr {
         }
     }
 
+    /// Sonarr `GET /history/series?seriesId=<id>&eventType=<n>`: every record of one series
+    /// (not paged). `3` is `downloadFolderImported` (`data.droppedPath` is the download copy).
+    pub async fn series_history(&self, series_id: i64, event_type: i64) -> UpResult<Vec<Value>> {
+        as_array(self.get(&format!("/history/series?seriesId={series_id}&eventType={event_type}")).await?)
+    }
+
     /// Sonarr `PUT /episode/monitor` `{"episodeIds": [...], "monitored": true}`.
     pub async fn monitor_episodes(&self, ids: &[i64]) -> UpResult<()> {
         self.send(Method::PUT, "/episode/monitor", Some(&json!({"episodeIds": ids, "monitored": true}))).await?;

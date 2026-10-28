@@ -4,12 +4,15 @@
 //! - `notify` loop (Phase 2a): `logic::notify::spawn_notify_loop`.
 //! - [`watchlist`] sync every 3 min, [`strip_dv`] every 5 min, [`seed_keeper`] every 5 min
 //!   (Phase 2b; plan "New behaviour").
+//! - [`convert`]: the TV conversion, batches on request from the PC tab, its revert pass
+//!   every 5 min.
 //!
 //! Rules for every job: honour `app.dry_run` (never delete, import, remux or rescan in
 //! dry-run; only log what would happen), use the service URLs from the config (tests run
 //! the exe with every service on a closed port), and stop when [`Stop`] fires.
 
 pub mod common;
+pub mod convert;
 pub mod seed_keeper;
 pub mod strip_dv;
 pub mod watchlist;
@@ -70,7 +73,8 @@ pub fn spawn_all(app: Arc<AppState>, stop: Stop) {
     crate::logic::notify::spawn_notify_loop(app.clone(), stop.clone());
     watchlist::spawn(app.clone(), stop.clone());
     strip_dv::spawn(app.clone(), stop.clone());
-    seed_keeper::spawn(app, stop);
+    seed_keeper::spawn(app.clone(), stop.clone());
+    convert::spawn(app, stop);
 }
 
 #[cfg(test)]

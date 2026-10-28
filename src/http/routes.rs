@@ -159,6 +159,9 @@ async fn app_get(r: &Req, ctx: &ConnCtx, rc: &mut ReqCtx) -> Response<Body> {
             };
             return json(rc, 200, &status, &[]);
         }
+        if path == "/api/convert" {
+            return json(rc, 200, &crate::jobs::convert::api_status(app).await, &[]);
+        }
         return unknown(rc);
     }
     if path.starts_with("/img/") {
@@ -311,6 +314,18 @@ async fn app_post(r: &mut Req, ctx: &ConnCtx, rc: &mut ReqCtx) -> Option<Respons
         "/api/notify/test" => {
             log_info!("action notify/test from {ip}");
             let (code, out) = crate::logic::notify::send_test_notification(app).await;
+            json(rc, code, &out, &[])
+        }
+        "/api/convert/start" => {
+            let sid = body.get("seriesId").and_then(Value::as_i64).unwrap_or(0);
+            let n = body.get("count").and_then(Value::as_i64).unwrap_or(0);
+            log_info!("action convert/start series {sid} x{n} from {ip}");
+            let (code, out) = crate::jobs::convert::api_start(app, &body).await;
+            json(rc, code, &out, &[])
+        }
+        "/api/convert/stop" => {
+            log_info!("action convert/stop from {ip}");
+            let (code, out) = crate::jobs::convert::api_stop(app);
             json(rc, code, &out, &[])
         }
         "/api/settings" => {

@@ -228,6 +228,62 @@ fn no_pin_and_demo_login() {
     });
 }
 
+/// An app whose services all sit on a closed port (keys set inline, nothing real is read).
+fn closed_services_server(demo: bool) -> TestServer {
+    let dir = temp_dir("conv");
+    let base = format!("http://127.0.0.1:{}", common::free_port());
+    let cfg = json!({"services": {
+        "plex": {"url": base, "token": "t"}, "radarr": {"url": base, "api_key": "k"}, "sonarr": {"url": base, "api_key": "k"},
+        "bazarr": {"url": base, "api_key": "k"}, "prowlarr": {"url": base}, "qbittorrent": {"url": base}}});
+    std::fs::write(dir.join("cfg.json"), cfg.to_string()).unwrap();
+    let opts = AppOptions { dry_run: true, demo, ..Default::default() };
+    TestServer::start(Setup { dir: Some(dir), opts, ..Default::default() })
+}
+
+#[test]
+fn convert_routes() {
+    let srv = closed_services_server(false);
+    // login and CSRF like every other route
+    assert_eq!(srv.req("GET", "/api/convert").send().status, 401);
+    let start = json!({"seriesId": 4, "count": 2});
+    assert_eq!(srv.req("POST", "/api/convert/start").json(start.clone()).send().status, 401);
+    assert_eq!(srv.req("POST", "/api/convert/stop").send().status, 401);
+    let tok = srv.app.new_session(None);
+    let r = srv.req("POST", "/api/convert/start").cookie(&tok).no_csrf().json(start.clone()).send();
+    assert_eq!((r.status, r.json()), (403, json!({"error": "Cerere respinsă (CSRF)."})));
+    assert_eq!(srv.req("POST", "/api/convert/stop").cookie(&tok).no_csrf().send().status, 403);
+    // validation before any upstream call
+    for body in [json!({}), json!({"seriesId": 4, "count": 0}), json!({"seriesId": 4, "count": 21}), json!({"seriesId": "x", "count": 2})] {
+        let r = srv.req("POST", "/api/convert/start").cookie(&tok).json(body).send();
+        assert_eq!((r.status, r.json()), (400, json!({"error": "Cerere invalidă."})));
+    }
+    // Sonarr down: a message, never a crash
+    let r = srv.req("POST", "/api/convert/start").cookie(&tok).json(start).send();
+    assert_eq!((r.status, r.json()), (502, json!({"error": "Sonarr nu răspunde."})));
+    let r = srv.req("GET", "/api/convert").cookie(&tok).send();
+    assert_eq!(r.status, 200);
+    let v = r.json();
+    assert_eq!((v["error"].clone(), v["series"].clone(), v["job"].clone()), (json!("Sonarr nu răspunde."), Value::Null, Value::Null));
+    assert_eq!((v["max"].clone(), v["default"].clone()), (json!(20), json!(2)));
+    let r = srv.req("POST", "/api/convert/stop").cookie(&tok).send();
+    assert_eq!((r.status, r.json()), (409, json!({"error": "Nicio conversie nu rulează."})));
+    // the page has the section
+    let html = srv.req("GET", "/").send().text();
+    assert!(html.contains("id=\"h-convert\""));
+}
+
+#[test]
+fn convert_in_demo() {
+    let demo = closed_services_server(true);
+    let v = demo.req("GET", "/api/convert").send().json();
+    assert_eq!(v["demo"], json!(true));
+    assert!(!v["series"].as_array().unwrap().is_empty());
+    let r = demo.req("POST", "/api/convert/start").json(json!({"seriesId": 1, "count": 2})).send();
+    assert_eq!((r.status, r.json()["demo"].clone()), (200, json!(true)));
+    assert!(!demo.app.convert.running());
+    assert_eq!(demo.req("POST", "/api/convert/stop").send().status, 200);
+}
+
 #[test]
 fn install_page_redirects_and_ca() {
     let d = temp_dir("inst");

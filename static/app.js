@@ -24,6 +24,7 @@
   let afterMovie = null;
   let countdownTimer = null;
   let segment = 'lib';
+  let convertBusy = false;
 
   // ---------- formatting (Romanian: decimal comma, tabular figures in CSS) ----------
   const nf = (d) => new Intl.NumberFormat('ro-RO', { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -237,6 +238,7 @@
     for (const id of ['tile-shutdown', 'btn-shutdown', 'btn-restart']) $(id).disabled = off || !!pendingPower;
     $('sheet-confirm').disabled = off;
     $('sheet-after').disabled = off;
+    for (const b of $('convert').querySelectorAll('button')) b.disabled = off || convertBusy || b.dataset.off === '1';
   }
   function setOffline(on) {
     if (offline === on) return;
@@ -375,6 +377,7 @@
     if (location.hash === '#login') return showLogin();
     route();
     window.scrollTo(0, 0);
+    loadConvert(true);
   });
 
   // SegmentedControl: Bibliotecă / Urmează
@@ -411,6 +414,7 @@
       $('app').hidden = false;
       render(s);
       saveLast(s);
+      loadConvert();
     } catch (e) {
       if (e.message === 'auth') return;
       if (e.offline) {
@@ -581,6 +585,137 @@
     if (list == null) return fill(box, card(down('qBittorrent'), true));
     if (!list.length) return fill(box, card('Niciun torrent FileList la seed.'));
     fill(box, h('div', 'group', ...list.map(seedRow)));
+  }
+
+  // ---------- Conversie pentru TV (own endpoint, polled only on the PC tab) ----------
+  // Every 5 s while a batch runs or the list is loading, else every 30 s.
+  const CONVERT_IDLE_MS = 30000;
+  const RESULT_TEXT = { ok: 'gata', failed: 'eșuat', skipped: 'sărit', stopped: 'oprit', dry: 'probă' };
+  let convert = null;
+  let convertAt = 0;
+  let convertLoading = false;
+  let convertSel = null;
+  let convertCount = null;
+  const epText = (n) => (n === 1 ? '1 episod' : n >= 20 ? `${n} de episoade` : `${n} episoade`);
+
+  async function loadConvert(force) {
+    if (currentTab() !== 'pc' || convertLoading || $('app').hidden) return;
+    const fast = convert && ((convert.job && convert.job.running) || convert.loading);
+    if (!force && !fast && Date.now() - convertAt < CONVERT_IDLE_MS) return;
+    convertLoading = true;
+    try {
+      convert = await api('/api/convert');
+      convertAt = Date.now();
+      renderConvert();
+    } catch (e) {
+      if (e.message !== 'auth' && !e.offline && !convert) fill($('convert'), card(e.message, true));
+    } finally {
+      convertLoading = false;
+    }
+  }
+
+  function renderConvert() {
+    const c = convert;
+    if (!c) return;
+    const job = c.job;
+    const running = !!(job && job.running);
+    $('convert-meta').textContent = c.dry_run && !c.demo ? 'mod de probă' : 'pentru redare directă';
+    fill($('convert'), job && (running || job.summary) ? convertJob(job) : null, running ? null : convertList(c));
+    applyDisabled();
+  }
+
+  function convertJob(job) {
+    const cur = job.current;
+    let state = '';
+    if (job.running) state = cur ? `${cur.label}, ${n0.format(cur.percent || 0)}%` : 'pornește';
+    let line;
+    if (!job.running) line = job.summary || '';
+    else if (job.stopping) line = 'Se oprește.';
+    else line = job.remaining ? `Încă ${epText(job.remaining)} în coadă.` : 'Ultimul episod.';
+    const rows = [h('div', 'li',
+      h('div', 'li-head', h('span', 'tile-label', job.title || ''), h('span', 'data', state)),
+      job.running ? bar(cur ? cur.percent : 0) : null,
+      h('span', job.running ? 'meta muted' : 'meta', line))];
+    for (const it of job.items || []) {
+      const word = RESULT_TEXT[it.result] || it.result;
+      const tone = it.result === 'ok' ? ' ok' : it.result === 'failed' ? ' bad' : '';
+      rows.push(h('div', 'li conv-item', h('div', 'li-head',
+        h('span', 'data', it.label),
+        h('span', 'data' + tone, it.note && it.result !== 'ok' ? `${word}: ${it.note}` : word))));
+    }
+    let stop = null;
+    if (job.running && !job.stopping) {
+      stop = h('button', 'btn btn-danger', 'Oprește conversia');
+      stop.type = 'button';
+      stop.addEventListener('click', stopConvert);
+    }
+    return h('div', 'sec-body', h('div', 'group', ...rows), stop);
+  }
+
+  function stepButton(text, label, delta, off) {
+    const b = h('button', 'step', text);
+    b.type = 'button';
+    b.setAttribute('aria-label', label);
+    b.dataset.off = off ? '1' : '';
+    b.addEventListener('click', () => { convertCount += delta; renderConvert(); });
+    return b;
+  }
+
+  function convertList(c) {
+    if (c.error) return card(c.error, true);
+    if (c.series == null) return card('Se încarcă lista.');
+    if (!c.series.length) return card('Nimic de convertit: episoadele nevăzute merg direct pe TV.');
+    if (!c.series.some((s) => s.id === convertSel)) convertSel = c.series[0].id;
+    const sel = c.series.find((s) => s.id === convertSel);
+    const max = Math.max(1, Math.min(c.max || 20, sel.pending));
+    if (convertCount == null) convertCount = c.default || 2;
+    convertCount = Math.max(1, Math.min(convertCount, max));
+    const rows = c.series.map((s) => {
+      const b = h('button', 'li li-btn conv-row',
+        h('span', 'li-head', h('span', 'tile-label', s.title), h('span', 'data', epText(s.pending))),
+        h('span', 'meta muted', `Următorul: ${s.next}`));
+      b.type = 'button';
+      b.setAttribute('aria-pressed', String(s.id === convertSel));
+      b.addEventListener('click', () => { convertSel = s.id; renderConvert(); });
+      return b;
+    });
+    const value = h('span', 'data stepper-value', String(convertCount));
+    value.setAttribute('aria-live', 'polite');
+    const go = h('button', 'btn btn-primary', `Convertește ${epText(convertCount)}`);
+    go.type = 'button';
+    go.addEventListener('click', startConvert);
+    return h('div', 'sec-body',
+      h('div', 'group', ...rows),
+      h('div', 'conv-pick',
+        h('div', 'stepper', stepButton('−', 'Mai puține', -1, convertCount <= 1), value,
+          stepButton('+', 'Mai multe', 1, convertCount >= max)),
+        go),
+      h('p', 'meta muted', 'Pornesc de la primul episod nevăzut, în ordine. După ce îl vezi, '
+        + 'pun la loc fișierul din torrent.'));
+  }
+
+  async function convertAction(path, body, okText) {
+    if (convertBusy) return;
+    convertBusy = true;
+    applyDisabled();
+    try {
+      const r = await api(path, body);
+      toast(r.demo ? 'Mod demo: nu se convertește nimic.' : okText);
+      if (r.job && convert) { convert.job = r.job; renderConvert(); }
+    } catch (e) {
+      if (e.message !== 'auth') toast(e.message, true);
+    } finally {
+      convertBusy = false;
+      applyDisabled();
+      loadConvert(true);
+    }
+  }
+  function startConvert() {
+    if (convertSel == null) return;
+    convertAction('/api/convert/start', { seriesId: convertSel, count: convertCount }, 'Conversia a pornit.');
+  }
+  function stopConvert() {
+    convertAction('/api/convert/stop', {}, 'Conversia se oprește.');
   }
 
   function renderDisk(pc) {

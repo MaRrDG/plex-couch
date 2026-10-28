@@ -306,6 +306,36 @@ a { color: inherit; }
 .li-btn:not(:disabled):active { color: var(--muted); }
 .foot { display: grid; gap: var(--space-1); justify-items: start; }
 
+/* ---------- Conversie pentru TV: pickable ListGroup rows, a Stepper, the batch rows ---------- */
+.conv-row { display: grid; gap: 2px; padding: 12px 0; }
+.conv-row .li-head .data { color: var(--muted); }
+.conv-row[aria-pressed="true"] .tile-label { color: var(--accent); }
+.conv-pick { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--space-3); align-items: center; }
+.stepper {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--size-tap);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+.step {
+  width: var(--size-tap);
+  height: var(--size-tap);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--ink);
+  font-size: 20px;
+  line-height: 1;
+}
+.step:disabled { opacity: 0.45; }
+.step:not(:disabled):active { background: var(--surface-2); }
+.stepper-value { min-width: 2.5ch; text-align: center; color: var(--ink); }
+.conv-item { padding: 8px 0; }
+.conv-item .li-head .data { white-space: normal; text-align: right; }
+.conv-item .li-head .data:first-child { color: var(--ink); flex: none; }
+.li-head .data.bad { color: var(--danger); }
+
 /* ---------- Banners (offline, CountdownBanner) ---------- */
 .banner {
   background: var(--surface);
