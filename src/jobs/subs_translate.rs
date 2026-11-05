@@ -36,12 +36,20 @@
 //!   24 h, a manual one is reported (page + ntfy) and left to the user.
 //! - Never overwrites a non-empty `.ro.srt`, never touches the video, writes only in its
 //!   folder. Dry-run: only logged, nothing written, no PATCH.
+//! - Plex sees the new `.ro.srt` but keeps playing the default (English) track, so the video
+//!   goes on a persisted list ([`RoSelect`], also fed by convert and strip-dv when they
+//!   rewrite a video that has a `.ro.srt`, see [`ro_select_after_rewrite`]). Every paced tick
+//!   ([`select_ro`]) looks each one up in Plex (one library listing per section): no subtitle
+//!   chosen yet and a `ron` stream there -> `PUT /library/parts/<id>?subtitleStreamID=..`;
+//!   RO already chosen or another subtitle chosen (the user's choice, never overridden) ->
+//!   dropped; not in Plex yet or no `ron` stream yet -> tried again next tick, given up after
+//!   [`RO_SELECT_MAX_AGE`].
 
 use crate::app::AppState;
-use crate::jobs::common::{ffmpeg_bin, job_cfg, quiet_command, run_capture, Quiet};
+use crate::jobs::common::{ffmpeg_bin, job_cfg, quiet_command, run_capture, unix_now, Quiet};
 use crate::jobs::subs::Cand;
 use crate::services::arr_jobs::urlencode;
-use crate::services::plex_jobs::{path_key, PlexJobs};
+use crate::services::plex_jobs::{path_key, PartRef, PlexJobs, SubStream};
 use crate::{log_info, log_warning};
 use regex::Regex;
 use serde_json::{json, Map, Value};
@@ -52,8 +60,15 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// `state.local.json` key: `{"day", "count", "last", "items": {key: {"tries", "next", "why"}},
-/// "inflight": {...} | null}`.
+/// "inflight": {...} | null, "ro_select": [{"path", "section", "movie", "since"}]}`.
 pub const TR_KEY: &str = "subs_translate";
+/// A video still not found in Plex with a RO stream after this is dropped from the list.
+pub const RO_SELECT_MAX_AGE: f64 = 24.0 * 3600.0;
+/// A video is looked up in Plex only this long after it went on the list (Plex rescans the
+/// folder on its own time; a rewritten file must not be judged on its old streams).
+pub const RO_SELECT_SETTLE: f64 = 60.0;
+/// Video extensions next to which Bazarr writes `<stem>.ro.srt` ([`video_of`]).
+const VIDEO_EXTS: [&str; 9] = ["mkv", "mp4", "m4v", "avi", "ts", "m2ts", "mov", "wmv", "webm"];
 /// Waits after the 1st, 2nd and every later failed translation of the same item.
 pub const TR_BACKOFF: [f64; 3] = [3600.0, 6.0 * 3600.0, 24.0 * 3600.0];
 /// No English source (or no video file): look again after a day.
@@ -341,6 +356,16 @@ pub fn sibling(video: &Path, suffix: &str) -> PathBuf {
     video.with_file_name(format!("{stem}.{suffix}"))
 }
 
+/// The video whose [`sibling`] `ro.srt` is `ro` (a video file in the same folder), if any.
+pub fn video_of(ro: &Path) -> Option<PathBuf> {
+    let want = path_key(&ro.to_string_lossy());
+    fs::read_dir(ro.parent()?)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()).is_some_and(|x| VIDEO_EXTS.contains(&x.to_ascii_lowercase().as_str())))
+        .find(|p| p.is_file() && path_key(&sibling(p, &format!("{}.srt", crate::jobs::subs::LANGUAGE)).to_string_lossy()) == want)
+}
+
 fn non_empty(p: &Path) -> bool {
     fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0)
 }
@@ -590,6 +615,34 @@ pub struct TrState {
     /// The kind of the last one started (`ep` / `movie`), to take turns.
     pub last: String,
     pub inflight: Option<InFlight>,
+    /// Videos whose RO subtitle Plex should be told to play ([`select_ro`]), one per
+    /// [`path_key`].
+    pub ro_select: Vec<RoSelect>,
+}
+
+/// A video whose `.ro.srt` Plex should select: its Plex section, movie or episode (which
+/// listing finds it), when it went on the list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoSelect {
+    pub path: String,
+    pub section: u32,
+    pub movie: bool,
+    pub since: f64,
+}
+
+impl RoSelect {
+    fn to_json(&self) -> Value {
+        json!({"path": self.path, "section": self.section, "movie": self.movie, "since": self.since})
+    }
+
+    fn from_json(v: &Value) -> Option<RoSelect> {
+        Some(RoSelect {
+            path: v.get("path")?.as_str().filter(|p| !p.is_empty())?.to_string(),
+            section: v.get("section")?.as_u64()? as u32,
+            movie: v.get("movie").and_then(Value::as_bool).unwrap_or(false),
+            since: v.get("since")?.as_f64()?,
+        })
+    }
 }
 
 impl TrState {
@@ -607,20 +660,41 @@ impl TrState {
                     .collect()
             })
             .unwrap_or_default();
-        TrState {
+        let mut tr = TrState {
             items,
             day: v.get("day").and_then(Value::as_str).unwrap_or("").to_string(),
             count: v.get("count").and_then(Value::as_u64).unwrap_or(0) as u32,
             last: v.get("last").and_then(Value::as_str).unwrap_or("").to_string(),
             inflight: v.get("inflight").and_then(InFlight::from_json),
+            ro_select: Vec::new(),
+        };
+        // Missing (a state file from before the list): empty.
+        for e in v.get("ro_select").and_then(Value::as_array).into_iter().flatten().filter_map(RoSelect::from_json) {
+            tr.want_ro_select(e);
         }
+        tr
     }
 
     pub fn to_json(&self) -> Value {
         let items: Map<String, Value> =
             self.items.iter().map(|(k, x)| (k.clone(), json!({"tries": x.tries, "next": x.next, "why": x.why}))).collect();
         json!({"day": self.day, "count": self.count, "last": self.last, "items": items,
-               "inflight": self.inflight.as_ref().map_or(Value::Null, InFlight::to_json)})
+               "inflight": self.inflight.as_ref().map_or(Value::Null, InFlight::to_json),
+               "ro_select": self.ro_select.iter().map(RoSelect::to_json).collect::<Vec<_>>()})
+    }
+
+    /// Put `e` on the RO-select list; a video already there (same [`path_key`]) takes the new
+    /// section and kind and the later `since`.
+    pub fn want_ro_select(&mut self, e: RoSelect) {
+        let key = path_key(&e.path);
+        match self.ro_select.iter_mut().find(|x| path_key(&x.path) == key) {
+            Some(x) => {
+                x.section = e.section;
+                x.movie = e.movie;
+                x.since = x.since.max(e.since);
+            }
+            None => self.ro_select.push(e),
+        }
     }
 
     /// Not waiting for a backoff and not the one in flight.
@@ -988,6 +1062,10 @@ pub async fn poll(app: &AppState, tr: &mut TrState, cfg: &TrSettings, tv_section
                 if let Err(e) = PlexJobs::new(app.services.plex.c.clone()).refresh_path(section, &dir).await {
                     log_warning!("subs: Plex refresh failed: {}", e.type_name());
                 }
+                // Plex picks the new stream up on its own time; [`select_ro`] makes it the one played.
+                if let Some(video) = video_of(&ro) {
+                    tr.want_ro_select(RoSelect { path: video.to_string_lossy().into_owned(), section, movie: f.movie_id != 0, since: now });
+                }
             }
             log_info!("subs: RO subtitle translated for {name}");
             if cfg.notify {
@@ -1021,6 +1099,157 @@ pub async fn poll(app: &AppState, tr: &mut TrState, cfg: &TrSettings, tv_section
     app.convert.invalidate_list();
     app.services.bazarr.clear_cache();
     true
+}
+
+// -- the RO subtitle chosen in Plex --------------------------------------------------------
+
+/// What to do with a part, from its subtitle streams.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RoPick {
+    /// No subtitle chosen, a RO stream there: choose this stream id.
+    Select(i64),
+    /// The RO stream is the chosen one already.
+    Done,
+    /// Another subtitle is chosen (the user's choice): left as is.
+    Skipped,
+    /// No RO stream yet (Plex has not seen the file): later.
+    NotYet,
+}
+
+/// What became of one video on the list this tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RoOutcome {
+    Selected,
+    Done,
+    Skipped,
+    /// Kept for the next tick: not in Plex yet, no RO stream yet, or Plex failed.
+    NotYet,
+}
+
+fn is_ro(s: &SubStream) -> bool {
+    matches!(s.language.to_ascii_lowercase().as_str(), "ron" | "rum" | "ro")
+}
+
+/// [`RoPick`] for a part's subtitle streams; of several RO streams the external one (our
+/// `.ro.srt`) wins.
+pub fn ro_pick(subs: &[SubStream]) -> RoPick {
+    if let Some(chosen) = subs.iter().find(|s| s.selected) {
+        return if is_ro(chosen) { RoPick::Done } else { RoPick::Skipped };
+    }
+    match subs.iter().find(|s| is_ro(s) && s.external).or_else(|| subs.iter().find(|s| is_ro(s))) {
+        Some(s) => RoPick::Select(s.id),
+        None => RoPick::NotYet,
+    }
+}
+
+fn video_name(path: &str) -> String {
+    ascii(&Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())
+}
+
+/// Convert or strip-dv rewrote `file` (Plex section `section`): if it has a non-empty
+/// `.ro.srt`, the subs job selects it in Plex again (the rewrite may reset the choice).
+/// Nothing without a Plex token.
+pub fn ro_select_after_rewrite(app: &AppState, file: &Path, section: u32, movie: bool) {
+    if app.services.keys.get("plex").is_empty() || !non_empty(&sibling(file, &format!("{}.srt", crate::jobs::subs::LANGUAGE))) {
+        return;
+    }
+    app.subs.note_ro_select(RoSelect { path: file.to_string_lossy().into_owned(), section, movie, since: unix_now() });
+}
+
+/// One video: find its part in `parts`, read its subtitle streams, choose the RO one.
+async fn select_one(app: &AppState, plex: &PlexJobs, quiet: &mut Quiet, parts: &HashMap<String, PartRef>, e: &RoSelect) -> RoOutcome {
+    let Some(p) = parts.get(&path_key(&e.path)) else { return RoOutcome::NotYet };
+    let name = video_name(&e.path);
+    let subs = match plex.part_subtitles(&p.rating_key, p.part_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return RoOutcome::NotYet,
+        Err(err) => {
+            quiet.warn("ro-select", format!("subs: Plex failed ({}), the RO subtitle is selected later", err.type_name()));
+            return RoOutcome::NotYet;
+        }
+    };
+    match ro_pick(&subs) {
+        RoPick::Select(_) if app.dry_run => {
+            log_info!("subs (dry-run): would select the RO subtitle in Plex for {name}");
+            RoOutcome::Selected
+        }
+        RoPick::Select(stream) => match plex.select_subtitle(p.part_id, stream).await {
+            Ok(()) => {
+                quiet.clear("ro-select");
+                log_info!("subs: selected the RO subtitle in Plex for {name}");
+                RoOutcome::Selected
+            }
+            Err(err) => {
+                quiet.warn("ro-select", format!("subs: Plex failed ({}), the RO subtitle is selected later", err.type_name()));
+                RoOutcome::NotYet
+            }
+        },
+        RoPick::Done => RoOutcome::Done,
+        RoPick::Skipped => {
+            log_info!("subs: {name} already has a subtitle chosen in Plex, left as is");
+            RoOutcome::Skipped
+        }
+        RoPick::NotYet => RoOutcome::NotYet,
+    }
+}
+
+/// The RO-select list: take what convert / strip-dv noted, drop what is older than
+/// [`RO_SELECT_MAX_AGE`], then look up every entry older than [`RO_SELECT_SETTLE`] (one
+/// library listing per section and kind) and select its RO subtitle ([`RoPick`]). Only
+/// [`RoOutcome::NotYet`] stays. No Plex token: nothing looked up. True: the list changed.
+pub async fn select_ro(app: &AppState, tr: &mut TrState, quiet: &mut Quiet, now: f64) -> bool {
+    let mut changed = false;
+    for e in app.subs.take_ro_select() {
+        tr.want_ro_select(e);
+        changed = true;
+    }
+    let before = tr.ro_select.len();
+    tr.ro_select.retain(|e| {
+        let fresh = now - e.since <= RO_SELECT_MAX_AGE;
+        if !fresh {
+            log_info!("subs: {} has no RO subtitle in Plex after a day, not selected", video_name(&e.path));
+        }
+        fresh
+    });
+    changed |= tr.ro_select.len() != before;
+    if tr.ro_select.is_empty() || app.services.keys.get("plex").is_empty() {
+        return changed;
+    }
+    let plex = PlexJobs::new(app.services.plex.c.clone());
+    let mut listings: HashMap<(u32, bool), Option<HashMap<String, PartRef>>> = HashMap::new();
+    let mut keep = Vec::new();
+    for e in std::mem::take(&mut tr.ro_select) {
+        if now - e.since < RO_SELECT_SETTLE {
+            keep.push(e);
+            continue;
+        }
+        let lk = (e.section, e.movie);
+        if let std::collections::hash_map::Entry::Vacant(slot) = listings.entry(lk) {
+            let qk = format!("ro-select-{}-{}", e.section, e.movie);
+            let listing = match plex.part_refs(e.section, !e.movie).await {
+                Ok(m) => {
+                    quiet.clear(&qk);
+                    Some(m)
+                }
+                Err(err) => {
+                    quiet.warn(&qk, format!("subs: Plex section {} failed ({}), the RO subtitle is selected later", e.section, err.type_name()));
+                    None
+                }
+            };
+            slot.insert(listing);
+        }
+        let outcome = match &listings[&lk] {
+            Some(parts) => select_one(app, &plex, quiet, parts, &e).await,
+            None => RoOutcome::NotYet,
+        };
+        if outcome == RoOutcome::NotYet {
+            keep.push(e);
+        } else {
+            changed = true;
+        }
+    }
+    tr.ro_select = keep;
+    changed
 }
 
 #[cfg(test)]
@@ -1267,5 +1496,236 @@ mod tests {
         assert_eq!(tr_backoff(1), 3600.0);
         assert_eq!(tr_backoff(2), 21600.0);
         assert_eq!(tr_backoff(7), 86400.0);
+    }
+
+    // -- the RO subtitle chosen in Plex ----------------------------------------------------
+
+    use crate::jobs::testutil::{app, fake, ok, status, Fake, Req};
+    use std::sync::Mutex;
+
+    fn entry(path: &str, section: u32, movie: bool, since: f64) -> RoSelect {
+        RoSelect { path: path.into(), section, movie, since }
+    }
+
+    fn stream(id: i64, lang: &str, selected: bool, external: bool) -> Value {
+        let mut s = json!({"id": id, "streamType": 3, "languageCode": lang});
+        if selected {
+            s["selected"] = json!(true);
+        }
+        if external {
+            s["key"] = json!(format!("/library/streams/{id}"));
+        }
+        s
+    }
+
+    fn ss(id: i64, lang: &str, selected: bool, external: bool) -> SubStream {
+        SubStream { id, language: lang.into(), selected, external }
+    }
+
+    /// One Plex item: section, file as Plex lists it, ratingKey, part id, subtitle streams.
+    type Item = (u32, &'static str, &'static str, i64, Vec<Value>);
+
+    /// A Plex that lists `items` per section, answers their metadata (500 if `meta_fails`)
+    /// and accepts every PUT.
+    async fn plex(items: Vec<Item>, meta_fails: bool) -> Fake {
+        let items = Arc::new(Mutex::new(items));
+        fake(move |r: &Req| {
+            let p = r.path.as_str();
+            let items = items.lock().unwrap();
+            if r.method == "PUT" && p.starts_with("/library/parts/") {
+                return status(200);
+            }
+            if let Some(rest) = p.strip_prefix("/library/sections/") {
+                let n: u32 = rest.split('/').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let md: Vec<Value> = items
+                    .iter()
+                    .filter(|i| i.0 == n)
+                    .map(|i| json!({"ratingKey": i.2, "Media": [{"Part": [{"id": i.3, "file": i.1}]}]}))
+                    .collect();
+                return ok(json!({"MediaContainer": {"Metadata": md}}));
+            }
+            if let Some(rk) = p.strip_prefix("/library/metadata/") {
+                if meta_fails {
+                    return status(500);
+                }
+                let Some(i) = items.iter().find(|i| i.2 == rk) else { return status(404) };
+                let mut streams = vec![json!({"id": 1000, "streamType": 1}), json!({"id": 1001, "streamType": 2, "selected": true})];
+                streams.extend(i.4.iter().cloned());
+                return ok(json!({"MediaContainer": {"Metadata": [{"ratingKey": i.2, "Media": [{"Part": [{"id": i.3, "file": i.1, "Stream": streams}]}]}]}}));
+            }
+            status(404)
+        })
+        .await
+    }
+
+    fn puts(f: &Fake) -> Vec<String> {
+        f.find("PUT", "/library/parts/").into_iter().map(|r| r.path).collect()
+    }
+
+    fn paths(tr: &TrState) -> Vec<&str> {
+        tr.ro_select.iter().map(|e| e.path.as_str()).collect()
+    }
+
+    #[test]
+    fn ro_pick_choices() {
+        // Nothing chosen: the RO stream, the external one first.
+        assert_eq!(ro_pick(&[ss(1, "eng", false, false), ss(2, "ron", false, false), ss(3, "ron", false, true)]), RoPick::Select(3));
+        assert_eq!(ro_pick(&[ss(1, "eng", false, false), ss(2, "RON", false, false)]), RoPick::Select(2));
+        assert_eq!(ro_pick(&[ss(1, "eng", false, false), ss(2, "ron", true, true)]), RoPick::Done);
+        assert_eq!(ro_pick(&[ss(1, "eng", true, false), ss(2, "ron", false, true)]), RoPick::Skipped);
+        assert_eq!(ro_pick(&[ss(1, "eng", false, false)]), RoPick::NotYet);
+        assert_eq!(ro_pick(&[]), RoPick::NotYet);
+    }
+
+    #[tokio::test]
+    async fn ro_select_selects_skips_and_keeps() {
+        let now = 1_000_000.0;
+        let f = plex(
+            vec![
+                // Nothing chosen, RO there (Plex lists the path in another case and with `/`).
+                (2, "d:/tv/show/a.mkv", "10", 100, vec![stream(1, "eng", false, false), stream(2, "ron", false, true)]),
+                // RO chosen already.
+                (2, "D:\\TV\\Show\\B.mkv", "11", 101, vec![stream(3, "eng", false, false), stream(4, "ron", true, true)]),
+                // The user chose English.
+                (2, "D:\\TV\\Show\\C.mkv", "12", 102, vec![stream(5, "eng", true, false), stream(6, "ron", false, true)]),
+                // No RO stream yet.
+                (2, "D:\\TV\\Show\\D.mkv", "13", 103, vec![stream(7, "eng", false, false)]),
+                // Older than a day.
+                (2, "D:\\TV\\Show\\F.mkv", "15", 105, vec![stream(9, "ron", false, true)]),
+                // Just added: Plex gets time to rescan.
+                (2, "D:\\TV\\Show\\G.mkv", "16", 106, vec![stream(10, "ron", false, true)]),
+                // A movie, in its own section (listed without type=4).
+                (1, "D:\\Movies\\M.mkv", "20", 200, vec![stream(11, "ron", false, false), stream(12, "eng", false, false)]),
+            ],
+            false,
+        )
+        .await;
+        let (a, _d) = app(&f.base, false, json!({}));
+        let mut tr = TrState::default();
+        for e in [
+            entry("D:\\TV\\Show\\A.mkv", 2, false, now - 600.0),
+            entry("D:\\TV\\Show\\B.mkv", 2, false, now - 600.0),
+            entry("D:\\TV\\Show\\C.mkv", 2, false, now - 600.0),
+            entry("D:\\TV\\Show\\D.mkv", 2, false, now - 600.0),
+            // Not in Plex yet.
+            entry("D:\\TV\\Show\\E.mkv", 2, false, now - 600.0),
+            entry("D:\\TV\\Show\\F.mkv", 2, false, now - RO_SELECT_MAX_AGE - 1.0),
+            entry("D:\\TV\\Show\\G.mkv", 2, false, now - 10.0),
+            entry("D:\\Movies\\M.mkv", 1, true, now - 600.0),
+        ] {
+            tr.want_ro_select(e);
+        }
+        let mut quiet = Quiet::default();
+        assert!(select_ro(&a, &mut tr, &mut quiet, now).await);
+        assert_eq!(puts(&f), ["/library/parts/100?subtitleStreamID=2&allParts=1", "/library/parts/200?subtitleStreamID=11&allParts=1"]);
+        assert!(f.find("PUT", "/").iter().all(|r| r.header("X-Plex-Token") == Some("plex-tok")));
+        assert_eq!(paths(&tr), ["D:\\TV\\Show\\D.mkv", "D:\\TV\\Show\\E.mkv", "D:\\TV\\Show\\G.mkv"]);
+        // One listing per section, episodes for the TV one.
+        let lists: Vec<String> = f.find("GET", "/library/sections/").into_iter().map(|r| r.path).collect();
+        assert_eq!(lists, ["/library/sections/2/all?type=4", "/library/sections/1/all"]);
+        // Neither the stale nor the fresh one was looked up.
+        assert!(f.find("GET", "/library/metadata/15").is_empty() && f.find("GET", "/library/metadata/16").is_empty());
+
+        // Next tick: G is due and selected; D and E wait on.
+        assert!(select_ro(&a, &mut tr, &mut quiet, now + 180.0).await);
+        assert_eq!(puts(&f).last().map(String::as_str), Some("/library/parts/106?subtitleStreamID=10&allParts=1"));
+        assert_eq!(paths(&tr), ["D:\\TV\\Show\\D.mkv", "D:\\TV\\Show\\E.mkv"]);
+        // Nothing changes while they are not in Plex.
+        assert!(!select_ro(&a, &mut tr, &mut quiet, now + 360.0).await);
+        assert_eq!(tr.ro_select.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ro_select_dry_run_and_plex_errors() {
+        let now = 1_000_000.0;
+        let a_item = || vec![(2, "D:\\TV\\A.mkv", "10", 100, vec![stream(1, "eng", false, false), stream(2, "ron", false, true)])];
+        let mut quiet = Quiet::default();
+        // Dry-run: only logged, dropped.
+        let f = plex(a_item(), false).await;
+        let (a, _d) = app(&f.base, true, json!({}));
+        let mut tr = TrState { ro_select: vec![entry("D:\\TV\\A.mkv", 2, false, now - 600.0)], ..Default::default() };
+        assert!(select_ro(&a, &mut tr, &mut quiet, now).await);
+        assert!(f.mutations().is_empty());
+        assert!(tr.ro_select.is_empty());
+        // The metadata call fails: kept, nothing sent.
+        let f = plex(a_item(), true).await;
+        let (a, _d) = app(&f.base, false, json!({}));
+        let mut tr = TrState { ro_select: vec![entry("D:\\TV\\A.mkv", 2, false, now - 600.0)], ..Default::default() };
+        assert!(!select_ro(&a, &mut tr, &mut quiet, now).await);
+        assert!(f.mutations().is_empty());
+        assert_eq!(tr.ro_select.len(), 1);
+        // Plex is down (the listing fails): kept.
+        let f = fake(|_r: &Req| status(503)).await;
+        let (a, _d) = app(&f.base, false, json!({}));
+        assert!(!select_ro(&a, &mut tr, &mut quiet, now).await);
+        assert_eq!(tr.ro_select.len(), 1);
+        // The PUT fails: kept.
+        let f = fake(|r: &Req| {
+            if r.method == "PUT" {
+                return status(500);
+            }
+            if r.path.starts_with("/library/sections/") {
+                return ok(json!({"MediaContainer": {"Metadata": [{"ratingKey": "10", "Media": [{"Part": [{"id": 100, "file": "D:\\TV\\A.mkv"}]}]}]}}));
+            }
+            ok(json!({"MediaContainer": {"Metadata": [{"Media": [{"Part": [{"id": 100, "Stream": [stream(2, "ron", false, true)]}]}]}]}}))
+        })
+        .await;
+        let (a, _d) = app(&f.base, false, json!({}));
+        assert!(!select_ro(&a, &mut tr, &mut quiet, now).await);
+        assert_eq!(puts(&f), ["/library/parts/100?subtitleStreamID=2&allParts=1"]);
+        assert_eq!(tr.ro_select.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rewritten_videos_with_a_ro_srt_are_noted() {
+        let f = plex(vec![], false).await;
+        let (a, d) = app(&f.base, false, json!({}));
+        let with = d.join("Film.mkv");
+        let without = d.join("Other.mkv");
+        fs::write(&with, b"video").unwrap();
+        fs::write(&without, b"video").unwrap();
+        fs::write(sibling(&with, "ro.srt"), b"1\n").unwrap();
+        fs::write(sibling(&without, "ro.srt"), b"").unwrap(); // Bazarr's empty placeholder
+        ro_select_after_rewrite(&a, &with, 1, true);
+        ro_select_after_rewrite(&a, &without, 1, true);
+        // The subs job takes them over on its next tick (too fresh to look up yet).
+        let mut tr = TrState::default();
+        assert!(select_ro(&a, &mut tr, &mut Quiet::default(), unix_now()).await);
+        assert_eq!(paths(&tr), [with.to_string_lossy()]);
+        assert!(tr.ro_select[0].movie && tr.ro_select[0].section == 1);
+        assert!(a.subs.take_ro_select().is_empty());
+        assert!(f.requests().is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn video_of_inverts_sibling() {
+        let d = crate::jobs::testutil::temp_dir("ro-video");
+        let v = d.join("Show - S01E02.mkv");
+        fs::write(&v, b"video").unwrap();
+        fs::write(d.join("Show - S01E02.en.srt"), b"x").unwrap();
+        fs::write(d.join("Show - S01E03.mkv"), b"video").unwrap();
+        assert_eq!(video_of(&sibling(&v, "ro.srt")), Some(v.clone()));
+        assert_eq!(video_of(&d.join("Show - S01E09.ro.srt")), None);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ro_select_state() {
+        let mut tr = TrState::default();
+        tr.want_ro_select(entry("D:\\TV\\A.mkv", 2, false, 100.0));
+        tr.want_ro_select(entry("d:/tv/a.mkv", 2, false, 50.0)); // the same file: the later `since` stays
+        tr.want_ro_select(entry("D:\\Movies\\M.mkv", 1, true, 70.0));
+        assert_eq!(tr.ro_select, [entry("D:\\TV\\A.mkv", 2, false, 100.0), entry("D:\\Movies\\M.mkv", 1, true, 70.0)]);
+        // Round trip.
+        let v = tr.to_json();
+        assert_eq!(v["ro_select"][1], json!({"path": "D:\\Movies\\M.mkv", "section": 1, "movie": true, "since": 70.0}));
+        assert_eq!(TrState::from_json(Some(&v)), tr);
+        // A state file from before the list: empty. Broken entries are skipped, duplicates merged.
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("ro_select");
+        assert!(TrState::from_json(Some(&old)).ro_select.is_empty());
+        old["ro_select"] = json!([{"path": "D:\\TV\\A.mkv", "section": 2, "since": 1.0}, {"path": "d:/TV/a.mkv", "section": 2, "since": 5.0}, {"section": 2, "since": 1.0}, {"path": "x", "since": 1.0}]);
+        assert_eq!(TrState::from_json(Some(&old)).ro_select, [entry("D:\\TV\\A.mkv", 2, false, 5.0)]);
     }
 }
