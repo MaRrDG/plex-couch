@@ -33,7 +33,8 @@ use crate::app::AppState;
 use crate::jobs::common::{id_of, unix_now, Quiet};
 use crate::jobs::subs::{episode_key, movie_key, Cand};
 use crate::jobs::subs_translate::{
-    bazarr_gate, local_today, manual_gate, prepare, translator_ready, InFlight, Prep, SubTools, TrSettings, TrState, When, TR_KEY,
+    bazarr_gate, local_today, manual_gate, prepare, translator_ready, InFlight, Prep, RoSelect, SubTools, TrSettings, TrState, When,
+    TR_KEY,
 };
 use crate::log_info;
 use serde_json::{json, Map, Value};
@@ -268,6 +269,9 @@ pub struct Manual {
     /// Notified on every enqueue; the subs job selects on it.
     pub wake: tokio::sync::Notify,
     translator: Mutex<Option<(Instant, Option<bool>)>>,
+    /// Videos convert / strip-dv rewrote that have a `.ro.srt`: the subs job moves them to
+    /// its persisted RO-select list on its next paced tick.
+    ro_select: Mutex<Vec<RoSelect>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -405,6 +409,16 @@ impl Manual {
     pub fn busy(&self) -> bool {
         let sh = lock(&self.inner);
         !sh.queue.is_empty() || sh.tr.inflight.is_some()
+    }
+
+    /// A video whose RO subtitle Plex should select again (convert / strip-dv rewrote it).
+    pub fn note_ro_select(&self, e: RoSelect) {
+        lock(&self.ro_select).push(e);
+    }
+
+    /// The videos noted since the last call (the subs job).
+    pub fn take_ro_select(&self) -> Vec<RoSelect> {
+        std::mem::take(&mut *lock(&self.ro_select))
     }
 
     /// The job read Bazarr's translator settings.

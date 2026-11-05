@@ -533,6 +533,8 @@ impl Worker<'_> {
         let Some(lib) = self.library_of(file).cloned() else { return Ok(()) };
         let dir = file.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
         let app = self.app;
+        // The new file may lose the RO subtitle chosen in Plex: the subs job selects it again.
+        crate::jobs::subs_translate::ro_select_after_rewrite(app, file, lib.section, lib.arr == "radarr");
         let dir_key = path_key(&dir);
         self.rt.block_on(async {
             let sonarr = lib.arr == "sonarr";

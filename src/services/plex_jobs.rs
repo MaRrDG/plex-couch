@@ -1,5 +1,5 @@
 //! Job-only Plex calls: library items with their file paths and `viewCount`, a path
-//! refresh, and the plex.tv Watchlist. The token goes in the `X-Plex-Token` header only
+//! refresh, a part's subtitle streams and their selection, and the plex.tv Watchlist. The token goes in the `X-Plex-Token` header only
 //! (plan fix 24) and is never logged.
 
 use crate::services::arr_jobs::urlencode;
@@ -57,6 +57,25 @@ impl WatchItem {
     }
 }
 
+/// A media part as the library listing shows it: its item's `ratingKey` and the part `id`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartRef {
+    pub rating_key: String,
+    pub part_id: i64,
+}
+
+/// One subtitle stream of a part (`/library/metadata/<ratingKey>`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubStream {
+    pub id: i64,
+    /// `languageCode` (ISO 639-2, e.g. `ron`, `eng`), empty if Plex gives none.
+    pub language: String,
+    /// The one Plex plays.
+    pub selected: bool,
+    /// A sidecar file (it has a `key`), e.g. our `<video>.ro.srt`.
+    pub external: bool,
+}
+
 /// `D:\x\y.mkv` and `d:/X/y.mkv` compare equal (Windows paths are case-insensitive).
 pub fn path_key(p: &str) -> String {
     p.trim().replace('/', "\\").trim_end_matches('\\').to_lowercase()
@@ -84,24 +103,93 @@ impl PlexJobs {
     /// [`PlexJobs::view_counts`] with `lastViewedAt` (unix seconds, 0 if never):
     /// `path_key(file) -> (viewCount, lastViewedAt)`.
     pub async fn view_info(&self, section: u32, episodes: bool) -> UpResult<HashMap<String, (i64, i64)>> {
+        let mut out = HashMap::new();
+        self.each_part(section, episodes, |m, file, _| {
+            let views = m.get("viewCount").and_then(Value::as_i64).unwrap_or(0);
+            let last = m.get("lastViewedAt").and_then(Value::as_i64).unwrap_or(0);
+            out.insert(path_key(file), (views, last));
+        })
+        .await?;
+        Ok(out)
+    }
+
+    /// The same listing as [`PlexJobs::view_info`]: `path_key(file) -> (ratingKey, part id)`
+    /// for every media part (a part without a ratingKey or an id is left out).
+    pub async fn part_refs(&self, section: u32, episodes: bool) -> UpResult<HashMap<String, PartRef>> {
+        let mut out = HashMap::new();
+        self.each_part(section, episodes, |m, file, part| {
+            let rating_key = m.get("ratingKey").and_then(|v| v.as_str().map(String::from).or_else(|| v.as_i64().map(|n| n.to_string())));
+            if let (Some(rating_key), Some(part_id)) = (rating_key.filter(|k| !k.is_empty()), part.get("id").and_then(Value::as_i64)) {
+                out.insert(path_key(file), PartRef { rating_key, part_id });
+            }
+        })
+        .await?;
+        Ok(out)
+    }
+
+    /// `GET {plex.url}/library/sections/<n>/all[?type=4]`, then `f(item, file, part)` for
+    /// every media part with a file. `episodes` lists episodes (type 4) instead of top-level
+    /// items.
+    async fn each_part(&self, section: u32, episodes: bool, mut f: impl FnMut(&Value, &str, &Value)) -> UpResult<()> {
         let token = self.c.keys.get("plex");
         let q = if episodes { "?type=4" } else { "" };
         let url = self.c.url("plex", &format!("/library/sections/{section}/all{q}"));
         let v = self.c.http.get_json(&url, &Self::headers(&token), PLEX_TIMEOUT).await?.ok_or(UpstreamError::Body)?;
         let mc = v.get("MediaContainer").ok_or(UpstreamError::Body)?;
-        let mut out = HashMap::new();
         for m in mc.get("Metadata").and_then(Value::as_array).into_iter().flatten() {
-            let views = m.get("viewCount").and_then(Value::as_i64).unwrap_or(0);
-            let last = m.get("lastViewedAt").and_then(Value::as_i64).unwrap_or(0);
             for media in m.get("Media").and_then(Value::as_array).into_iter().flatten() {
                 for part in media.get("Part").and_then(Value::as_array).into_iter().flatten() {
-                    if let Some(f) = part.get("file").and_then(Value::as_str) {
-                        out.insert(path_key(f), (views, last));
+                    if let Some(file) = part.get("file").and_then(Value::as_str) {
+                        f(m, file, part);
                     }
                 }
             }
         }
-        Ok(out)
+        Ok(())
+    }
+
+    /// `GET {plex.url}/library/metadata/<ratingKey>`: the subtitle streams (`streamType` 3)
+    /// of the part `part_id`; None if the item has no such part.
+    pub async fn part_subtitles(&self, rating_key: &str, part_id: i64) -> UpResult<Option<Vec<SubStream>>> {
+        let token = self.c.keys.get("plex");
+        if token.is_empty() {
+            return Err(UpstreamError::Other("no Plex token"));
+        }
+        let url = self.c.url("plex", &format!("/library/metadata/{}", urlencode(rating_key)));
+        let v = self.c.http.get_json(&url, &Self::headers(&token), PLEX_TIMEOUT).await?.ok_or(UpstreamError::Body)?;
+        let mc = v.get("MediaContainer").ok_or(UpstreamError::Body)?;
+        let arr = |v: &Value, k: &str| v.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
+        let part = arr(mc, "Metadata")
+            .iter()
+            .flat_map(|m| arr(m, "Media"))
+            .flat_map(|media| arr(&media, "Part"))
+            .find(|p| p.get("id").and_then(Value::as_i64) == Some(part_id));
+        let Some(part) = part else { return Ok(None) };
+        let subs = arr(&part, "Stream")
+            .iter()
+            .filter(|s| s.get("streamType").and_then(Value::as_i64) == Some(3))
+            .filter_map(|s| {
+                Some(SubStream {
+                    id: s.get("id")?.as_i64()?,
+                    language: s.get("languageCode").and_then(Value::as_str).unwrap_or("").to_string(),
+                    selected: s.get("selected").and_then(Value::as_bool).unwrap_or(false),
+                    external: s.get("key").and_then(Value::as_str).is_some_and(|k| !k.is_empty()),
+                })
+            })
+            .collect();
+        Ok(Some(subs))
+    }
+
+    /// `PUT {plex.url}/library/parts/<id>?subtitleStreamID=<stream>&allParts=1`: the subtitle
+    /// Plex plays for that part (for the token's account).
+    pub async fn select_subtitle(&self, part_id: i64, stream_id: i64) -> UpResult<()> {
+        let token = self.c.keys.get("plex");
+        if token.is_empty() {
+            return Err(UpstreamError::Other("no Plex token"));
+        }
+        let url = self.c.url("plex", &format!("/library/parts/{part_id}?subtitleStreamID={stream_id}&allParts=1"));
+        self.c.http.request(Method::PUT, &url, &Self::headers(&token), None, PLEX_TIMEOUT).await?;
+        Ok(())
     }
 
     /// `GET {plex.url}/library/sections/<n>/refresh?path=<EscapeDataString(dir)>`.

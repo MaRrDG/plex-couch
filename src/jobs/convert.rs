@@ -1970,6 +1970,8 @@ impl Job<'_> {
         } else {
             (app.services.sonarr.arr(), json!({"name": "RescanSeries", "seriesId": series_id}), self.cfg.section)
         };
+        // The new file may lose the RO subtitle chosen in Plex: the subs job selects it again.
+        crate::jobs::subs_translate::ro_select_after_rewrite(app, file, section, movie_id != 0);
         self.rt.block_on(async {
             if let Err(e) = arr.command(&cmd).await {
                 log_warning!("convert: {} rescan of {} failed: {}", arr.label(), movie_id.max(series_id), e.type_name());

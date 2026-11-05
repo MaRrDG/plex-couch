@@ -314,6 +314,8 @@ pub async fn tick_on(app: &AppState, s: &mut Subs, now: f64, today: &str) -> Opt
     if !ensure_loaded(app, s) {
         return None;
     }
+    // The RO subtitles Plex should play (needs Plex only, not Bazarr).
+    let ro_changed = translate::select_ro(app, &mut s.tr, &mut s.quiet, now).await;
     let bz = &app.services.bazarr;
     let (wanted, total) = match bz.data_total("/api/episodes/wanted?start=0&length=-1", LIST_TIMEOUT).await {
         Ok(w) => {
@@ -324,13 +326,16 @@ pub async fn tick_on(app: &AppState, s: &mut Subs, now: f64, today: &str) -> Opt
         }
         Err(e) => {
             s.quiet.warn("bazarr", format!("subs: Bazarr wanted episodes failed ({e}), nothing searched"));
+            if ro_changed {
+                save(app, s);
+            }
             return None;
         }
     };
     let complete = complete_list(wanted.len(), total);
     let wanted: Vec<&Value> = wanted.iter().filter(|w| missing_ro(w)).collect();
     let keys: HashSet<String> = wanted.iter().filter_map(|w| id_of(w.get("sonarrEpisodeId"))).map(episode_key).collect();
-    let mut changed = complete && prune(&mut s.attempts, "ep:", |k| keys.contains(k));
+    let mut changed = ro_changed | (complete && prune(&mut s.attempts, "ep:", |k| keys.contains(k)));
     if complete {
         changed |= s.tr.prune("ep:", |k| keys.contains(k));
     }
@@ -923,6 +928,9 @@ mod tests {
         assert_eq!(fs::read_to_string(&ro2).unwrap(), "1\r\n00:00:06,000 --> 00:00:07,000\r\nSalut\r\n\r\n2\r\n00:00:08,000 --> 00:00:09,000\r\nPa\r\n\r\n");
         assert_eq!(s.tr.items["ep:102"].why, "done");
         assert_eq!(f.find("GET", "/library/sections/2/refresh").len(), 1);
+        // The video (not the .srt) waits for its RO subtitle to be selected in Plex.
+        let pending = crate::jobs::subs_translate::RoSelect { path: w.ep(2).display().to_string(), section: 2, movie: false, since: t0 + 360.0 };
+        assert_eq!(s.tr.ro_select, [pending]);
         let ntfy: Vec<Value> = f.find("POST", "/").iter().filter(|q| q.path == "/").map(Req::json).collect();
         assert_eq!(ntfy.len(), 1);
         assert_eq!(ntfy[0]["message"], json!("Subtitrare RO tradusă: Show S01E02"));
