@@ -29,6 +29,11 @@
 //! missing `ro` after a search ([`crate::jobs::subs_translate`]). A queued request wakes the
 //! loop at once, and while one is queued or in flight the loop looks every 15 s
 //! ([`translate_tick`], translations only; the paced search stays every 3 min).
+//!
+//! Each paced tick first makes Plex play the Romanian subtitle where one arrived: the ones
+//! translated, the videos convert / strip-dv rewrote, and the ones Bazarr downloaded from a
+//! provider (read from its history, [`translate::ro_from_history`]); see
+//! [`translate::select_ro`].
 
 use crate::app::AppState;
 use crate::jobs::common::{id_of, unix_now, Quiet};
@@ -314,8 +319,11 @@ pub async fn tick_on(app: &AppState, s: &mut Subs, now: f64, today: &str) -> Opt
     if !ensure_loaded(app, s) {
         return None;
     }
-    // The RO subtitles Plex should play (needs Plex only, not Bazarr).
-    let ro_changed = translate::select_ro(app, &mut s.tr, &mut s.quiet, now).await;
+    let tcfg = TrSettings::from_app(app);
+    // The RO subtitles Bazarr downloaded since the last tick join the RO-select list, then
+    // the list goes to Plex (a failed history read does not stop the rest).
+    let mut ro_changed = translate::ro_from_history(app, &mut s.tr, &mut s.quiet, section(app), tcfg.movie_section, now).await;
+    ro_changed |= translate::select_ro(app, &mut s.tr, &mut s.quiet, now).await;
     let bz = &app.services.bazarr;
     let (wanted, total) = match bz.data_total("/api/episodes/wanted?start=0&length=-1", LIST_TIMEOUT).await {
         Ok(w) => {
@@ -339,7 +347,6 @@ pub async fn tick_on(app: &AppState, s: &mut Subs, now: f64, today: &str) -> Opt
     if complete {
         changed |= s.tr.prune("ep:", |k| keys.contains(k));
     }
-    let tcfg = TrSettings::from_app(app);
     // The one in flight, then the user's requests: they go before everything else.
     changed |= translations(app, s, &tcfg, now, today).await;
 
@@ -1228,5 +1235,61 @@ mod tests {
         assert!(seen, "woken at once, not after 75 s");
         assert!(f.find("GET", "/api/episodes/wanted").is_empty(), "translations only, no paced search");
         let _ = fs::remove_dir_all(&w.root);
+    }
+
+    // -- RO subtitles Bazarr downloaded --------------------------------------------------
+
+    #[tokio::test]
+    async fn a_provider_ro_subtitle_is_selected_in_plex() {
+        let root = crate::jobs::testutil::temp_dir("subs-ro-hist");
+        let film = root.join("Infinity Castle (2025) WEBDL-1080p.mkv");
+        fs::write(&film, b"video").unwrap();
+        let ro = translate::sibling(&film, "ro.srt");
+        fs::write(&ro, b"1\n00:00:01,000 --> 00:00:02,000\nSalut\n").unwrap();
+        let (film_s, ro_s) = (film.display().to_string(), ro.display().to_string());
+        let f = fake(move |r: &Req| {
+            let p = r.path.as_str();
+            if p.starts_with("/api/episodes/wanted") || p.starts_with("/api/movies/wanted") || p.starts_with("/api/episodes/history") {
+                return ok(json!({"data": [], "total": 0}));
+            }
+            if p.starts_with("/api/movies/history") {
+                return ok(json!({"data": [{"action": 1, "title": "Infinity Castle", "radarrId": 7, "provider": "titrari",
+                    "language": {"name": "Romanian", "code2": "ro", "code3": "ron", "forced": false, "hi": false},
+                    "subtitles_path": ro_s, "timestamp": "3 hours ago", "parsed_timestamp": "11/11/26 09:12:00"}], "total": 1}));
+            }
+            if r.method == "PUT" && p.starts_with("/library/parts/") {
+                return status(200);
+            }
+            if p.starts_with("/library/sections/1/all") {
+                return ok(json!({"MediaContainer": {"Metadata": [{"ratingKey": "20", "Media": [{"Part": [{"id": 200, "file": film_s}]}]}]}}));
+            }
+            if p.starts_with("/library/metadata/20") {
+                let streams = json!([{"id": 1, "streamType": 1}, {"id": 2, "streamType": 2, "selected": true},
+                                     {"id": 3, "streamType": 3, "languageCode": "eng"},
+                                     {"id": 4, "streamType": 3, "languageCode": "ron", "key": "/library/streams/4"}]);
+                return ok(json!({"MediaContainer": {"Metadata": [{"ratingKey": "20", "Media": [{"Part": [{"id": 200, "file": film_s, "Stream": streams}]}]}]}}));
+            }
+            status(404)
+        })
+        .await;
+        let (a, _d) = app(&f.base, false, json!({"jobs": {"subs": {"section": 2, "movie_section": 1}}}));
+        let mut s = Subs::default();
+        let t0 = 1_000_000.0;
+        // The download goes on the list (and is persisted with the cursor); Plex gets time to rescan.
+        tick(&a, &mut s, t0).await;
+        assert_eq!(s.tr.ro_select.len(), 1);
+        assert!(s.tr.ro_select[0].movie && s.tr.ro_select[0].section == 1);
+        assert!(f.find("PUT", "/").is_empty());
+        let saved = TrState::from_json(a.state_file.load().get(TR_KEY));
+        assert_eq!((saved.ro_select.len(), saved.ro_history.movie.as_ref().map(Vec::len)), (1, Some(1)));
+        // Next paced tick: Plex plays the RO subtitle; the download is not queued again.
+        tick(&a, &mut s, t0 + 180.0).await;
+        let puts: Vec<String> = f.find("PUT", "/library/parts/").into_iter().map(|r| r.path).collect();
+        assert_eq!(puts, ["/library/parts/200?subtitleStreamID=4&allParts=1"]);
+        assert!(s.tr.ro_select.is_empty());
+        tick(&a, &mut s, t0 + 360.0).await;
+        assert!(s.tr.ro_select.is_empty());
+        assert_eq!(f.find("PUT", "/").len(), 1);
+        let _ = fs::remove_dir_all(&root);
     }
 }
