@@ -2,7 +2,8 @@
 //!
 //! - `auto-monitor` loop (Phase 2a): `logic::power::spawn_auto_monitor`.
 //! - `notify` loop (Phase 2a): `logic::notify::spawn_notify_loop`.
-//! - [`watchlist`] sync every 3 min, [`strip_dv`] every 5 min, [`seed_keeper`] every 5 min
+//! - [`watchlist`] sync every 3 min (with [`watchlist_alt`], the Radarr alternative-title
+//!   search), [`strip_dv`] every 5 min, [`seed_keeper`] every 5 min
 //!   (Phase 2b; plan "New behaviour").
 //! - [`convert`]: the TV conversion, batches on request from the PC tab, its revert pass
 //!   every 5 min.
@@ -23,6 +24,7 @@ pub mod subs;
 pub mod subs_manual;
 pub mod subs_translate;
 pub mod watchlist;
+pub mod watchlist_alt;
 #[cfg(test)]
 pub mod testutil;
 

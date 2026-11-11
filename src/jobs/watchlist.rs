@@ -22,6 +22,13 @@
 //!    path, `viewCount > 0`), monitor the next season (if it has aired episodes), run
 //!    `SeasonSearch` and send "Sezonul N din <serial> se descarcă" once
 //!    (`watchlist.next_season` in the state file).
+//! 5. Radarr alternative-title search ([`crate::jobs::watchlist_alt`]): a monitored,
+//!    available movie without a file, added 60+ min ago, not queued and never grabbed, is
+//!    searched in Prowlarr by text (its romaji / alternate titles; the indexer may list it
+//!    under one of them and not under its IMDb id); releases with the movie's year and a
+//!    matching title are pushed to Radarr (`release/push`), best first, until one is
+//!    approved (Radarr grabs it). Once per movie per 6 h (`Mem::alt_tried`), 2 movies per
+//!    tick at most. Runs after the Sonarr steps, also when Sonarr is down.
 //!
 //! Dry-run: only GETs; every would-be action is logged.
 
@@ -48,6 +55,8 @@ const PLEX_SERIES_SECTION: u32 = 2;
 pub struct Mem {
     pub ticks: u64,
     pub quiet: Quiet,
+    /// Radarr movie id -> last alternative-title attempt (unix seconds).
+    pub alt_tried: HashMap<i64, f64>,
 }
 
 /// Start the loop.
@@ -91,19 +100,22 @@ pub async fn tick(app: &AppState, mem: &mut Mem, now: f64) {
             None
         }
     };
-    let Some(series) = sonarr_series(&sonarr, &mut mem.quiet).await else { return };
-    let kept = sonarr_cleanup(app, &sonarr, watch.as_deref(), &series, now, &mut mem.quiet).await;
-    if verbose {
-        let (items, shows) = watch.as_deref().map(|w| (w.len(), w.iter().filter(|i| i.kind == "show").count())).unwrap_or((0, 0));
-        log_info!(
-            "watchlist: Plex Watchlist {items} item(s), {shows} show(s); Sonarr {} series, {} from the Watchlist",
-            series.len(),
-            kept.len()
-        );
+    if let Some(series) = sonarr_series(&sonarr, &mut mem.quiet).await {
+        let kept = sonarr_cleanup(app, &sonarr, watch.as_deref(), &series, now, &mut mem.quiet).await;
+        if verbose {
+            let (items, shows) =
+                watch.as_deref().map(|w| (w.len(), w.iter().filter(|i| i.kind == "show").count())).unwrap_or((0, 0));
+            log_info!(
+                "watchlist: Plex Watchlist {items} item(s), {shows} show(s); Sonarr {} series, {} from the Watchlist",
+                series.len(),
+                kept.len()
+            );
+        }
+        if let Some(w) = watch.as_deref() {
+            next_season(app, &sonarr, &plex, w, &kept, now as i64, &mut mem.quiet).await;
+        }
     }
-    if let Some(w) = watch.as_deref() {
-        next_season(app, &sonarr, &plex, w, &kept, now as i64, &mut mem.quiet).await;
-    }
+    crate::jobs::watchlist_alt::run(app, &radarr, &mut mem.alt_tried, now, &mut mem.quiet).await;
 }
 
 /// Radarr `enabled`; Sonarr v4 has `enableAutomaticAdd` and no `enabled`.
@@ -679,6 +691,7 @@ mod tests {
         episodes: Value,
         episode_files: Value,
         plex_eps: Value,
+        movies: Value,
     }
 
     fn world() -> World {
@@ -692,6 +705,7 @@ mod tests {
             episodes: json!([]),
             episode_files: json!([]),
             plex_eps: json!({"MediaContainer": {"Metadata": []}}),
+            movies: json!([]),
         }
     }
 
@@ -723,6 +737,12 @@ mod tests {
             }
             if p == "/api/v3/series" {
                 return ok(w.series.lock().unwrap().clone());
+            }
+            if p == "/api/v3/movie" {
+                return ok(w.movies.clone());
+            }
+            if p.starts_with("/api/v3/history/movie") {
+                return ok(json!([]));
             }
             if let Some(id) = p.strip_prefix("/api/v3/series/") {
                 if r.method == "GET" {
@@ -993,6 +1013,22 @@ mod tests {
         std::fs::write(d.join("state.local.json"), r#"{"watchlist": {"seen_tvdb": [200], "next_season": [], "missing": {"200": {"since": 0.0, "count": 5, "last": 0.0}}}}"#).unwrap();
         tick(&a, &mut Mem::default(), T0).await;
         assert!(f.mutations().is_empty(), "{:?}", f.mutations());
+    }
+
+    #[tokio::test]
+    async fn the_tick_runs_the_alternative_title_search_even_when_sonarr_fails() {
+        let mut w = world();
+        w.movies = json!([{"id": 9, "title": "Some Film", "year": 2025, "monitored": true, "hasFile": false,
+                           "isAvailable": true, "added": "2026-01-01T00:00:00Z",
+                           "alternateTitles": [{"title": "Some Film Gekijouban"}]}]);
+        w.radarr_queue = json!({"totalRecords": 0, "records": []});
+        *w.series.lock().unwrap() = json!({"not": "a list"});
+        let (f, _a, _w) = run(w, false).await;
+        // The fake answers `{}` to the search: a Prowlarr error, so nothing is pushed.
+        let s = f.find("GET", "/api/v1/search");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].header("x-api-key"), Some("prowlarr-key"));
+        assert!(f.find("POST", "/api/v3/release/push").is_empty());
     }
 
     // -- next season ------------------------------------------------------------------

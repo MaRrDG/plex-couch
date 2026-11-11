@@ -148,7 +148,7 @@ pub fn app(base: &str, dry_run: bool, extra: Value) -> (Arc<AppState>, PathBuf) 
             "sonarr": {"url": base, "api_key": "sonarr-key"},
             "qbittorrent": {"url": base},
             "bazarr": {"url": base, "api_key": "b"},
-            "prowlarr": {"url": base}
+            "prowlarr": {"url": base, "api_key": "prowlarr-key"}
         },
         "notifications": {"server": base, "topic": "plexcouch-testtopic"},
         "jobs": {"watchlist": {"discover_url": base}}
