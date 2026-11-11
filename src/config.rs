@@ -61,7 +61,12 @@ pub fn defaults() -> Value {
                 "api_key": "",
                 "config_xml": "C:\\ProgramData\\Sonarr\\config.xml"
             },
-            "prowlarr": {"url": "http://127.0.0.1:9696"},
+            // The key is used only by the watchlist alternative-title search (not the ping).
+            "prowlarr": {
+                "url": "http://127.0.0.1:9696",
+                "api_key": "",
+                "config_xml": "C:\\ProgramData\\Prowlarr\\config.xml"
+            },
             "qbittorrent": {"url": "http://127.0.0.1:8080", "username": "", "password": ""}
         }
     })

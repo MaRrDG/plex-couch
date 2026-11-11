@@ -1,6 +1,6 @@
 //! Job-only calls to Radarr and Sonarr (both speak the same v3 API): import lists,
-//! commands, queue, manual import, history by download id, series/episodes. Used by
-//! `jobs::watchlist`, `jobs::strip_dv` and `jobs::seed_keeper`. Header `X-Api-Key`
+//! commands, queue, manual import, history by download id, series/episodes, release push.
+//! Used by `jobs::watchlist`, `jobs::watchlist_alt`, `jobs::strip_dv` and `jobs::seed_keeper`. Header `X-Api-Key`
 //! (sent even when empty); the key is never logged.
 
 use crate::services::{Client, UpResult, UpstreamError};
@@ -197,6 +197,17 @@ impl Arr {
     /// (not paged). `3` is `downloadFolderImported` (`data.droppedPath` is the download copy).
     pub async fn movie_history(&self, movie_id: i64, event_type: i64) -> UpResult<Vec<Value>> {
         as_array(self.get(&format!("/history/movie?movieId={movie_id}&eventType={event_type}")).await?)
+    }
+
+    /// Radarr `POST /release/push` with one release: Radarr matches it to a movie, decides,
+    /// and grabs it at once when `approved`. Returns the decisions (an array in current
+    /// Radarr, a single object in older ones).
+    pub async fn release_push(&self, release: &Value) -> UpResult<Vec<Value>> {
+        match self.send(Method::POST, "/release/push", Some(release)).await? {
+            Some(Value::Array(a)) => Ok(a),
+            Some(v @ Value::Object(_)) => Ok(vec![v]),
+            _ => Err(UpstreamError::Body),
+        }
     }
 
     /// Sonarr `PUT /episode/monitor` `{"episodeIds": [...], "monitored": true}`.

@@ -100,6 +100,15 @@ still kept).
     the last 2 of the highest monitored season is watched in Plex and the next season has aired
     episodes, that season is monitored, searched (`SeasonSearch`, if an aired episode has no
     file yet) and you get "Sezonul N din <serial> se descarcă", once per season.
+  - **Alternative titles (Radarr)**: Radarr searches the indexers by IMDb id, and some
+    releases (anime films on FileList, for example) are not linked to it and carry a romaji
+    title. A monitored, released movie without a file that was added at least an hour ago, is
+    not in the queue and was never grabbed is searched in Prowlarr by text (the phrase its
+    Latin alternate titles share, e.g. "Kimetsu no Yaiba", and its title). Releases with the
+    movie's year and a matching title (accents stripped, `ou`/`uu` read as `o`/`u`) are pushed
+    to Radarr best first (2160p, 1080p, 720p, then seeders), at most 5, until Radarr approves
+    one and grabs it. Each movie is tried at most once every 6 hours, 2 movies per run. Needs
+    the Prowlarr API key (read from Prowlarr's `config.xml`).
 - **Dolby Vision strip** (every 5 minutes, first run 60 s after start): every `.mkv` in the
   movie and series libraries that has a Dolby Vision layer on top of an HDR10 base is remuxed
   with ffmpeg (`-c copy -bsf:v dovi_rpu=strip=1`), so TVs without DV play it as plain HDR10
@@ -254,7 +263,7 @@ config.
 - For the watchlist jobs: a Plex token (read from the registry, see below) and the Plex
   Watchlist import list in Radarr and Sonarr.
 
-API keys are read at runtime from the services' own config files (Radarr and Sonarr
+API keys are read at runtime from the services' own config files (Radarr, Sonarr and Prowlarr
 `config.xml`, Bazarr `config.yaml`) and the Plex token from the registry; they are never stored,
 logged or returned. Paths, URLs and the tracker regex can be overridden in the config
 (see `config.example.json`).
@@ -350,7 +359,7 @@ against the config file's folder; give the `jobs` paths in full. The app writes 
 | `https` | `port`, `cert`, `key`, `ca_cert`. |
 | `services.<name>.url` | Base URL of `plex`, `radarr`, `sonarr`, `bazarr`, `prowlarr`, `qbittorrent`. |
 | `services.plex.token` | Plex token; empty = read `token_registry_value` under `HKCU\<token_registry_key>`. |
-| `services.radarr` / `sonarr` `.api_key` | API key; empty = read `<ApiKey>` from `config_xml`. |
+| `services.radarr` / `sonarr` / `prowlarr` `.api_key` | API key; empty = read `<ApiKey>` from `config_xml`. |
 | `services.bazarr.api_key` | API key; empty = read it from `config_yaml`. |
 | `services.qbittorrent` | `username` / `password`, empty when localhost needs no login. |
 | `jobs.watchlist.discover_url` | Where the Plex Watchlist is read (default `https://discover.provider.plex.tv`). |

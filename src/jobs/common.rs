@@ -106,6 +106,14 @@ impl Quiet {
         }
     }
 
+    /// Like [`Quiet::warn`] at INFO level (an outcome worth one line, not a failure).
+    pub fn info(&mut self, key: &str, msg: String) {
+        if self.last.get(key) != Some(&msg) {
+            crate::log_info!("{msg}");
+            self.last.insert(key.to_string(), msg);
+        }
+    }
+
     /// True if `key` was failing (the caller may log the recovery).
     pub fn clear(&mut self, key: &str) -> bool {
         self.last.remove(key).is_some()

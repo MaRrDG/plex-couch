@@ -2,7 +2,9 @@
 //!
 //! - Plex: `services.plex.token`, else `HKCU\<token_registry_key>` value
 //!   `<token_registry_value>`.
-//! - Radarr / Sonarr: `api_key`, else `<ApiKey>...</ApiKey>` from `config_xml`.
+//! - Radarr / Sonarr / Prowlarr: `api_key`, else `<ApiKey>...</ApiKey>` from `config_xml`
+//!   (Prowlarr's key is used only by the watchlist alternative-title search; the status
+//!   ping needs none).
 //! - Bazarr: `api_key`, else the `apikey:` line of the top-level `auth:` block of
 //!   `config_yaml`.
 //!
@@ -38,7 +40,8 @@ impl Keys {
         Keys { config, cache: Mutex::new(HashMap::new()) }
     }
 
-    /// The key or token for `name` (`plex`, `radarr`, `sonarr`, `bazarr`), `""` if none.
+    /// The key or token for `name` (`plex`, `radarr`, `sonarr`, `prowlarr`, `bazarr`), `""`
+    /// if none.
     pub fn get(&self, name: &str) -> String {
         {
             let g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -59,8 +62,8 @@ impl Keys {
         let r: Result<String, KeyError> = match name {
             "plex" if !s("token").is_empty() => Ok(s("token")),
             "plex" => read_plex_token(&s("token_registry_key"), &s("token_registry_value")).map_err(KeyError::from),
-            "radarr" | "sonarr" if !s("api_key").is_empty() => Ok(s("api_key")),
-            "radarr" | "sonarr" => read_xml_api_key(&s("config_xml")),
+            "radarr" | "sonarr" | "prowlarr" if !s("api_key").is_empty() => Ok(s("api_key")),
+            "radarr" | "sonarr" | "prowlarr" => read_xml_api_key(&s("config_xml")),
             "bazarr" if !s("api_key").is_empty() => Ok(s("api_key")),
             "bazarr" => read_bazarr_key(&s("config_yaml")),
             _ => Ok(String::new()),

@@ -43,7 +43,9 @@
       "config_yaml": "C:\\ProgramData\\Bazarr\\config\\config.yaml"
     },
     "prowlarr": {
-      "url": "http://127.0.0.1:9696"
+      "url": "http://127.0.0.1:9696",
+      "api_key": "",
+      "config_xml": "C:\\ProgramData\\Prowlarr\\config.xml"
     },
     "qbittorrent": {
       "url": "http://127.0.0.1:8080",
