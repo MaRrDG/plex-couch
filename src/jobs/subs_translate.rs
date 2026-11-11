@@ -44,6 +44,15 @@
 //!   RO already chosen or another subtitle chosen (the user's choice, never overridden) ->
 //!   dropped; not in Plex yet or no `ron` stream yet -> tried again next tick, given up after
 //!   [`RO_SELECT_MAX_AGE`].
+//! - The same list takes the RO subtitles Bazarr got from a provider (its own search on
+//!   import or the paced one): every paced tick, before [`select_ro`], [`ro_from_history`]
+//!   reads Bazarr's newest history records (`GET /api/episodes/history` and
+//!   `/api/movies/history?start=0&length=100`). A non-forced `ro` record that is a download,
+//!   manual pick, upgrade or upload ([`HISTORY_ACTIONS`]; not a translation, queued above)
+//!   and not seen before ([`RoHistory`], persisted as `ro_history`; the first run looks back a
+//!   day only) puts the video next to its `subtitles_path` ([`video_for_sub`]) on the list,
+//!   in the TV or movie section. Bazarr down: logged once, the cursor stays. No Plex token:
+//!   not read. Dry-run: listed and logged, the selection only logged.
 
 use crate::app::AppState;
 use crate::jobs::common::{ffmpeg_bin, job_cfg, quiet_command, run_capture, unix_now, Quiet};
@@ -60,7 +69,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// `state.local.json` key: `{"day", "count", "last", "items": {key: {"tries", "next", "why"}},
-/// "inflight": {...} | null, "ro_select": [{"path", "section", "movie", "since"}]}`.
+/// "inflight": {...} | null, "ro_select": [{"path", "section", "movie", "since"}],
+/// "ro_history": {"ep": [mark] | null, "movie": [mark] | null}}`.
 pub const TR_KEY: &str = "subs_translate";
 /// A video still not found in Plex with a RO stream after this is dropped from the list.
 pub const RO_SELECT_MAX_AGE: f64 = 24.0 * 3600.0;
@@ -618,6 +628,33 @@ pub struct TrState {
     /// Videos whose RO subtitle Plex should be told to play ([`select_ro`]), one per
     /// [`path_key`].
     pub ro_select: Vec<RoSelect>,
+    /// How far Bazarr's subtitle history has been read ([`ro_from_history`]).
+    pub ro_history: RoHistory,
+}
+
+/// The cursor into Bazarr's subtitle history, per kind: the marks ([`history_mark`]) of the
+/// newest records read last time. `None`: never read (the first run looks back a day only).
+/// Bazarr's history API gives neither a record id nor a numeric time (see
+/// [`ro_from_history`]), so the cursor is the set of records already seen.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RoHistory {
+    pub ep: Option<Vec<String>>,
+    pub movie: Option<Vec<String>>,
+}
+
+impl RoHistory {
+    fn to_json(&self) -> Value {
+        let side = |m: &Option<Vec<String>>| m.as_ref().map_or(Value::Null, |v| json!(v));
+        json!({"ep": side(&self.ep), "movie": side(&self.movie)})
+    }
+
+    /// Missing or broken (a state file from before the cursor): never read.
+    fn from_json(v: Option<&Value>) -> RoHistory {
+        let side = |k: &str| -> Option<Vec<String>> {
+            v.and_then(|v| v.get(k)).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+        };
+        RoHistory { ep: side("ep"), movie: side("movie") }
+    }
 }
 
 /// A video whose `.ro.srt` Plex should select: its Plex section, movie or episode (which
@@ -667,6 +704,7 @@ impl TrState {
             last: v.get("last").and_then(Value::as_str).unwrap_or("").to_string(),
             inflight: v.get("inflight").and_then(InFlight::from_json),
             ro_select: Vec::new(),
+            ro_history: RoHistory::from_json(v.get("ro_history")),
         };
         // Missing (a state file from before the list): empty.
         for e in v.get("ro_select").and_then(Value::as_array).into_iter().flatten().filter_map(RoSelect::from_json) {
@@ -680,7 +718,8 @@ impl TrState {
             self.items.iter().map(|(k, x)| (k.clone(), json!({"tries": x.tries, "next": x.next, "why": x.why}))).collect();
         json!({"day": self.day, "count": self.count, "last": self.last, "items": items,
                "inflight": self.inflight.as_ref().map_or(Value::Null, InFlight::to_json),
-               "ro_select": self.ro_select.iter().map(RoSelect::to_json).collect::<Vec<_>>()})
+               "ro_select": self.ro_select.iter().map(RoSelect::to_json).collect::<Vec<_>>(),
+               "ro_history": self.ro_history.to_json()})
     }
 
     /// Put `e` on the RO-select list; a video already there (same [`path_key`]) takes the new
@@ -1252,6 +1291,233 @@ pub async fn select_ro(app: &AppState, tr: &mut TrState, quiet: &mut Quiet, now:
     changed
 }
 
+// -- RO subtitles Bazarr downloaded from a provider --------------------------------------
+
+/// Bazarr's newest history records read per kind and tick.
+pub const HISTORY_LENGTH: usize = 100;
+/// A history record older than this (when its age is known) is not queued; on the first run
+/// (no cursor yet) only records known to be this recent are.
+pub const HISTORY_WINDOW: f64 = 24.0 * 3600.0;
+/// Bazarr history actions that put a subtitle on disk: 1 downloaded, 2 manual (picked in
+/// Bazarr's search), 3 upgraded, 4 uploaded by the user. Not 0 deleted, 5 synced, 6
+/// translated (queued by [`poll`] already), 7 extracted.
+pub const HISTORY_ACTIONS: [i64; 4] = [1, 2, 3, 4];
+
+/// `ro` / `ron` / `rum` (any case).
+fn is_ro_code(c: &str) -> bool {
+    matches!(c.to_ascii_lowercase().as_str(), "ro" | "ron" | "rum")
+}
+
+fn int_of(v: Option<&Value>) -> Option<i64> {
+    match v? {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// A history record that put a non-forced Romanian subtitle on disk ([`HISTORY_ACTIONS`]),
+/// with a `subtitles_path`. `language` is Bazarr's `{"code2", "code3", "forced", "hi"}`
+/// (older Bazarr: the raw `ro`, `ro:hi`, `ro:forced` string).
+pub fn ro_download(rec: &Value) -> bool {
+    let ro = match rec.get("language") {
+        Some(Value::Object(l)) => {
+            // `code2`, else `code3`.
+            let code = ["code2", "code3"].iter().find_map(|k| l.get(*k).and_then(Value::as_str).filter(|c| !c.is_empty()));
+            code.is_some_and(is_ro_code) && !l.get("forced").and_then(Value::as_bool).unwrap_or(false)
+        }
+        Some(Value::String(s)) => s.split(':').next().is_some_and(is_ro_code) && !s.ends_with(":forced"),
+        _ => false,
+    };
+    ro && int_of(rec.get("action")).is_some_and(|a| HISTORY_ACTIONS.contains(&a))
+        && rec.get("subtitles_path").and_then(Value::as_str).is_some_and(|p| !p.trim().is_empty())
+}
+
+/// `pretty.date` text (what Bazarr gives as `timestamp`): `now`, `12 seconds ago`, `a minute
+/// ago`, `5 minutes ago`, `an hour ago`, `3 hours ago`, `yesterday`, `4 days ago`, `last
+/// week`, ... (also the short `5m ago`) -> seconds, roughly. Anything else: `None`.
+pub fn relative_age(s: &str) -> Option<f64> {
+    const MIN: f64 = 60.0;
+    const HOUR: f64 = 3600.0;
+    const DAY: f64 = 86400.0;
+    let t = s.trim().to_ascii_lowercase();
+    let t = t.strip_suffix("ago").unwrap_or(&t).trim();
+    let fixed = match t {
+        "now" | "just now" => Some(0.0),
+        "a second" => Some(1.0),
+        "a minute" => Some(MIN),
+        "an hour" => Some(HOUR),
+        "yesterday" | "yest" | "a day" => Some(DAY),
+        "day before" => Some(2.0 * DAY),
+        "last week" | "a week" => Some(7.0 * DAY),
+        "last month" | "a month" => Some(30.0 * DAY),
+        "last year" | "a year" => Some(365.0 * DAY),
+        _ => None,
+    };
+    if fixed.is_some() {
+        return fixed;
+    }
+    let digits = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let n: f64 = t[..digits].parse().ok()?;
+    let unit = match t[digits..].trim() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1.0,
+        "m" | "min" | "mins" | "minute" | "minutes" => MIN,
+        "h" | "hr" | "hrs" | "hour" | "hours" => HOUR,
+        "d" | "day" | "days" => DAY,
+        "w" | "wk" | "week" | "weeks" => 7.0 * DAY,
+        "mo" | "month" | "months" => 30.0 * DAY,
+        "y" | "yr" | "year" | "years" => 365.0 * DAY,
+        _ => return None,
+    };
+    Some(n * unit)
+}
+
+/// How old a history record is, if it says: a numeric `timestamp` (unix seconds, or
+/// milliseconds; older Bazarr) or Bazarr's relative `timestamp` text ([`relative_age`]).
+/// `parsed_timestamp` (`strftime('%x %X')`, locale-dependent, local time) is not read.
+pub fn history_age(rec: &Value, now: f64) -> Option<f64> {
+    match rec.get("timestamp")? {
+        Value::Number(n) => {
+            let t = n.as_f64()?;
+            Some(now - if t > 1e12 { t / 1000.0 } else { t })
+        }
+        Value::String(s) => match s.trim().parse::<f64>() {
+            Ok(t) => Some(now - if t > 1e12 { t / 1000.0 } else { t }),
+            Err(_) => relative_age(s),
+        },
+        _ => None,
+    }
+}
+
+/// FNV-1a, 64 bit (stable across builds, unlike the std hasher).
+fn fnv64(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// A history record's identity, kept as the cursor ([`RoHistory`]): a hash of the fields that
+/// never change for a record (action, language, file, ids, provider, `parsed_timestamp`;
+/// not the relative `timestamp`, which does, unless it is a number).
+pub fn history_mark(rec: &Value) -> String {
+    let field = |k: &str| match rec.get(k) {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::Object(_)) => rec[k].to_string(),
+        _ => String::new(),
+    };
+    let ts = match rec.get("timestamp") {
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    let lang = match rec.get("language") {
+        Some(Value::Object(l)) => ["code2", "code3", "forced", "hi"].iter().map(|k| l.get(*k).map_or(String::new(), Value::to_string)).collect::<Vec<_>>().join(","),
+        _ => field("language"),
+    };
+    let parts = [field("action"), lang, field("subtitles_path"), field("sonarrEpisodeId"), field("radarrId"), field("provider"), field("parsed_timestamp"), ts];
+    format!("{:016x}", fnv64(&parts.join("\u{1f}")))
+}
+
+/// The RO downloads among `recs` (newest first, as Bazarr gives them) not seen before
+/// (`seen`: the cursor, `None` on the first run), at most [`HISTORY_WINDOW`] old if the age
+/// is known; on the first run the age must be known.
+pub fn history_new<'a>(recs: &'a [Value], seen: Option<&[String]>, now: f64) -> Vec<&'a Value> {
+    recs.iter()
+        .filter(|r| ro_download(r))
+        .filter(|r| seen.is_none_or(|s| !s.contains(&history_mark(r))))
+        .filter(|r| match history_age(r, now) {
+            Some(age) => age <= HISTORY_WINDOW,
+            None => seen.is_some(),
+        })
+        .collect()
+}
+
+/// The video next to subtitle file `sub`: a video file in the same folder whose name (no
+/// extension) followed by `.ro.`, `.ron.` or `.rum.` starts the subtitle's name (`X.ro.srt`,
+/// `X.ro.hi.srt`, `X.ron.srt`); the longest such name wins.
+pub fn video_for_sub(sub: &Path) -> Option<PathBuf> {
+    let name = sub.file_name()?.to_string_lossy().to_lowercase();
+    fs::read_dir(sub.parent()?)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()).is_some_and(|x| VIDEO_EXTS.contains(&x.to_ascii_lowercase().as_str())))
+        .filter(|p| p.is_file())
+        .filter_map(|p| {
+            let stem = p.file_stem()?.to_string_lossy().to_lowercase();
+            let rest = name.strip_prefix(&stem)?.strip_prefix('.')?;
+            let code = rest.split('.').next()?;
+            (is_ro_code(code) && rest.len() > code.len()).then_some((stem.len(), p))
+        })
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, p)| p)
+}
+
+/// The video a history record is for: its `video_path` / `path` if Bazarr gives one (a video
+/// file name; current Bazarr drops both), else the one next to `subtitles_path`
+/// ([`video_for_sub`]).
+pub fn history_video(rec: &Value) -> Option<String> {
+    let given = ["video_path", "path"].iter().filter_map(|k| rec.get(*k).and_then(Value::as_str)).find(|p| {
+        Path::new(p).extension().and_then(|x| x.to_str()).is_some_and(|x| VIDEO_EXTS.contains(&x.to_ascii_lowercase().as_str()))
+    });
+    if let Some(p) = given {
+        return Some(p.to_string());
+    }
+    let sub = rec.get("subtitles_path").and_then(Value::as_str)?;
+    video_for_sub(Path::new(sub)).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Bazarr's subtitle history (`GET /api/episodes/history` and `/api/movies/history`, newest
+/// [`HISTORY_LENGTH`] each): every RO subtitle a provider (or the user) put on disk since the
+/// last read ([`history_new`]) puts its video on the RO-select list (`tv_section` for
+/// episodes, `movie_section` for movies), so [`select_ro`] makes Plex play it. A failed
+/// read is logged once and leaves that kind's cursor alone. No Plex token: nothing read.
+/// True: the state changed.
+///
+/// Bazarr's records (assumed from its API, tolerant): `data[]` with `action`, `language`
+/// ([`ro_download`]), `subtitles_path` (mapped to this machine's paths), `timestamp` (relative
+/// text, [`history_age`]), `parsed_timestamp`, `provider`, `sonarrEpisodeId` / `radarrId`;
+/// no record id, no video path.
+pub async fn ro_from_history(app: &AppState, tr: &mut TrState, quiet: &mut Quiet, tv_section: u32, movie_section: u32, now: f64) -> bool {
+    if app.services.keys.get("plex").is_empty() {
+        return false;
+    }
+    let bz = &app.services.bazarr;
+    let mut changed = false;
+    for movie in [false, true] {
+        let (kind, section) = if movie { ("movies", movie_section) } else { ("episodes", tv_section) };
+        let qk = format!("bazarr-history-{kind}");
+        let recs = match bz.data(&format!("/api/{kind}/history?start=0&length={HISTORY_LENGTH}"), LIST_TIMEOUT).await {
+            Ok(r) => {
+                quiet.clear(&qk);
+                r
+            }
+            Err(e) => {
+                quiet.warn(&qk, format!("subs: Bazarr {kind} history failed ({e}), downloaded RO subtitles are selected later"));
+                continue;
+            }
+        };
+        let seen = if movie { &tr.ro_history.movie } else { &tr.ro_history.ep };
+        let fresh: Vec<(String, String)> = history_new(&recs, seen.as_deref(), now)
+            .into_iter()
+            .filter_map(|r| Some((history_video(r)?, r.get("provider").and_then(Value::as_str).unwrap_or("").to_string())))
+            .collect();
+        for (video, provider) in fresh {
+            let name = video_name(&video);
+            let from = if provider.is_empty() { String::new() } else { format!(" ({})", ascii(&provider)) };
+            let dry = if app.dry_run { " (dry-run)" } else { "" };
+            log_info!("subs{dry}: Bazarr downloaded a RO subtitle for {name}{from}, it is selected in Plex next");
+            tr.want_ro_select(RoSelect { path: video, section, movie, since: now });
+            changed = true;
+        }
+        let marks: Vec<String> = recs.iter().map(history_mark).collect();
+        let slot = if movie { &mut tr.ro_history.movie } else { &mut tr.ro_history.ep };
+        if slot.as_ref() != Some(&marks) {
+            *slot = Some(marks);
+            changed = true;
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1727,5 +1993,222 @@ mod tests {
         assert!(TrState::from_json(Some(&old)).ro_select.is_empty());
         old["ro_select"] = json!([{"path": "D:\\TV\\A.mkv", "section": 2, "since": 1.0}, {"path": "d:/TV/a.mkv", "section": 2, "since": 5.0}, {"section": 2, "since": 1.0}, {"path": "x", "since": 1.0}]);
         assert_eq!(TrState::from_json(Some(&old)).ro_select, [entry("D:\\TV\\A.mkv", 2, false, 5.0)]);
+    }
+
+    // -- RO subtitles Bazarr downloaded --------------------------------------------------
+
+    /// A Bazarr history record (current API shape).
+    fn hist(action: i64, code2: &str, subs: &str, when: &str, ids: Value) -> Value {
+        let mut r = json!({"action": action, "language": {"name": "Romanian", "code2": code2, "code3": "ron", "forced": false, "hi": false},
+                           "subtitles_path": subs, "timestamp": when, "parsed_timestamp": format!("11/11/26 10:00:00 {subs}"),
+                           "provider": "titrari", "score": "90.0%", "upgradable": false});
+        for (k, v) in ids.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        r
+    }
+
+    fn ep_ids() -> Value {
+        json!({"seriesTitle": "Show", "sonarrSeriesId": 4, "sonarrEpisodeId": 11})
+    }
+
+    fn movie_ids() -> Value {
+        json!({"title": "Film", "radarrId": 7})
+    }
+
+    #[test]
+    fn history_records() {
+        // A RO subtitle from a provider: episode or movie, downloaded, manual, upgraded, uploaded.
+        assert!(ro_download(&hist(1, "ro", "D:\\TV\\A.ro.srt", "3 hours ago", ep_ids())));
+        assert!(ro_download(&hist(1, "ro", "D:\\Movies\\M.ro.srt", "now", movie_ids())));
+        for a in [2, 3, 4] {
+            assert!(ro_download(&hist(a, "ro", "D:\\TV\\A.ro.srt", "now", ep_ids())), "action {a}");
+        }
+        // Another language, a forced one, no file.
+        assert!(!ro_download(&hist(1, "en", "D:\\TV\\A.en.srt", "now", ep_ids())));
+        let mut forced = hist(1, "ro", "D:\\TV\\A.ro.forced.srt", "now", ep_ids());
+        forced["language"]["forced"] = json!(true);
+        assert!(!ro_download(&forced));
+        assert!(!ro_download(&hist(1, "ro", "", "now", ep_ids())));
+        // Deleted, synced, translated (queued when the translation is judged), extracted.
+        for a in [0, 5, 6, 7] {
+            assert!(!ro_download(&hist(a, "ro", "D:\\TV\\A.ro.srt", "now", ep_ids())), "action {a}");
+        }
+        // Older shapes: the raw language string, a string action, code3 only.
+        assert!(ro_download(&json!({"action": "1", "language": "ro:hi", "subtitles_path": "x.ro.hi.srt"})));
+        assert!(!ro_download(&json!({"action": 1, "language": "ro:forced", "subtitles_path": "x.ro.forced.srt"})));
+        assert!(ro_download(&json!({"action": 1, "language": {"code3": "rum"}, "subtitles_path": "x.rum.srt"})));
+        assert!(!ro_download(&json!({"language": "ro", "subtitles_path": "x.ro.srt"})));
+    }
+
+    #[test]
+    fn history_ages() {
+        let now = 1_800_000_000.0;
+        let age = |t: Value| history_age(&json!({"timestamp": t}), now);
+        assert_eq!(age(json!("now")), Some(0.0));
+        assert_eq!(age(json!("12 seconds ago")), Some(12.0));
+        assert_eq!(age(json!("a minute ago")), Some(60.0));
+        assert_eq!(age(json!("5 minutes ago")), Some(300.0));
+        assert_eq!(age(json!("an hour ago")), Some(3600.0));
+        assert_eq!(age(json!("23 hours ago")), Some(23.0 * 3600.0));
+        assert_eq!(age(json!("5m ago")), Some(300.0));
+        assert_eq!(age(json!("yesterday")), Some(86400.0));
+        assert_eq!(age(json!("3 days ago")), Some(3.0 * 86400.0));
+        assert_eq!(age(json!("last week")), Some(7.0 * 86400.0));
+        // Unix seconds or milliseconds (older Bazarr).
+        assert_eq!(age(json!(now - 100.0)), Some(100.0));
+        assert_eq!(age(json!((now - 100.0) * 1000.0)), Some(100.0));
+        assert_eq!(age(json!("1799999900")), Some(100.0));
+        // Not understood: unknown.
+        assert_eq!(age(json!("today")), None);
+        assert_eq!(age(json!("11/11/26 10:00:00")), None);
+        assert_eq!(history_age(&json!({"parsed_timestamp": "11/11/26 10:00:00"}), now), None);
+    }
+
+    #[test]
+    fn history_cursor_and_first_run() {
+        let now = 1_000_000.0;
+        let mut unknown = hist(1, "ro", "D:\\TV\\C.ro.srt", "", ep_ids());
+        unknown.as_object_mut().unwrap().remove("timestamp");
+        let recs = vec![
+            hist(1, "ro", "D:\\TV\\A.ro.srt", "3 hours ago", ep_ids()),
+            hist(1, "ro", "D:\\TV\\B.ro.srt", "2 days ago", ep_ids()),
+            unknown,
+            hist(1, "en", "D:\\TV\\D.en.srt", "now", ep_ids()),
+            hist(6, "ro", "D:\\TV\\E.ro.srt", "now", ep_ids()),
+            hist(3, "ro", "D:\\TV\\F.ro.srt", "a minute ago", ep_ids()),
+        ];
+        // First run: only RO downloads known to be from the last day.
+        assert_eq!(history_new(&recs, None, now), [&recs[0], &recs[5]]);
+        // With a cursor: what it holds is old news; an unknown age is new, an old one is not.
+        let seen: Vec<String> = [&recs[0], &recs[3]].iter().map(|r| history_mark(r)).collect();
+        assert_eq!(history_new(&recs, Some(&seen), now), [&recs[2], &recs[5]]);
+        // A record keeps its mark while its relative time and flags move on; another download
+        // of the same file (another time) is a new record.
+        let mut later = recs[0].clone();
+        later["timestamp"] = json!("4 hours ago");
+        later["upgradable"] = json!(true);
+        later["score"] = json!("91.0%");
+        assert_eq!(history_mark(&later), history_mark(&recs[0]));
+        later["parsed_timestamp"] = json!("11/11/26 11:00:00");
+        assert_ne!(history_mark(&later), history_mark(&recs[0]));
+        assert_eq!(history_mark(&recs[0]).len(), 16);
+    }
+
+    #[test]
+    fn history_videos() {
+        let d = crate::jobs::testutil::temp_dir("ro-hist-video");
+        let v = d.join("Demon Slayer (2025) WEBDL-1080p.mkv");
+        fs::write(&v, b"video").unwrap();
+        fs::write(d.join("Demon Slayer (2025) WEBDL-1080p.en.srt"), b"x").unwrap();
+        fs::write(d.join("Demon Slayer (2025).mkv"), b"video").unwrap();
+        let sub = |n: &str| d.join(n).to_string_lossy().into_owned();
+        let video = |s: String| history_video(&json!({"subtitles_path": s}));
+        let want = Some(v.to_string_lossy().into_owned());
+        assert_eq!(video(sub("Demon Slayer (2025) WEBDL-1080p.ro.srt")), want);
+        assert_eq!(video(sub("demon slayer (2025) webdl-1080p.RO.hi.srt")), want);
+        assert_eq!(video(sub("Demon Slayer (2025) WEBDL-1080p.ron.srt")), want);
+        assert_eq!(video(sub("Demon Slayer (2025).ro.srt")), Some(d.join("Demon Slayer (2025).mkv").to_string_lossy().into_owned()));
+        // No such video, or not a RO name.
+        assert_eq!(video(sub("Other.ro.srt")), None);
+        assert_eq!(video(sub("Demon Slayer (2025) WEBDL-1080p.en.srt")), None);
+        assert_eq!(video_for_sub(&d.join("Demon Slayer (2025) WEBDL-1080p.ro")), None);
+        // The record's own video path wins (a video file name only).
+        assert_eq!(history_video(&json!({"video_path": "D:\\TV\\X.mkv", "subtitles_path": sub("Other.ro.srt")})).as_deref(), Some("D:\\TV\\X.mkv"));
+        assert_eq!(history_video(&json!({"path": "D:\\Movies\\Film", "subtitles_path": sub("Other.ro.srt")})), None);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ro_history_state() {
+        let tr = TrState { ro_history: RoHistory { ep: Some(vec!["00000000000000aa".into()]), movie: Some(vec![]) }, ..Default::default() };
+        let v = tr.to_json();
+        assert_eq!(v["ro_history"], json!({"ep": ["00000000000000aa"], "movie": []}));
+        assert_eq!(TrState::from_json(Some(&v)), tr);
+        // A state file from before the cursor: never read (the first run's day window).
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("ro_history");
+        assert_eq!(TrState::from_json(Some(&old)).ro_history, RoHistory::default());
+        old["ro_history"] = json!({"ep": null, "movie": "x"});
+        assert_eq!(TrState::from_json(Some(&old)).ro_history, RoHistory::default());
+    }
+
+    struct Hist {
+        eps: Mutex<Vec<Value>>,
+        movies: Mutex<Vec<Value>>,
+        up: Mutex<bool>,
+    }
+
+    async fn bazarr_history(h: Arc<Hist>) -> Fake {
+        fake(move |r: &Req| {
+            if !*h.up.lock().unwrap() {
+                return status(500);
+            }
+            if r.path.starts_with("/api/episodes/history?") {
+                return ok(json!({"data": h.eps.lock().unwrap().clone(), "total": 1000}));
+            }
+            if r.path.starts_with("/api/movies/history?") {
+                return ok(json!({"data": h.movies.lock().unwrap().clone(), "total": 1000}));
+            }
+            status(404)
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn history_feeds_the_ro_select_list() {
+        let d = crate::jobs::testutil::temp_dir("ro-hist");
+        let ep = d.join("Show - S01E02.mkv");
+        let film = d.join("Film (2025) WEBDL-1080p.mkv");
+        let old = d.join("Old.mkv");
+        for v in [&ep, &film, &old] {
+            fs::write(v, b"video").unwrap();
+        }
+        let s = |p: &Path, suffix: &str| sibling(p, suffix).to_string_lossy().into_owned();
+        let h = Arc::new(Hist {
+            eps: Mutex::new(vec![
+                hist(1, "ro", &s(&ep, "ro.srt"), "2 hours ago", ep_ids()),
+                hist(6, "ro", &s(&old, "ro.srt"), "3 hours ago", ep_ids()),
+                hist(1, "ro", &s(&old, "ro.srt"), "2 days ago", ep_ids()),
+            ]),
+            movies: Mutex::new(vec![hist(1, "ro", &s(&film, "ro.srt"), "5 hours ago", movie_ids()), hist(1, "en", &s(&film, "en.srt"), "5 hours ago", movie_ids())]),
+            up: Mutex::new(true),
+        });
+        let f = bazarr_history(h.clone()).await;
+        let (a, _cfg) = app(&f.base, false, json!({}));
+        let now = 1_000_000.0;
+        let mut tr = TrState::default();
+        let mut quiet = Quiet::default();
+        // First run: the downloads of the last day, episodes in the TV section, movies in theirs.
+        assert!(ro_from_history(&a, &mut tr, &mut quiet, 2, 1, now).await);
+        assert_eq!(tr.ro_select, [entry(&ep.to_string_lossy(), 2, false, now), entry(&film.to_string_lossy(), 1, true, now)]);
+        assert_eq!(tr.ro_history.ep.as_ref().map(Vec::len), Some(3));
+        assert_eq!(tr.ro_history.movie.as_ref().map(Vec::len), Some(2));
+        let reqs: Vec<String> = f.requests().into_iter().map(|r| r.path).collect();
+        assert_eq!(reqs, ["/api/episodes/history?start=0&length=100", "/api/movies/history?start=0&length=100"]);
+        assert!(f.requests().iter().all(|r| r.header("x-api-key") == Some("b")));
+        // Nothing new: nothing queued, nothing changed.
+        tr.ro_select.clear();
+        assert!(!ro_from_history(&a, &mut tr, &mut quiet, 2, 1, now + 180.0).await);
+        assert!(tr.ro_select.is_empty());
+        // Bazarr down: nothing queued, the cursor stays.
+        let cursor = tr.ro_history.clone();
+        h.eps.lock().unwrap().insert(0, hist(3, "ro", &s(&old, "ro.srt"), "now", ep_ids()));
+        *h.up.lock().unwrap() = false;
+        assert!(!ro_from_history(&a, &mut tr, &mut quiet, 2, 1, now + 360.0).await);
+        assert!(tr.ro_select.is_empty());
+        assert_eq!(tr.ro_history, cursor);
+        // Back up: the upgrade made meanwhile is queued.
+        *h.up.lock().unwrap() = true;
+        assert!(ro_from_history(&a, &mut tr, &mut quiet, 2, 1, now + 540.0).await);
+        assert_eq!(paths(&tr), [old.to_string_lossy()]);
+        assert_eq!(tr.ro_history.ep.as_ref().map(Vec::len), Some(4));
+        // No Plex token: Bazarr is not even asked.
+        let no_token = json!({"services": {"plex": {"token": "", "token_registry_key": "Software\\PlexCouchTest\\Nope", "token_registry_value": "Nope"}}});
+        let (a2, _cfg2) = app(&f.base, false, no_token);
+        let n = f.requests().len();
+        assert!(!ro_from_history(&a2, &mut TrState::default(), &mut quiet, 2, 1, now).await);
+        assert_eq!(f.requests().len(), n);
+        let _ = fs::remove_dir_all(&d);
     }
 }
