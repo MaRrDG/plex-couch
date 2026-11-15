@@ -146,6 +146,25 @@ still kept).
     hit & run rule only if every one of its files has a hard-link count of 1, i.e. no library
     copy shares it.
   - Any API error, unknown mapping, missing file or failed check keeps the torrent.
+- **Library cleanup** (every 5 minutes, first run 4 minutes after start; **dry-run by
+  default**: it only logs "library cleanup (dry-run): would delete ..." until
+  `jobs.library_cleanup.dry_run` is `false`): deletes what you have watched from the library
+  itself, once the seed keeper has removed the download copy. At most one season or one movie
+  per run.
+  - A season (1 and up; specials never) of a Sonarr series goes when it is complete on disk
+    (every aired episode has a file), every episode file is watched in Plex and the last one
+    was watched at least `grace_hours` (24) ago, every file has a hard-link count of 1 (no
+    torrent copy left), and it is not the series' highest season with files (that one always
+    stays for the next-season check). Sonarr first unmonitors the season and its episodes, then
+    deletes the files; the subtitle sidecars of those videos (`.srt`, `.ass`, `.ssa`, `.sub`,
+    `.idx`, `.vtt`) and the then empty season folder are removed, and Plex refreshes the series.
+  - A Radarr movie goes when its file is watched in Plex at least `grace_hours` ago and has a
+    hard-link count of 1: Radarr deletes it with its folder and adds an import list exclusion
+    (so the Plex Watchlist does not add it back).
+  - Plex down skips the run; any other API error, unknown mapping, missing file or failed link
+    check keeps the item; files under the downloads folder are never touched. Each deletion
+    sends "Am șters sezonul N din <serial> (X,X GB), l-ai văzut" / "Am șters filmul <titlu>
+    (X,X GB), l-ai văzut".
 
 - **Seriale tab**: every Sonarr series with files as a poster grid (Sonarr's media covers through
   `/img/series/<id>`), with "N nevăzute" (Plex's watched state) and an amber marker with the
@@ -244,9 +263,9 @@ still kept).
     `subs_translate`). An existing non-empty `.ro.srt` is never overwritten and the video is
     never touched. Dry-run only logs.
 
-The seed keeper and the next-season check read "watched" from Plex library section 1 (movies)
-and section 2 (TV); these are fixed. The DV strip takes the section of each library from the
-config.
+The seed keeper, the library cleanup and the next-season check read "watched" from Plex
+library section 1 (movies) and section 2 (TV); these are fixed. The DV strip takes the section
+of each library from the config.
 
 ## Requirements
 
@@ -369,6 +388,9 @@ against the config file's folder; give the `jobs` paths in full. The app writes 
 | `jobs.strip_dv.tmp_dir` | Where remuxes are written before they replace the original. |
 | `jobs.strip_dv.log`, `.seen` | The job's own log file and its list of files already checked. |
 | `jobs.seed_keeper.downloads_root` | Only torrents under this folder can be deleted. |
+| `jobs.library_cleanup.enabled` | Run the library cleanup at all (default `true`). |
+| `jobs.library_cleanup.dry_run` | Only log what the library cleanup would delete (default `true`; the global dry-run also applies). |
+| `jobs.library_cleanup.grace_hours` | Hours since the last watch before a season or movie may be deleted (default `24`). |
 | `jobs.subs.auto_translate` | Also translate missing RO subtitles on its own, after a provider search (default `false`; manual requests from Seriale / Filme work either way). The old key `jobs.subs.translate` is read as its alias when `auto_translate` is missing. |
 | `jobs.subs.translate_per_day` | Translations started per local day at most, manual and automatic together (default `40`). |
 | `jobs.subs.translate_notify` | ntfy when a translation is done or a manual one fails (default `true`). |
@@ -397,7 +419,8 @@ What you get: "Film gata" when Radarr finishes a new movie (right away once Baza
 Romanian subtitle, otherwise after `ready_wait_minutes`), "Spațiu puțin" once when the drive of
 Radarr's root folder drops below `disk_min_gb` free (again only after it has gone back above
 `disk_min_gb + 10`), "Oprire după film", "Sezon nou" from the next-season job and the
-"Watchlist" warning from the Sonarr cleanup. Movies already in the library when notifications
+"Watchlist" warning from the Sonarr cleanup, and "Bibliotecă" when the library cleanup
+deletes a watched season or movie. Movies already in the library when notifications
 are first turned on never notify. What was already sent is remembered in `state.local.json` next
 to the config (git-ignored), so a restart does not repeat anything. The `notifications` block in
 the config sets `server` (for a self-hosted ntfy), `disk_min_gb` and `ready_wait_minutes`.
