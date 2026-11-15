@@ -1,6 +1,6 @@
 //! Job-only calls to Radarr and Sonarr (both speak the same v3 API): import lists,
 //! commands, queue, manual import, history by download id, series/episodes, release push.
-//! Used by `jobs::watchlist`, `jobs::watchlist_alt`, `jobs::strip_dv` and `jobs::seed_keeper`. Header `X-Api-Key`
+//! Used by `jobs::watchlist`, `jobs::watchlist_alt`, `jobs::strip_dv`, `jobs::seed_keeper` and `jobs::library_cleanup`. Header `X-Api-Key`
 //! (sent even when empty); the key is never logged.
 
 use crate::services::{Client, UpResult, UpstreamError};
@@ -212,7 +212,26 @@ impl Arr {
 
     /// Sonarr `PUT /episode/monitor` `{"episodeIds": [...], "monitored": true}`.
     pub async fn monitor_episodes(&self, ids: &[i64]) -> UpResult<()> {
-        self.send(Method::PUT, "/episode/monitor", Some(&json!({"episodeIds": ids, "monitored": true}))).await?;
+        self.set_episodes_monitored(ids, true).await
+    }
+
+    /// Sonarr `PUT /episode/monitor` `{"episodeIds": [...], "monitored": <monitored>}`.
+    pub async fn set_episodes_monitored(&self, ids: &[i64], monitored: bool) -> UpResult<()> {
+        self.send(Method::PUT, "/episode/monitor", Some(&json!({"episodeIds": ids, "monitored": monitored}))).await?;
+        Ok(())
+    }
+
+    /// Sonarr `DELETE /episodefile/bulk` `{"episodeFileIds": [...]}`: deletes the files from
+    /// disk (Sonarr's recycle bin setting applies).
+    pub async fn delete_episode_files(&self, ids: &[i64]) -> UpResult<()> {
+        self.send(Method::DELETE, "/episodefile/bulk", Some(&json!({"episodeFileIds": ids}))).await?;
+        Ok(())
+    }
+
+    /// Radarr `DELETE /movie/<id>?deleteFiles=true&addImportListExclusion=true`: the movie,
+    /// its folder, and an exclusion so no import list (the Plex Watchlist) adds it again.
+    pub async fn delete_movie_excluded(&self, id: i64) -> UpResult<()> {
+        self.send(Method::DELETE, &format!("/movie/{id}?deleteFiles=true&addImportListExclusion=true"), None).await?;
         Ok(())
     }
 }

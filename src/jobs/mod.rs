@@ -4,7 +4,8 @@
 //! - `notify` loop (Phase 2a): `logic::notify::spawn_notify_loop`.
 //! - [`watchlist`] sync every 3 min (with [`watchlist_alt`], the Radarr alternative-title
 //!   search), [`strip_dv`] every 5 min, [`seed_keeper`] every 5 min
-//!   (Phase 2b; plan "New behaviour").
+//!   (Phase 2b; plan "New behaviour"), [`library_cleanup`] every 5 min (deletes watched
+//!   seasons / movies from the library once the download copy is gone; dry-run by default).
 //! - [`convert`]: the TV conversion, batches on request from the PC tab, its revert pass
 //!   every 5 min.
 //! - [`subs`]: one paced Bazarr RO subtitle search every 3 min, next episode first; with
@@ -18,6 +19,7 @@
 
 pub mod common;
 pub mod convert;
+pub mod library_cleanup;
 pub mod seed_keeper;
 pub mod strip_dv;
 pub mod subs;
@@ -83,6 +85,7 @@ pub fn spawn_all(app: Arc<AppState>, stop: Stop) {
     watchlist::spawn(app.clone(), stop.clone());
     strip_dv::spawn(app.clone(), stop.clone());
     seed_keeper::spawn(app.clone(), stop.clone());
+    library_cleanup::spawn(app.clone(), stop.clone());
     convert::spawn(app.clone(), stop.clone());
     subs::spawn(app, stop);
 }

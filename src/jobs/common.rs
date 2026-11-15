@@ -12,6 +12,7 @@
 //!                   "libraries": [{"path": "D:\\Media\\Movies", "arr": "radarr", "section": 1},
 //!                                 {"path": "D:\\Media\\Seriale", "arr": "sonarr", "section": 2}]},
 //!   "seed_keeper": {"downloads_root": "D:\\Media\\Downloads"},
+//!   "library_cleanup": {"enabled": true, "dry_run": true, "grace_hours": 24},
 //!   "convert":     {"ffmpeg_bin": "", "tmp_dir": "D:\\Media\\Downloads\\.reencode", "section": 2,
 //!                   "movie_section": 1},
 //!   "subs":        {"section": 2, "movie_section": 1, "translate": true, "translate_per_day": 40,
@@ -40,6 +41,11 @@ pub fn job_str(app: &AppState, job: &str, key: &str, default: &str) -> String {
         Some(Value::String(s)) if !s.trim().is_empty() => s,
         _ => default.to_string(),
     }
+}
+
+/// A bool setting, `default` when missing or not a JSON bool.
+pub fn job_bool(app: &AppState, job: &str, key: &str, default: bool) -> bool {
+    job_cfg(app, job, key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
 pub fn unix_now() -> f64 {
